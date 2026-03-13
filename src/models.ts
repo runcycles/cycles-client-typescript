@@ -297,11 +297,11 @@ export function errorCodeFromString(value: string | undefined): ErrorCode | unde
 }
 
 export function isToolAllowed(caps: Caps, tool: string): boolean {
-  if (caps.toolAllowlist !== undefined) {
+  if (caps.toolAllowlist && caps.toolAllowlist.length > 0) {
     return caps.toolAllowlist.includes(tool);
   }
-  if (caps.toolDenylist && caps.toolDenylist.includes(tool)) {
-    return false;
+  if (caps.toolDenylist && caps.toolDenylist.length > 0) {
+    return !caps.toolDenylist.includes(tool);
   }
   return true;
 }

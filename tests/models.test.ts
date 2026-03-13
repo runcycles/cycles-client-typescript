@@ -75,6 +75,23 @@ describe("models", () => {
       expect(isToolAllowed(caps, "search")).toBe(true);
       expect(isToolAllowed(caps, "delete")).toBe(false);
     });
+
+    it("empty allowlist falls through to denylist", () => {
+      const caps: Caps = { toolAllowlist: [], toolDenylist: ["delete"] };
+      expect(isToolAllowed(caps, "search")).toBe(true);
+      expect(isToolAllowed(caps, "delete")).toBe(false);
+    });
+
+    it("empty allowlist and empty denylist allows all", () => {
+      const caps: Caps = { toolAllowlist: [], toolDenylist: [] };
+      expect(isToolAllowed(caps, "anything")).toBe(true);
+    });
+
+    it("allowlist takes precedence over denylist", () => {
+      const caps: Caps = { toolAllowlist: ["search"], toolDenylist: ["search"] };
+      expect(isToolAllowed(caps, "search")).toBe(true);
+      expect(isToolAllowed(caps, "delete")).toBe(false);
+    });
   });
 
   describe("isMetricsEmpty", () => {

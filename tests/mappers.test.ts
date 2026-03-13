@@ -98,6 +98,14 @@ describe("reservationCreateResponseFromWire", () => {
     expect(parsed.reservationId).toBeUndefined();
     expect(parsed.caps).toBeUndefined();
   });
+
+  it("defaults affectedScopes to empty array when missing", () => {
+    const parsed = reservationCreateResponseFromWire({
+      decision: "ALLOW",
+      reservation_id: "r-1",
+    });
+    expect(parsed.affectedScopes).toEqual([]);
+  });
 });
 
 describe("errorResponseFromWire", () => {

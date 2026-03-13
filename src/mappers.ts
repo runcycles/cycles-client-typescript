@@ -99,7 +99,7 @@ export function reservationCreateResponseFromWire(
   return {
     decision: wire.decision as ReservationCreateResponse["decision"],
     reservationId: wire.reservation_id as string | undefined,
-    affectedScopes: wire.affected_scopes as string[],
+    affectedScopes: (wire.affected_scopes as string[] | undefined) ?? [],
     expiresAtMs: wire.expires_at_ms as number | undefined,
     scopePath: wire.scope_path as string | undefined,
     reserved: amountFromWire(wire.reserved as Record<string, unknown> | undefined),
