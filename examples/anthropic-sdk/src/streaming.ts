@@ -33,9 +33,10 @@ async function main() {
     MAX_TOKENS,
   );
 
+  // 1. Reserve budget — throws BudgetExceededError if exhausted.
+  //    No cleanup needed on failure (no handle exists yet).
   let handle;
   try {
-    // Reserve budget before starting the stream.
     handle = await reserveForStream({
       client: cyclesClient,
       estimate: estimatedCost,
@@ -43,7 +44,16 @@ async function main() {
       actionKind: "llm.completion",
       actionName: MODEL,
     });
+  } catch (err) {
+    if (err instanceof BudgetExceededError) {
+      console.error("Budget exhausted:", err.message);
+      return;
+    }
+    throw err;
+  }
 
+  // 2. Stream — release the reservation if anything fails.
+  try {
     // Respect budget caps for max_tokens.
     let maxTokens = MAX_TOKENS;
     if (handle.caps?.maxTokens) {
@@ -66,7 +76,7 @@ async function main() {
     const finalMessage = await stream.finalMessage();
     console.log(); // newline after streamed content
 
-    // Commit actual usage.
+    // 3. Commit actual usage.
     const actualCost = calculateCostMicrocents(
       MODEL,
       finalMessage.usage.input_tokens,
@@ -82,14 +92,8 @@ async function main() {
       usage: finalMessage.usage,
     });
   } catch (err) {
-    if (handle) {
-      await handle.release("stream_error");
-    }
-    if (err instanceof BudgetExceededError) {
-      console.error("Budget exhausted:", err.message);
-    } else {
-      throw err;
-    }
+    await handle.release("stream_error");
+    throw err;
   }
 }
 

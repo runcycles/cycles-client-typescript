@@ -675,7 +675,7 @@ The client validates inputs before sending requests:
 
 | Field | Constraint | Error |
 |-------|-----------|-------|
-| `subject` | At least one of: tenant, workspace, app, workflow, agent, toolset | `"Subject must have at least one standard field"` |
+| `subject` | At least one of: tenant, workspace, app, workflow, agent, toolset | `"Subject must have at least one standard field (tenant, workspace, app, workflow, agent, or toolset)"` |
 | `estimate` | Must be >= 0 | `"estimate must be non-negative"` |
 | `ttlMs` | 1,000 – 86,400,000 ms (1s – 24h) | `"ttl_ms must be between 1000 and 86400000"` |
 | `gracePeriodMs` | 0 – 60,000 ms (0 – 60s) | `"grace_period_ms must be between 0 and 60000"` |
@@ -781,6 +781,7 @@ ErrorCode.UNAUTHORIZED
 ErrorCode.FORBIDDEN
 ErrorCode.NOT_FOUND
 ErrorCode.INTERNAL_ERROR
+ErrorCode.UNKNOWN
 ```
 
 ## Examples

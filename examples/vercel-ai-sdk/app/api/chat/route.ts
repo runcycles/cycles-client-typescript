@@ -45,12 +45,10 @@ export async function POST(req: Request) {
     estimatedInputTokens * 250 + estimatedInputTokens * 2 * 1000,
   );
 
+  // 1. Reserve budget — throws BudgetExceededError if exhausted.
+  //    No cleanup needed on failure (no handle exists yet).
   let handle;
   try {
-    // Reserve budget before starting the stream.
-    // Throws BudgetExceededError if the tenant's budget is exhausted.
-    // Subject defaults (tenant, etc.) are read from cyclesClient.config
-    // automatically, so there's no need to pass them explicitly.
     handle = await reserveForStream({
       client: cyclesClient,
       estimate: estimatedCostMicrocents,
@@ -58,9 +56,21 @@ export async function POST(req: Request) {
       actionKind: "llm.completion",
       actionName: "gpt-4o",
     });
+  } catch (err) {
+    if (err instanceof BudgetExceededError) {
+      return new Response(
+        JSON.stringify({
+          error: "budget_exceeded",
+          message: "Your budget has been exhausted. Please contact your administrator.",
+        }),
+        { status: 402, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    throw err;
+  }
 
-    // Start the stream. The reservation heartbeat keeps it alive
-    // while tokens are being generated.
+  // 2. Stream — release the reservation if anything fails.
+  try {
     const result = streamText({
       model: openai("gpt-4o"),
       messages: await convertToModelMessages(messages),
@@ -71,7 +81,7 @@ export async function POST(req: Request) {
           (usage.promptTokens ?? 0) * 250 +
           (usage.completionTokens ?? 0) * 1000,
         );
-        await handle!.commit(actualCost, {
+        await handle.commit(actualCost, {
           tokensInput: usage.promptTokens,
           tokensOutput: usage.completionTokens,
           modelVersion: "gpt-4o",
@@ -81,21 +91,7 @@ export async function POST(req: Request) {
 
     return result.toDataStreamResponse();
   } catch (err) {
-    // Release the reservation if we fail before or during streaming.
-    // release() automatically stops the heartbeat.
-    if (handle) {
-      await handle.release("stream_error");
-    }
-
-    if (err instanceof BudgetExceededError) {
-      return new Response(
-        JSON.stringify({
-          error: "budget_exceeded",
-          message: "Your budget has been exhausted. Please contact your administrator.",
-        }),
-        { status: 402, headers: { "Content-Type": "application/json" } },
-      );
-    }
+    await handle.release("stream_error");
     throw err;
   }
 }

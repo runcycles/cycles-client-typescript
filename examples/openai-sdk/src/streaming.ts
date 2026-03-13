@@ -33,9 +33,10 @@ async function main() {
     estimatedInputTokens * 2,
   );
 
+  // 1. Reserve budget — throws BudgetExceededError if exhausted.
+  //    No cleanup needed on failure (no handle exists yet).
   let handle;
   try {
-    // Reserve budget before starting the stream.
     handle = await reserveForStream({
       client: cyclesClient,
       estimate: estimatedCost,
@@ -43,8 +44,16 @@ async function main() {
       actionKind: "llm.completion",
       actionName: MODEL,
     });
+  } catch (err) {
+    if (err instanceof BudgetExceededError) {
+      console.error("Budget exhausted:", err.message);
+      return;
+    }
+    throw err;
+  }
 
-    // Start streaming with usage tracking enabled.
+  // 2. Stream — release the reservation if anything fails.
+  try {
     // stream_options.include_usage makes OpenAI include token counts
     // in the final chunk — without it, usage is unavailable in streams.
     const stream = await openai.chat.completions.create({
@@ -68,7 +77,7 @@ async function main() {
     }
     console.log(); // newline after streamed content
 
-    // Commit actual usage now that the stream has finished.
+    // 3. Commit actual usage now that the stream has finished.
     const actualCost = calculateCostMicrocents(
       MODEL,
       usage?.prompt_tokens ?? 0,
@@ -81,14 +90,8 @@ async function main() {
     });
     console.log("\nCommitted:", { actualCost, usage });
   } catch (err) {
-    if (handle) {
-      await handle.release("stream_error");
-    }
-    if (err instanceof BudgetExceededError) {
-      console.error("Budget exhausted:", err.message);
-    } else {
-      throw err;
-    }
+    await handle.release("stream_error");
+    throw err;
   }
 }
 
