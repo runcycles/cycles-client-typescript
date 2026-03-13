@@ -1,13 +1,10 @@
 import { defineConfig } from "vitest/config";
-import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 export default defineConfig({
-  // Normalize root to fix Windows drive-letter casing issues
-  // (see https://github.com/vitest-dev/vitest/issues/5251)
-  root: resolve("."),
+  root: fileURLToPath(new URL(".", import.meta.url)),
   test: {
-    // Use threads pool — the default 'forks' pool has issues on
-    // Node 24 + Windows (https://github.com/vitest-dev/vitest/issues/8861)
+    environment: "node",
     pool: "threads",
   },
 });
