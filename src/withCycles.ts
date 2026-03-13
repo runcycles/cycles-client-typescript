@@ -41,26 +41,26 @@ export function withCycles<TArgs extends unknown[], TResult>(
   options: WithCyclesConfig & { client?: CyclesClient },
   fn: (...args: TArgs) => Promise<TResult>,
 ): (...args: TArgs) => Promise<TResult> {
+  const client = getEffectiveClient(options.client);
+  const config = client.config;
+
+  const defaultSubject = {
+    tenant: config.tenant,
+    workspace: config.workspace,
+    app: config.app,
+    workflow: config.workflow,
+    agent: config.agent,
+    toolset: config.toolset,
+  };
+
+  const retryEngine = new CommitRetryEngine(config);
+  const lifecycle = new AsyncCyclesLifecycle(
+    client,
+    retryEngine,
+    defaultSubject,
+  );
+
   return async (...args: TArgs): Promise<TResult> => {
-    const client = getEffectiveClient(options.client);
-    const config = client.config;
-
-    const defaultSubject = {
-      tenant: config.tenant,
-      workspace: config.workspace,
-      app: config.app,
-      workflow: config.workflow,
-      agent: config.agent,
-      toolset: config.toolset,
-    };
-
-    const retryEngine = new CommitRetryEngine(config);
-    const lifecycle = new AsyncCyclesLifecycle(
-      client,
-      retryEngine,
-      defaultSubject,
-    );
-
     return lifecycle.execute(
       fn as (...args: unknown[]) => Promise<TResult>,
       args,

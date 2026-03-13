@@ -82,13 +82,13 @@ describe("withCycles", () => {
     expect(result).toBe("lazy");
   });
 
-  it("throws if no client available", async () => {
-    const guarded = withCycles(
-      { estimate: 500 },
-      async () => "never",
-    );
-
-    await expect(guarded()).rejects.toThrow("No Cycles client available");
+  it("throws if no client available", () => {
+    expect(() =>
+      withCycles(
+        { estimate: 500 },
+        async () => "never",
+      ),
+    ).toThrow("No Cycles client available");
   });
 
   it("preserves function arguments", async () => {

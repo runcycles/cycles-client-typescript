@@ -9,10 +9,11 @@ import {
   metricsToWire,
   reservationCreateResponseFromWire,
 } from "./mappers.js";
-import type {
-  CyclesMetrics,
-  Decision,
-  Subject,
+import {
+  isMetricsEmpty,
+  type CyclesMetrics,
+  type Decision,
+  type Subject,
 } from "./models.js";
 import type { CommitRetryEngine } from "./retry.js";
 import {
@@ -162,16 +163,6 @@ function buildCommitBody(
     body.metadata = metadata;
   }
   return body;
-}
-
-function isMetricsEmpty(metrics: CyclesMetrics): boolean {
-  return (
-    metrics.tokensInput === undefined &&
-    metrics.tokensOutput === undefined &&
-    metrics.latencyMs === undefined &&
-    metrics.modelVersion === undefined &&
-    !metrics.custom
-  );
 }
 
 /** Build wire-format release request body. */
@@ -377,7 +368,7 @@ export class AsyncCyclesLifecycle {
     if (ttlMs <= 0) return undefined;
     const intervalMs = Math.max(ttlMs / 2, 1_000);
     let stopped = false;
-    let currentTimer: ReturnType<typeof setTimeout>;
+    let currentTimer: ReturnType<typeof setTimeout> | undefined;
 
     const tick = (): void => {
       if (stopped) return;
