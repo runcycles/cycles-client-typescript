@@ -1,7 +1,7 @@
 # Cycles + Vercel AI SDK Example
 
 A Next.js App Router API route that wraps the Vercel AI SDK's `streamText` with
-[Cycles](https://runcycles.io) budget governance using the streaming adapter.
+[Cycles](https://runcycles.com) budget governance using the streaming adapter.
 
 Every LLM call is:
 
@@ -16,7 +16,8 @@ call is made.
 ## Requirements
 
 - **Node.js 20+** (required for `fetch`, `AsyncLocalStorage`)
-- The route uses `export const runtime = 'nodejs'` to ensure the Node.js runtime
+- An OpenAI API key
+- A running Cycles server
 
 ## Setup
 

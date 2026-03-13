@@ -11,6 +11,7 @@
     "langchain": "^0.3.0",
     "@langchain/openai": "^0.3.0",
     "@langchain/core": "^0.3.0",
+    "@langchain/langgraph": "^0.2.0",
     "runcycles": "../../"
   },
   "devDependencies": {

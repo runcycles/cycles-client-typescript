@@ -14,6 +14,8 @@ Every LLM call is:
 3. **Committed** with actual token usage accumulated across all steps
 4. **Released** if the operation fails
 
+If the budget is exhausted, the request is denied with a `BudgetExceededError` before any LLM call is made.
+
 ## Requirements
 
 - **Node.js 20+**
@@ -59,17 +61,25 @@ import { withCycles, getCyclesContext } from "runcycles";
 const chain = prompt.pipe(model);
 
 const askQuestion = withCycles(
-  { client, estimate, actual, actionKind: "llm.completion" },
+  {
+    client: cyclesClient,
+    actionKind: "llm.completion",
+    actionName: "gpt-4o",
+    estimate: (question: string) => calculateCostMicrocents(MODEL, ...),
+    actual: (response: AIMessage) => {
+      // Extract actual cost from the LangChain response
+      const usage = response.response_metadata?.tokenUsage;
+      return calculateCostMicrocents(MODEL, usage.promptTokens, usage.completionTokens);
+    },
+  },
   async (question: string) => {
     const response = await chain.invoke({ question });
-
-    // Extract token usage from LangChain's response metadata
-    const usage = response.response_metadata?.tokenUsage;
     const ctx = getCyclesContext();
-    if (ctx && usage) {
+    if (ctx) {
+      const usage = response.response_metadata?.tokenUsage;
       ctx.metrics = { tokensInput: usage.promptTokens, tokensOutput: usage.completionTokens };
     }
-    return response;
+    return response; // Return AIMessage so actual() can extract usage
   },
 );
 ```
@@ -108,3 +118,13 @@ The agent example is unique because:
 - Agent runs make multiple LLM calls, so token usage must be accumulated across all steps
 - Cycles `Caps` can dynamically constrain the agent by filtering available tools via `isToolAllowed()`
 - The heartbeat keeps the reservation alive during potentially long agent runs
+
+## Testing
+
+```bash
+# Run the chain example
+npm run chain
+
+# Run the agent example
+npm run agent
+```

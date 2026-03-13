@@ -9,7 +9,7 @@
 
 import { ChatOpenAI } from "@langchain/openai";
 import { ChatPromptTemplate } from "@langchain/core/prompts";
-import { StringOutputParser } from "@langchain/core/output_parsers";
+import type { AIMessage } from "@langchain/core/messages";
 import {
   withCycles,
   getCyclesContext,
@@ -26,6 +26,17 @@ const prompt = ChatPromptTemplate.fromMessages([
 ]);
 const chain = prompt.pipe(model);
 
+/** Helper to extract token usage from a LangChain AIMessage. */
+function getTokenUsage(response: AIMessage) {
+  const usage = response.response_metadata?.tokenUsage as
+    | { promptTokens?: number; completionTokens?: number }
+    | undefined;
+  return {
+    inputTokens: usage?.promptTokens ?? 0,
+    outputTokens: usage?.completionTokens ?? 0,
+  };
+}
+
 const askQuestion = withCycles(
   {
     client: cyclesClient,
@@ -36,11 +47,9 @@ const askQuestion = withCycles(
       const inputTokens = Math.ceil((question.length + 60) / 4);
       return calculateCostMicrocents(MODEL, inputTokens, inputTokens * 2);
     },
-    actual: (_result: string, _question: string) => {
-      // Actual cost is set via getCyclesContext() inside the function,
-      // so we return 0 here and let the context handle it.
-      const ctx = getCyclesContext();
-      return ctx?.actualOverride ?? 0;
+    actual: (response: AIMessage) => {
+      const { inputTokens, outputTokens } = getTokenUsage(response);
+      return calculateCostMicrocents(MODEL, inputTokens, outputTokens);
     },
   },
   async (question: string) => {
@@ -49,34 +58,29 @@ const askQuestion = withCycles(
     // Invoke the chain. LangChain returns an AIMessage with response_metadata.
     const response = await chain.invoke({ question });
 
-    // Extract token usage from LangChain's response metadata.
-    const usage = response.response_metadata?.tokenUsage as
-      | { promptTokens?: number; completionTokens?: number }
-      | undefined;
-
-    if (ctx && usage) {
-      const inputTokens = usage.promptTokens ?? 0;
-      const outputTokens = usage.completionTokens ?? 0;
+    // Report token metrics.
+    if (ctx) {
+      const { inputTokens, outputTokens } = getTokenUsage(response);
       ctx.metrics = {
         tokensInput: inputTokens,
         tokensOutput: outputTokens,
         modelVersion: MODEL,
       };
-      // Store actual cost for the actual() callback.
-      (ctx as Record<string, unknown>).actualOverride =
-        calculateCostMicrocents(MODEL, inputTokens, outputTokens);
     }
 
-    // Parse the content to a string.
-    const parser = new StringOutputParser();
-    return parser.invoke(response);
+    // Return the AIMessage so the actual() callback can extract usage.
+    return response;
   },
 );
 
 async function main() {
   try {
-    const result = await askQuestion("What is budget governance for AI?");
-    console.log("Answer:", result);
+    const response = await askQuestion("What is budget governance for AI?");
+    // The response is an AIMessage — extract the text content.
+    const text = typeof response.content === "string"
+      ? response.content
+      : JSON.stringify(response.content);
+    console.log("Answer:", text);
   } catch (err) {
     if (err instanceof BudgetExceededError) {
       console.error("Budget exhausted:", err.message);

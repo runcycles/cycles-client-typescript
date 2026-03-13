@@ -98,3 +98,13 @@ await handle.commit(actualCost, {
 ```
 
 The Anthropic SDK's `.stream()` helper aggregates usage from `message_start` (input tokens) and `message_delta` (output tokens) events into `finalMessage().usage`, so you don't need to track them separately.
+
+## Testing
+
+```bash
+# Run the non-streaming example
+npm run non-streaming
+
+# Run the streaming example
+npm run streaming
+```

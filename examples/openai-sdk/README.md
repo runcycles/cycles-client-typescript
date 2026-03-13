@@ -103,3 +103,13 @@ await handle.commit(actualCost, { tokensInput, tokensOutput });
 ```
 
 **Important:** The `stream_options: { include_usage: true }` parameter is required to get token counts in streaming mode. Without it, the final chunk will not include usage data.
+
+## Testing
+
+```bash
+# Run the non-streaming example
+npm run non-streaming
+
+# Run the streaming example
+npm run streaming
+```

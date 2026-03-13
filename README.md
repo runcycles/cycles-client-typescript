@@ -790,7 +790,11 @@ See the [`examples/`](./examples/) directory:
 - [`basic-usage.ts`](./examples/basic-usage.ts) — Programmatic client with full reserve/commit lifecycle
 - [`async-usage.ts`](./examples/async-usage.ts) — `withCycles` with async/await and context access
 - [`decorator-usage.ts`](./examples/decorator-usage.ts) — `withCycles` patterns
-- [`vercel-ai-sdk/`](./examples/vercel-ai-sdk/) — Vercel AI SDK streaming integration
+- [`vercel-ai-sdk/`](./examples/vercel-ai-sdk/) — Next.js + Vercel AI SDK streaming integration
+- [`openai-sdk/`](./examples/openai-sdk/) — Direct OpenAI SDK with non-streaming and streaming patterns
+- [`anthropic-sdk/`](./examples/anthropic-sdk/) — Anthropic Claude SDK with Caps-aware `max_tokens`
+- [`langchain-js/`](./examples/langchain-js/) — LangChain.js chains and ReAct agents with Caps integration
+- [`express-middleware/`](./examples/express-middleware/) — Reusable Express middleware for budget governance
 
 ## Features
 
