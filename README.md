@@ -112,7 +112,7 @@ try {
 ```
 
 The handle is **once-only and race-safe**: in streaming code, multiple terminal paths can fire concurrently (onFinish, error handler, abort signal). Only the first terminal call wins:
-- `commit()` throws `CyclesError` if already finalized (dropping a commit silently hides bugs)
+- `commit()` throws `CyclesError` if already finalized (dropping a commit silently hides bugs). If `commit()` fails due to a network or server error, `finalized` resets to `false` so you can retry — but the heartbeat is **not** restarted (restart it manually if needed)
 - `release()` is a silent no-op if already finalized (best-effort by design)
 - `dispose()` stops the heartbeat only, for startup failures before streaming begins
 - `handle.finalized` — check whether the handle has been finalized
