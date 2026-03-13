@@ -11,6 +11,7 @@ describe("withCycles", () => {
   });
 
   afterEach(() => {
+    vi.unstubAllGlobals();
     vi.restoreAllMocks();
     _resetDefaults();
   });

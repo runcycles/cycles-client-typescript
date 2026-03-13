@@ -11,6 +11,7 @@ const config = new CyclesConfig({
 
 describe("CyclesClient", () => {
   afterEach(() => {
+    vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
 
