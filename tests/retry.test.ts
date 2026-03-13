@@ -70,6 +70,43 @@ describe("CommitRetryEngine", () => {
     expect(mockClient.commitReservation).toHaveBeenCalledTimes(1);
   });
 
+  it("warns when all retry attempts are exhausted", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const config = new CyclesConfig({
+      baseUrl: "http://localhost",
+      apiKey: "key",
+      retryMaxAttempts: 2,
+      retryInitialDelay: 100,
+      retryMultiplier: 2,
+      retryMaxDelay: 1000,
+    });
+
+    const engine = new CommitRetryEngine(config);
+    const mockClient = {
+      commitReservation: vi
+        .fn()
+        .mockResolvedValue(CyclesResponse.httpError(500, "Server error")),
+    };
+    engine.setClient(mockClient as any);
+
+    engine.schedule("r-exhaust", { idempotency_key: "c-1" });
+
+    // Advance through both attempts (100ms + 200ms)
+    await vi.advanceTimersByTimeAsync(100);
+    await vi.advanceTimersByTimeAsync(200);
+
+    expect(mockClient.commitReservation).toHaveBeenCalledTimes(2);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("exhausted"),
+    );
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("r-exhaust"),
+    );
+
+    warnSpy.mockRestore();
+  });
+
   it("does not schedule when disabled", () => {
     const config = new CyclesConfig({
       baseUrl: "http://localhost",
