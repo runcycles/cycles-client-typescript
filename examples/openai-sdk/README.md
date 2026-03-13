@@ -1,6 +1,6 @@
 # Cycles + OpenAI SDK Example
 
-Budget-governed chat completions using the official [OpenAI Node SDK](https://github.com/openai/openai-node) with [Cycles](https://runcycles.com).
+Budget-governed chat completions using the official [OpenAI Node SDK](https://github.com/openai/openai-node) with [Cycles](https://runcycles.io).
 
 Two scripts demonstrate both integration patterns side-by-side:
 

@@ -1,6 +1,6 @@
 # Cycles + Anthropic Claude SDK Example
 
-Budget-governed chat completions using the official [Anthropic SDK](https://github.com/anthropics/anthropic-sdk-typescript) with [Cycles](https://runcycles.com).
+Budget-governed chat completions using the official [Anthropic SDK](https://github.com/anthropics/anthropic-sdk-typescript) with [Cycles](https://runcycles.io).
 
 Two scripts demonstrate both integration patterns:
 

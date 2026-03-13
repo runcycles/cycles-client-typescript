@@ -1,6 +1,6 @@
 # Cycles + Express Middleware Example
 
-Reusable Express middleware for [Cycles](https://runcycles.com) budget governance, demonstrating how to protect any API route with budget checks.
+Reusable Express middleware for [Cycles](https://runcycles.io) budget governance, demonstrating how to protect any API route with budget checks.
 
 This example shows two patterns on the same server:
 

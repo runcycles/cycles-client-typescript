@@ -1,6 +1,6 @@
 # Cycles + LangChain.js Example
 
-Budget-governed LLM chains and agents using [LangChain.js](https://github.com/langchain-ai/langchainjs) with [Cycles](https://runcycles.com).
+Budget-governed LLM chains and agents using [LangChain.js](https://github.com/langchain-ai/langchainjs) with [Cycles](https://runcycles.io).
 
 Two scripts demonstrate budget governance for different LangChain patterns:
 

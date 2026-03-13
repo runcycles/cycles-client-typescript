@@ -1,6 +1,6 @@
 # Cycles TypeScript Client
 
-TypeScript client for the [Cycles](https://runcycles.com) budget-management protocol — govern spend on AI calls, API usage, and any metered resource.
+TypeScript client for the [Cycles](https://runcycles.io) budget-management protocol — govern spend on AI calls, API usage, and any metered resource.
 
 Cycles lets you set budgets, reserve capacity before expensive operations, and track actual usage. This client handles the full reservation lifecycle: reserve budget up front, execute your work, then commit or release — with automatic heartbeats, retries, and typed error handling.
 
