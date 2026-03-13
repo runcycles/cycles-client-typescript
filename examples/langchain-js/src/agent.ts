@@ -42,9 +42,10 @@ async function main() {
   // Estimate a higher budget for agent runs — agents make multiple LLM calls.
   const estimatedCost = calculateCostMicrocents(MODEL, 2000, 4000);
 
+  // 1. Reserve budget — throws BudgetExceededError if exhausted.
+  //    No cleanup needed on failure (no handle exists yet).
   let handle;
   try {
-    // Reserve budget before the agent run.
     handle = await reserveForStream({
       client: cyclesClient,
       estimate: estimatedCost,
@@ -52,7 +53,16 @@ async function main() {
       actionKind: "agent.run",
       actionName: "react-agent",
     });
+  } catch (err) {
+    if (err instanceof BudgetExceededError) {
+      console.error("Budget exhausted:", err.message);
+      return;
+    }
+    throw err;
+  }
 
+  // 2. Run the agent — release the reservation if anything fails.
+  try {
     // Filter tools based on budget caps (toolAllowlist).
     let tools = allTools;
     if (handle.caps) {
@@ -87,7 +97,7 @@ async function main() {
       }
     }
 
-    // Commit aggregate cost.
+    // 3. Commit aggregate cost.
     const actualCost = calculateCostMicrocents(MODEL, totalInputTokens, totalOutputTokens);
     await handle.commit(actualCost, {
       tokensInput: totalInputTokens,
@@ -101,14 +111,8 @@ async function main() {
       steps: result.messages.length,
     });
   } catch (err) {
-    if (handle) {
-      await handle.release("agent_error");
-    }
-    if (err instanceof BudgetExceededError) {
-      console.error("Budget exhausted:", err.message);
-    } else {
-      throw err;
-    }
+    await handle.release("agent_error");
+    throw err;
   }
 }
 
