@@ -65,29 +65,26 @@ export async function POST(req: Request) {
       model: openai("gpt-4o"),
       messages: await convertToModelMessages(messages),
       onFinish: async ({ usage }) => {
-        try {
-          // Commit actual usage once the stream completes.
-          const actualCost = Math.ceil(
-            (usage.promptTokens ?? 0) * 250 +
-            (usage.completionTokens ?? 0) * 1000,
-          );
-          await handle!.commit(actualCost, {
-            tokensInput: usage.promptTokens,
-            tokensOutput: usage.completionTokens,
-            modelVersion: "gpt-4o",
-          });
-        } finally {
-          handle!.dispose();
-        }
+        // Commit actual usage once the stream completes.
+        // commit() automatically stops the heartbeat.
+        const actualCost = Math.ceil(
+          (usage.promptTokens ?? 0) * 250 +
+          (usage.completionTokens ?? 0) * 1000,
+        );
+        await handle!.commit(actualCost, {
+          tokensInput: usage.promptTokens,
+          tokensOutput: usage.completionTokens,
+          modelVersion: "gpt-4o",
+        });
       },
     });
 
     return result.toDataStreamResponse();
   } catch (err) {
     // Release the reservation if we fail before or during streaming.
+    // release() automatically stops the heartbeat.
     if (handle) {
       await handle.release("stream_error");
-      handle.dispose();
     }
 
     if (err instanceof BudgetExceededError) {
