@@ -31,7 +31,7 @@ describe("CommitRetryEngine", () => {
     };
     engine.setClient(mockClient as any);
 
-    engine.schedule("r-1", { idempotencyKey: "c-1", actual: { unit: "USD_MICROCENTS", amount: 100 } });
+    engine.schedule("r-1", { idempotency_key: "c-1", actual: { unit: "USD_MICROCENTS", amount: 100 } });
 
     // First retry after 100ms
     await vi.advanceTimersByTimeAsync(100);
@@ -60,7 +60,7 @@ describe("CommitRetryEngine", () => {
     };
     engine.setClient(mockClient as any);
 
-    engine.schedule("r-1", { idempotencyKey: "c-1" });
+    engine.schedule("r-1", { idempotency_key: "c-1" });
 
     await vi.advanceTimersByTimeAsync(100);
     expect(mockClient.commitReservation).toHaveBeenCalledTimes(1);
@@ -81,7 +81,7 @@ describe("CommitRetryEngine", () => {
     const mockClient = { commitReservation: vi.fn() };
     engine.setClient(mockClient as any);
 
-    engine.schedule("r-1", { idempotencyKey: "c-1" });
+    engine.schedule("r-1", { idempotency_key: "c-1" });
 
     vi.advanceTimersByTime(10000);
     expect(mockClient.commitReservation).not.toHaveBeenCalled();

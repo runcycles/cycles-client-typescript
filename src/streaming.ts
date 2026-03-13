@@ -185,7 +185,7 @@ export async function reserveForStream(
   // Heartbeat and finalization state
   let heartbeatStopped = false;
   let finalized = false;
-  let currentTimer: ReturnType<typeof setTimeout>;
+  let currentTimer: ReturnType<typeof setTimeout> | undefined;
 
   const stopHeartbeat = (): void => {
     if (!heartbeatStopped) {

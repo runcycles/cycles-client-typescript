@@ -192,6 +192,11 @@ export class CyclesClient {
     }
   }
 
+  async [Symbol.asyncDispose](): Promise<void> {
+    // No persistent resources to clean up currently.
+    // Provided for `await using client = new CyclesClient(config)` support.
+  }
+
   private async _handleResponse(resp: Response): Promise<CyclesResponse> {
     // Response body is stored in wire format (snake_case).
     // Callers use explicit mappers from mappers.ts for type-safe access.
