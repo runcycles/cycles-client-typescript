@@ -45,22 +45,21 @@ describe("reserveForStream", () => {
       tenant: "acme",
     });
 
-    try {
-      expect(handle.reservationId).toBe("r-stream-1");
-      expect(handle.decision).toBe("ALLOW");
-      expect(handle.caps).toEqual({ maxTokens: 4096 });
+    expect(handle.reservationId).toBe("r-stream-1");
+    expect(handle.decision).toBe("ALLOW");
+    expect(handle.caps).toEqual({ maxTokens: 4096 });
 
-      // Verify wire-format request
-      const createBody = client.createReservation.mock.calls[0][0];
-      expect(createBody.idempotency_key).toBeDefined();
-      expect(createBody.estimate).toEqual({ unit: "USD_MICROCENTS", amount: 5000 });
-      expect(createBody.action).toEqual({ kind: "llm.completion", name: "gpt-4o" });
-    } finally {
-      handle.dispose();
-    }
+    // Verify wire-format request
+    const createBody = client.createReservation.mock.calls[0][0];
+    expect(createBody.idempotency_key).toBeDefined();
+    expect(createBody.estimate).toEqual({ unit: "USD_MICROCENTS", amount: 5000 });
+    expect(createBody.action).toEqual({ kind: "llm.completion", name: "gpt-4o" });
+
+    // Cleanup via dispose (simulates startup-failure path)
+    handle.dispose();
   });
 
-  it("commits with actual usage", async () => {
+  it("commits with actual usage and auto-disposes heartbeat", async () => {
     const client = makeMockClient();
     client.createReservation.mockResolvedValue(
       CyclesResponse.success(200, {
@@ -79,28 +78,29 @@ describe("reserveForStream", () => {
       tenant: "acme",
     });
 
-    try {
-      await handle.commit(2500, {
-        tokensInput: 100,
-        tokensOutput: 200,
-        modelVersion: "gpt-4o",
-      });
+    await handle.commit(2500, {
+      tokensInput: 100,
+      tokensOutput: 200,
+      modelVersion: "gpt-4o",
+    });
 
-      expect(client.commitReservation).toHaveBeenCalledOnce();
-      const [resId, commitBody] = client.commitReservation.mock.calls[0];
-      expect(resId).toBe("r-stream-2");
-      expect(commitBody.actual).toEqual({ unit: "USD_MICROCENTS", amount: 2500 });
-      expect(commitBody.metrics).toEqual({
-        tokens_input: 100,
-        tokens_output: 200,
-        model_version: "gpt-4o",
-      });
-    } finally {
-      handle.dispose();
-    }
+    // No dispose() needed — commit auto-stops the heartbeat
+    expect(client.commitReservation).toHaveBeenCalledOnce();
+    const [resId, commitBody] = client.commitReservation.mock.calls[0];
+    expect(resId).toBe("r-stream-2");
+    expect(commitBody.actual).toEqual({ unit: "USD_MICROCENTS", amount: 2500 });
+    expect(commitBody.metrics).toEqual({
+      tokens_input: 100,
+      tokens_output: 200,
+      model_version: "gpt-4o",
+    });
+
+    // Verify heartbeat stopped: after waiting, no extend calls should appear
+    await new Promise((r) => setTimeout(r, 50));
+    expect(client.extendReservation).not.toHaveBeenCalled();
   });
 
-  it("releases on abort", async () => {
+  it("releases on abort and auto-disposes heartbeat", async () => {
     const client = makeMockClient();
     client.createReservation.mockResolvedValue(
       CyclesResponse.success(200, {
@@ -119,15 +119,16 @@ describe("reserveForStream", () => {
       tenant: "acme",
     });
 
-    try {
-      await handle.release("user_cancelled");
-      expect(client.releaseReservation).toHaveBeenCalledOnce();
-      const [resId, releaseBody] = client.releaseReservation.mock.calls[0];
-      expect(resId).toBe("r-stream-3");
-      expect(releaseBody.reason).toBe("user_cancelled");
-    } finally {
-      handle.dispose();
-    }
+    await handle.release("user_cancelled");
+    // No dispose() needed — release auto-stops the heartbeat
+    expect(client.releaseReservation).toHaveBeenCalledOnce();
+    const [resId, releaseBody] = client.releaseReservation.mock.calls[0];
+    expect(resId).toBe("r-stream-3");
+    expect(releaseBody.reason).toBe("user_cancelled");
+
+    // Verify heartbeat stopped
+    await new Promise((r) => setTimeout(r, 50));
+    expect(client.extendReservation).not.toHaveBeenCalled();
   });
 
   it("throws on DENY decision", async () => {
@@ -190,13 +191,11 @@ describe("reserveForStream", () => {
       // tenant not specified — should fall back to config
     });
 
-    try {
-      const createBody = client.createReservation.mock.calls[0][0];
-      expect(createBody.subject.tenant).toBe("from-config");
-      expect(createBody.subject.workspace).toBe("ws-1");
-    } finally {
-      handle.dispose();
-    }
+    const createBody = client.createReservation.mock.calls[0][0];
+    expect(createBody.subject.tenant).toBe("from-config");
+    expect(createBody.subject.workspace).toBe("ws-1");
+
+    handle.dispose();
   });
 
   it("dispose is idempotent", async () => {

@@ -63,13 +63,19 @@ const config = new CyclesConfig({
 });
 const client = new CyclesClient(config);
 
-const handle = await reserveForStream({
-  client,
-  estimate: 5000,
-  unit: "USD_MICROCENTS",
-  actionKind: "llm.completion",
-  actionName: "gpt-4o",
-});
+let handle;
+try {
+  handle = await reserveForStream({
+    client,
+    estimate: 5000,
+    unit: "USD_MICROCENTS",
+    actionKind: "llm.completion",
+    actionName: "gpt-4o",
+  });
+} catch (err) {
+  // Reservation denied (BudgetExceededError, etc.) — no cleanup needed
+  throw err;
+}
 
 try {
   // Start streaming (e.g. Vercel AI SDK's streamText)
@@ -78,6 +84,7 @@ try {
     messages,
     onFinish: async ({ usage }) => {
       const actualCost = (usage.promptTokens + usage.completionTokens) * 3;
+      // commit() automatically stops the heartbeat
       await handle.commit(actualCost, {
         tokensInput: usage.promptTokens,
         tokensOutput: usage.completionTokens,
@@ -87,17 +94,20 @@ try {
 
   return stream.toDataStreamResponse();
 } catch (err) {
+  // Stream startup failed — release and stop heartbeat
   await handle.release("stream_error");
   throw err;
-} finally {
-  handle.dispose(); // Always stop the heartbeat
 }
 ```
 
+The handle owns its finalization: `commit()` and `release()` automatically stop the heartbeat.
+There is no need for a `finally { handle.dispose() }` block — in a streaming handler, the
+`finally` would run when the handler returns the response object, not when the stream ends.
+
 The `StreamReservation` handle provides:
-- `handle.commit(actual, metrics?, metadata?)` — commit actual usage after stream completes
-- `handle.release(reason?)` — release reservation on error/abort (best-effort)
-- `handle.dispose()` — stop heartbeat timer (always call in `finally`)
+- `handle.commit(actual, metrics?, metadata?)` — commit actual usage and stop heartbeat
+- `handle.release(reason?)` — release reservation and stop heartbeat (best-effort)
+- `handle.dispose()` — stop heartbeat only (for stream startup failures where neither commit nor release applies)
 - `handle.reservationId` — the reservation ID
 - `handle.decision` — the budget decision (ALLOW or ALLOW_WITH_CAPS)
 - `handle.caps` — soft-landing caps, if any

@@ -7,12 +7,17 @@
  * essential for LLM streaming where the function returns a stream object
  * immediately but actual usage is only known after the stream finishes.
  *
+ * The handle owns its own finalization: calling `commit()` or `release()`
+ * automatically stops the heartbeat. There is no need for a `finally`
+ * block around the stream — the heartbeat lives until a terminal
+ * operation (commit/release) is reached.
+ *
  * Typical lifecycle:
  *   1. `reserveForStream(...)` — creates reservation + starts heartbeat
  *   2. Start streaming (e.g. `streamText(...)`)
- *   3. On stream finish → `handle.commit(actualCost, metrics)`
- *   4. On stream error/abort → `handle.release("aborted")`
- *   5. Always → `handle.dispose()` to stop the heartbeat
+ *   3. On stream finish → `handle.commit(actualCost, metrics)` (stops heartbeat)
+ *   4. On stream error/abort → `handle.release("aborted")` (stops heartbeat)
+ *   5. If stream startup fails before streaming begins → `handle.dispose()`
  */
 
 import { randomUUID } from "node:crypto";
@@ -62,7 +67,7 @@ export interface StreamReservation {
 
   /**
    * Commit actual usage after the stream completes successfully.
-   * Call this from `onFinish` or equivalent.
+   * Automatically stops the heartbeat. Call from `onFinish` or equivalent.
    */
   commit(
     actual: number,
@@ -72,12 +77,14 @@ export interface StreamReservation {
 
   /**
    * Release the reservation on error or abort.
-   * Best-effort — errors are swallowed.
+   * Automatically stops the heartbeat. Best-effort — errors are swallowed.
    */
   release(reason?: string): Promise<void>;
 
   /**
-   * Stop the heartbeat timer. Always call this in a `finally` block.
+   * Stop the heartbeat timer without committing or releasing.
+   * Use only for stream startup failures where the stream was never started.
+   * For normal finalization, use `commit()` or `release()` instead.
    * Safe to call multiple times.
    */
   dispose(): void;
@@ -165,9 +172,16 @@ export async function reserveForStream(
     );
   }
 
-  // Start heartbeat
+  // Heartbeat management
   let disposed = false;
   let currentTimer: ReturnType<typeof setTimeout>;
+
+  const stopHeartbeat = (): void => {
+    if (!disposed) {
+      disposed = true;
+      clearTimeout(currentTimer);
+    }
+  };
 
   const startHeartbeat = (): void => {
     if (ttlMs <= 0) return;
@@ -201,6 +215,7 @@ export async function reserveForStream(
       metrics?: CyclesMetrics,
       metadata?: Record<string, unknown>,
     ): Promise<void> {
+      stopHeartbeat();
       const commitBody: Record<string, unknown> = {
         idempotency_key: randomUUID(),
         actual: { unit, amount: actual },
@@ -215,6 +230,7 @@ export async function reserveForStream(
     },
 
     async release(reason?: string): Promise<void> {
+      stopHeartbeat();
       try {
         const releaseBody = { idempotency_key: randomUUID(), reason: reason ?? "stream_aborted" };
         await client.releaseReservation(reservationId, releaseBody);
@@ -224,10 +240,7 @@ export async function reserveForStream(
     },
 
     dispose(): void {
-      if (!disposed) {
-        disposed = true;
-        clearTimeout(currentTimer);
-      }
+      stopHeartbeat();
     },
   };
 }
