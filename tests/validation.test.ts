@@ -5,6 +5,7 @@ import {
   validateNonNegative,
   validateTtlMs,
   validateGracePeriodMs,
+  validateExtendByMs,
 } from "../src/validation.js";
 
 describe("validation", () => {
@@ -87,6 +88,32 @@ describe("validation", () => {
 
     it("throws with too high", () => {
       expect(() => validateGracePeriodMs(100_000)).toThrow("between 0");
+    });
+  });
+
+  describe("validateExtendByMs", () => {
+    it("passes with minimum value (1)", () => {
+      expect(() => validateExtendByMs(1)).not.toThrow();
+    });
+
+    it("passes with maximum value (86400000)", () => {
+      expect(() => validateExtendByMs(86_400_000)).not.toThrow();
+    });
+
+    it("passes with typical value", () => {
+      expect(() => validateExtendByMs(30_000)).not.toThrow();
+    });
+
+    it("throws with zero", () => {
+      expect(() => validateExtendByMs(0)).toThrow("between 1 and 86400000");
+    });
+
+    it("throws with negative", () => {
+      expect(() => validateExtendByMs(-1)).toThrow("between 1 and 86400000");
+    });
+
+    it("throws with too high", () => {
+      expect(() => validateExtendByMs(86_400_001)).toThrow("between 1 and 86400000");
     });
   });
 });
