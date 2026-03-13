@@ -16,6 +16,7 @@ import type {
 } from "./models.js";
 import type { CommitRetryEngine } from "./retry.js";
 import {
+  validateExtendByMs,
   validateGracePeriodMs,
   validateNonNegative,
   validateSubject,
@@ -179,8 +180,9 @@ function buildReleaseBody(reason: string): Record<string, unknown> {
 }
 
 /** Build wire-format extend request body. */
-function buildExtendBody(ttlMs: number): Record<string, unknown> {
-  return { idempotency_key: randomUUID(), extend_by_ms: ttlMs };
+function buildExtendBody(extendByMs: number): Record<string, unknown> {
+  validateExtendByMs(extendByMs);
+  return { idempotency_key: randomUUID(), extend_by_ms: extendByMs };
 }
 
 export class AsyncCyclesLifecycle {

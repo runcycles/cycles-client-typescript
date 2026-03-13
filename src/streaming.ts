@@ -7,18 +7,29 @@
  * essential for LLM streaming where the function returns a stream object
  * immediately but actual usage is only known after the stream finishes.
  *
+ * The handle owns its own finalization: calling `commit()` or `release()`
+ * automatically stops the heartbeat. There is no need for a `finally`
+ * block around the stream — the heartbeat lives until a terminal
+ * operation (commit/release) is reached.
+ *
+ * RACE SAFETY: In real streaming code, multiple terminal paths can fire
+ * concurrently (onFinish, error handler, abort signal, client disconnect).
+ * The handle is once-only: the first terminal call (commit/release/dispose)
+ * wins, and subsequent calls are either no-ops (release, dispose) or throw
+ * (commit). Check `handle.finalized` to inspect state.
+ *
  * Typical lifecycle:
  *   1. `reserveForStream(...)` — creates reservation + starts heartbeat
  *   2. Start streaming (e.g. `streamText(...)`)
- *   3. On stream finish → `handle.commit(actualCost, metrics)`
- *   4. On stream error/abort → `handle.release("aborted")`
- *   5. Always → `handle.dispose()` to stop the heartbeat
+ *   3. On stream finish → `handle.commit(actualCost, metrics)` (stops heartbeat)
+ *   4. On stream error/abort → `handle.release("aborted")` (stops heartbeat)
+ *   5. If stream startup fails before streaming begins → `handle.dispose()`
  */
 
 import { randomUUID } from "node:crypto";
 import type { CyclesClient } from "./client.js";
 import { buildProtocolException } from "./errors.js";
-import { CyclesProtocolError } from "./exceptions.js";
+import { CyclesError, CyclesProtocolError } from "./exceptions.js";
 import {
   metricsToWire,
   reservationCreateResponseFromWire,
@@ -26,6 +37,7 @@ import {
 import type { Caps, CyclesMetrics, Decision, Subject } from "./models.js";
 import { isMetricsEmpty } from "./models.js";
 import {
+  validateExtendByMs,
   validateGracePeriodMs,
   validateNonNegative,
   validateSubject,
@@ -58,10 +70,13 @@ export interface StreamReservation {
   readonly decision: Decision;
   /** Caps imposed by the budget, if any. */
   readonly caps: Caps | undefined;
+  /** True after commit(), release(), or dispose() has been called. */
+  readonly finalized: boolean;
 
   /**
    * Commit actual usage after the stream completes successfully.
-   * Call this from `onFinish` or equivalent.
+   * Automatically stops the heartbeat. Call from `onFinish` or equivalent.
+   * Throws `CyclesError` if the handle is already finalized.
    */
   commit(
     actual: number,
@@ -71,13 +86,16 @@ export interface StreamReservation {
 
   /**
    * Release the reservation on error or abort.
-   * Best-effort — errors are swallowed.
+   * Automatically stops the heartbeat. Best-effort — errors are swallowed.
+   * No-op if the handle is already finalized.
    */
   release(reason?: string): Promise<void>;
 
   /**
-   * Stop the heartbeat timer. Always call this in a `finally` block.
-   * Safe to call multiple times.
+   * Stop the heartbeat timer without committing or releasing.
+   * Use only for stream startup failures where the stream was never started.
+   * For normal finalization, use `commit()` or `release()` instead.
+   * No-op if the handle is already finalized.
    */
   dispose(): void;
 }
@@ -164,18 +182,27 @@ export async function reserveForStream(
     );
   }
 
-  // Start heartbeat
-  let disposed = false;
+  // Heartbeat and finalization state
+  let heartbeatStopped = false;
+  let finalized = false;
   let currentTimer: ReturnType<typeof setTimeout>;
+
+  const stopHeartbeat = (): void => {
+    if (!heartbeatStopped) {
+      heartbeatStopped = true;
+      clearTimeout(currentTimer);
+    }
+  };
 
   const startHeartbeat = (): void => {
     if (ttlMs <= 0) return;
     const intervalMs = Math.max(ttlMs / 2, 1_000);
 
     const tick = (): void => {
-      if (disposed) return;
+      if (heartbeatStopped) return;
       currentTimer = setTimeout(() => {
-        if (disposed) return;
+        if (heartbeatStopped) return;
+        validateExtendByMs(ttlMs);
         const extendBody = { idempotency_key: randomUUID(), extend_by_ms: ttlMs };
         void client
           .extendReservation(reservationId, extendBody)
@@ -194,11 +221,20 @@ export async function reserveForStream(
     decision: parsed.decision as Decision,
     caps: parsed.caps,
 
+    get finalized(): boolean {
+      return finalized;
+    },
+
     async commit(
       actual: number,
       metrics?: CyclesMetrics,
       metadata?: Record<string, unknown>,
     ): Promise<void> {
+      if (finalized) {
+        throw new CyclesError("StreamReservation already finalized");
+      }
+      finalized = true;
+      stopHeartbeat();
       const commitBody: Record<string, unknown> = {
         idempotency_key: randomUUID(),
         actual: { unit, amount: actual },
@@ -213,6 +249,9 @@ export async function reserveForStream(
     },
 
     async release(reason?: string): Promise<void> {
+      if (finalized) return;
+      finalized = true;
+      stopHeartbeat();
       try {
         const releaseBody = { idempotency_key: randomUUID(), reason: reason ?? "stream_aborted" };
         await client.releaseReservation(reservationId, releaseBody);
@@ -222,10 +261,9 @@ export async function reserveForStream(
     },
 
     dispose(): void {
-      if (!disposed) {
-        disposed = true;
-        clearTimeout(currentTimer);
-      }
+      if (finalized) return;
+      finalized = true;
+      stopHeartbeat();
     },
   };
 }

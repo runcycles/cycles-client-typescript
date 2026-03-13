@@ -63,13 +63,19 @@ const config = new CyclesConfig({
 });
 const client = new CyclesClient(config);
 
-const handle = await reserveForStream({
-  client,
-  estimate: 5000,
-  unit: "USD_MICROCENTS",
-  actionKind: "llm.completion",
-  actionName: "gpt-4o",
-});
+let handle;
+try {
+  handle = await reserveForStream({
+    client,
+    estimate: 5000,
+    unit: "USD_MICROCENTS",
+    actionKind: "llm.completion",
+    actionName: "gpt-4o",
+  });
+} catch (err) {
+  // Reservation denied (BudgetExceededError, etc.) — no cleanup needed
+  throw err;
+}
 
 try {
   // Start streaming (e.g. Vercel AI SDK's streamText)
@@ -78,6 +84,7 @@ try {
     messages,
     onFinish: async ({ usage }) => {
       const actualCost = (usage.promptTokens + usage.completionTokens) * 3;
+      // commit() automatically stops the heartbeat
       await handle.commit(actualCost, {
         tokensInput: usage.promptTokens,
         tokensOutput: usage.completionTokens,
@@ -87,32 +94,86 @@ try {
 
   return stream.toDataStreamResponse();
 } catch (err) {
+  // Stream startup failed — release and stop heartbeat
   await handle.release("stream_error");
   throw err;
-} finally {
-  handle.dispose(); // Always stop the heartbeat
 }
 ```
 
+The handle owns its finalization: `commit()` and `release()` automatically stop the heartbeat.
+There is no need for a `finally { handle.dispose() }` block — in a streaming handler, the
+`finally` would run when the handler returns the response object, not when the stream ends.
+
+The handle is **once-only and race-safe**: in real streaming code, multiple terminal paths
+can fire (onFinish, error, abort signal, client disconnect). Only the first terminal call wins:
+- `commit()` throws `CyclesError` if already finalized (dropping a commit silently hides bugs)
+- `release()` is a silent no-op if already finalized (best-effort by design)
+- `handle.finalized` — check whether the handle has been finalized
+
 The `StreamReservation` handle provides:
-- `handle.commit(actual, metrics?, metadata?)` — commit actual usage after stream completes
-- `handle.release(reason?)` — release reservation on error/abort (best-effort)
-- `handle.dispose()` — stop heartbeat timer (always call in `finally`)
+- `handle.commit(actual, metrics?, metadata?)` — commit actual usage and stop heartbeat (throws if finalized)
+- `handle.release(reason?)` — release reservation and stop heartbeat (no-op if finalized)
+- `handle.dispose()` — stop heartbeat only, for startup failures (no-op if finalized)
+- `handle.finalized` — true after any terminal call
 - `handle.reservationId` — the reservation ID
 - `handle.decision` — the budget decision (ALLOW or ALLOW_WITH_CAPS)
 - `handle.caps` — soft-landing caps, if any
 
 ### Programmatic client
 
-The client sends wire-format (snake_case) request bodies and returns wire-format responses:
+The client sends wire-format (snake_case) request bodies and returns wire-format responses.
+Use the typed mappers to convert between camelCase TypeScript interfaces and wire format:
 
 ```typescript
-import { CyclesClient, CyclesConfig } from "runcycles";
+import {
+  CyclesClient,
+  CyclesConfig,
+  reservationCreateRequestToWire,
+  reservationCreateResponseFromWire,
+  commitRequestToWire,
+  commitResponseFromWire,
+} from "runcycles";
 
 const config = new CyclesConfig({ baseUrl: "http://localhost:7878", apiKey: "your-api-key" });
 const client = new CyclesClient(config);
 
-// 1. Reserve budget
+// 1. Reserve budget (using typed request mapper)
+const response = await client.createReservation(
+  reservationCreateRequestToWire({
+    idempotencyKey: "req-001",
+    subject: { tenant: "acme", agent: "support-bot" },
+    action: { kind: "llm.completion", name: "gpt-4" },
+    estimate: { unit: "USD_MICROCENTS", amount: 500_000 },
+    ttlMs: 30_000,
+  }),
+);
+
+if (response.isSuccess) {
+  // Parse typed response
+  const parsed = reservationCreateResponseFromWire(response.body!);
+
+  // 2. Do work ...
+
+  // 3. Commit actual usage (using typed request mapper)
+  const commitResp = await client.commitReservation(
+    parsed.reservationId!,
+    commitRequestToWire({
+      idempotencyKey: "commit-001",
+      actual: { unit: "USD_MICROCENTS", amount: 420_000 },
+      metrics: { tokensInput: 1200, tokensOutput: 800 },
+    }),
+  );
+
+  if (commitResp.isSuccess) {
+    const commit = commitResponseFromWire(commitResp.body!);
+    console.log(`Charged: ${commit.charged.amount}, Released: ${commit.released?.amount}`);
+  }
+}
+```
+
+You can also pass raw snake_case objects directly without mappers:
+
+```typescript
 const response = await client.createReservation({
   idempotency_key: "req-001",
   subject: { tenant: "acme", agent: "support-bot" },
@@ -120,19 +181,6 @@ const response = await client.createReservation({
   estimate: { unit: "USD_MICROCENTS", amount: 500_000 },
   ttl_ms: 30_000,
 });
-
-if (response.isSuccess) {
-  const reservationId = response.getBodyAttribute("reservation_id") as string;
-
-  // 2. Do work ...
-
-  // 3. Commit actual usage
-  await client.commitReservation(reservationId, {
-    idempotency_key: "commit-001",
-    actual: { unit: "USD_MICROCENTS", amount: 420_000 },
-    metrics: { tokens_input: 1200, tokens_output: 800 },
-  });
-}
 ```
 
 ## Configuration
@@ -240,48 +288,121 @@ Exception hierarchy:
 ## Preflight checks (decide)
 
 ```typescript
-const response = await client.decide({
-  idempotency_key: "decide-001",
-  subject: { tenant: "acme" },
-  action: { kind: "llm.completion", name: "gpt-4" },
-  estimate: { unit: "USD_MICROCENTS", amount: 500_000 },
-});
+import { decisionRequestToWire, decisionResponseFromWire } from "runcycles";
+
+const response = await client.decide(
+  decisionRequestToWire({
+    idempotencyKey: "decide-001",
+    subject: { tenant: "acme" },
+    action: { kind: "llm.completion", name: "gpt-4" },
+    estimate: { unit: "USD_MICROCENTS", amount: 500_000 },
+  }),
+);
 
 if (response.isSuccess) {
-  const decision = response.getBodyAttribute("decision"); // "ALLOW", "ALLOW_WITH_CAPS", or "DENY"
+  const parsed = decisionResponseFromWire(response.body!);
+  console.log(parsed.decision); // "ALLOW", "ALLOW_WITH_CAPS", or "DENY"
+  if (parsed.caps) {
+    console.log(`Max tokens: ${parsed.caps.maxTokens}`);
+  }
 }
 ```
 
 ## Events (direct debit)
 
+Record spend without a prior reservation (returns HTTP 201):
+
 ```typescript
-await client.createEvent({
-  idempotency_key: "evt-001",
-  subject: { tenant: "acme" },
-  action: { kind: "api.call", name: "geocode" },
-  actual: { unit: "USD_MICROCENTS", amount: 1_500 },
-});
+import { eventCreateRequestToWire, eventCreateResponseFromWire } from "runcycles";
+
+const response = await client.createEvent(
+  eventCreateRequestToWire({
+    idempotencyKey: "evt-001",
+    subject: { tenant: "acme" },
+    action: { kind: "api.call", name: "geocode" },
+    actual: { unit: "USD_MICROCENTS", amount: 1_500 },
+    overagePolicy: "ALLOW_IF_AVAILABLE",
+    metrics: { latencyMs: 120 },
+  }),
+);
+
+if (response.isSuccess) {
+  const parsed = eventCreateResponseFromWire(response.body!);
+  console.log(`Event ID: ${parsed.eventId}, Status: ${parsed.status}`);
+}
 ```
 
 ## Querying
 
 ### Balances
 
+At least one subject filter (`tenant`, `workspace`, `app`, `workflow`, `agent`, or `toolset`) is required:
+
 ```typescript
+import { balanceResponseFromWire } from "runcycles";
+
 const response = await client.getBalances({ tenant: "acme" });
 if (response.isSuccess) {
-  console.log(response.body); // { balances: [...], has_more, next_cursor }
+  const parsed = balanceResponseFromWire(response.body!);
+  for (const balance of parsed.balances) {
+    console.log(`${balance.scopePath}: remaining=${balance.remaining.amount}, spent=${balance.spent?.amount}`);
+    if (balance.isOverLimit) {
+      console.log(`  OVER LIMIT — debt: ${balance.debt?.amount}, limit: ${balance.overdraftLimit?.amount}`);
+    }
+  }
+  if (parsed.hasMore) {
+    // Fetch next page with: client.getBalances({ tenant: "acme", cursor: parsed.nextCursor })
+  }
 }
 ```
 
 ### Reservations
 
 ```typescript
-// List reservations
-const list = await client.listReservations({ tenant: "acme" });
+import { reservationListResponseFromWire, reservationDetailFromWire } from "runcycles";
+
+// List reservations (supports filters: tenant, workspace, app, workflow, agent, toolset, status, idempotency_key)
+const list = await client.listReservations({ tenant: "acme", status: "ACTIVE" });
+if (list.isSuccess) {
+  const parsed = reservationListResponseFromWire(list.body!);
+  for (const r of parsed.reservations) {
+    console.log(`${r.reservationId}: ${r.status} — ${r.reserved.amount} ${r.reserved.unit}`);
+  }
+}
 
 // Get a specific reservation
 const detail = await client.getReservation("r-123");
+if (detail.isSuccess) {
+  const parsed = reservationDetailFromWire(detail.body!);
+  console.log(`Status: ${parsed.status}, Committed: ${parsed.committed?.amount}`);
+}
+```
+
+### Release and extend
+
+```typescript
+import { releaseRequestToWire, releaseResponseFromWire } from "runcycles";
+import { reservationExtendRequestToWire, reservationExtendResponseFromWire } from "runcycles";
+
+// Release a reservation
+const releaseResp = await client.releaseReservation(
+  "r-123",
+  releaseRequestToWire({ idempotencyKey: "rel-001", reason: "user_cancelled" }),
+);
+if (releaseResp.isSuccess) {
+  const parsed = releaseResponseFromWire(releaseResp.body!);
+  console.log(`Released: ${parsed.released.amount}`);
+}
+
+// Extend a reservation TTL (heartbeat)
+const extendResp = await client.extendReservation(
+  "r-123",
+  reservationExtendRequestToWire({ idempotencyKey: "ext-001", extendByMs: 30_000 }),
+);
+if (extendResp.isSuccess) {
+  const parsed = reservationExtendResponseFromWire(extendResp.body!);
+  console.log(`New expiry: ${parsed.expiresAtMs}`);
+}
 ```
 
 ## Dry run (shadow mode)
@@ -319,11 +440,45 @@ const guarded = withCycles({ estimate: 1000, client }, async () => {
 });
 ```
 
+## Wire-format mappers
+
+The client operates on snake_case wire-format JSON. Typed mappers convert between camelCase TypeScript interfaces and the wire format, so you can choose your preferred style:
+
+### Request mappers (camelCase → snake_case)
+
+| Mapper | Converts |
+|---|---|
+| `reservationCreateRequestToWire(req)` | `ReservationCreateRequest` → wire body |
+| `commitRequestToWire(req)` | `CommitRequest` → wire body |
+| `releaseRequestToWire(req)` | `ReleaseRequest` → wire body |
+| `reservationExtendRequestToWire(req)` | `ReservationExtendRequest` → wire body |
+| `decisionRequestToWire(req)` | `DecisionRequest` → wire body |
+| `eventCreateRequestToWire(req)` | `EventCreateRequest` → wire body |
+| `metricsToWire(metrics)` | `CyclesMetrics` → wire metrics |
+
+### Response mappers (snake_case → camelCase)
+
+| Mapper | Returns |
+|---|---|
+| `reservationCreateResponseFromWire(wire)` | `ReservationCreateResponse` |
+| `commitResponseFromWire(wire)` | `CommitResponse` |
+| `releaseResponseFromWire(wire)` | `ReleaseResponse` |
+| `reservationExtendResponseFromWire(wire)` | `ReservationExtendResponse` |
+| `decisionResponseFromWire(wire)` | `DecisionResponse` |
+| `eventCreateResponseFromWire(wire)` | `EventCreateResponse` |
+| `reservationDetailFromWire(wire)` | `ReservationDetail` |
+| `reservationSummaryFromWire(wire)` | `ReservationSummary` |
+| `reservationListResponseFromWire(wire)` | `ReservationListResponse` |
+| `balanceResponseFromWire(wire)` | `BalanceResponse` |
+| `errorResponseFromWire(wire)` | `ErrorResponse \| undefined` |
+| `capsFromWire(wire)` | `Caps \| undefined` |
+
 ## Features
 
 - **`withCycles` HOF**: Wraps async functions with automatic reserve/execute/commit lifecycle
 - **`reserveForStream`**: First-class streaming adapter — reserve before, heartbeat during, commit on finish
 - **Programmatic client**: Full control via `CyclesClient` with wire-format passthrough
+- **Typed wire-format mappers**: Convert between camelCase TypeScript and snake_case wire format for all request/response types
 - **Automatic heartbeat**: TTL extension at half-interval keeps reservations alive
 - **Commit retry**: Failed commits are retried with exponential backoff
 - **Context access**: `getCyclesContext()` provides reservation details inside guarded functions

@@ -42,3 +42,9 @@ export function validateGracePeriodMs(gracePeriodMs: number | undefined): void {
     throw new Error(`grace_period_ms must be between 0 and 60000, got ${gracePeriodMs}`);
   }
 }
+
+export function validateExtendByMs(extendByMs: number): void {
+  if (extendByMs < 1 || extendByMs > 86_400_000) {
+    throw new Error(`extend_by_ms must be between 1 and 86400000, got ${extendByMs}`);
+  }
+}
