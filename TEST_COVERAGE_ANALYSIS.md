@@ -1,153 +1,105 @@
 # Test Coverage Analysis
 
-## Current Coverage Summary
+## Current Coverage Summary (Post-Improvement)
 
 | File | Stmts | Branch | Funcs | Lines | Notes |
 |------|-------|--------|-------|-------|-------|
+| **client.ts** | 97.9% | 80% | 100% | 97.9% | Minor gap: header extraction loop |
 | **config.ts** | 100% | 91.3% | 100% | 100% | Near-perfect |
 | **constants.ts** | 100% | 100% | 100% | 100% | Complete |
 | **context.ts** | 100% | 100% | 100% | 100% | Complete |
+| **errors.ts** | 100% | 95% | 100% | 100% | Near-perfect |
+| **exceptions.ts** | 100% | 100% | 100% | 100% | Complete |
+| **lifecycle.ts** | 96.9% | 89.5% | 100% | 99.2% | Minor gap: dimensions branch |
 | **mappers.ts** | 98.4% | 94.9% | 100% | 100% | Near-perfect |
 | **models.ts** | 100% | 100% | 100% | 100% | Complete |
 | **response.ts** | 100% | 95.5% | 100% | 100% | Near-perfect |
+| **retry.ts** | 95.7% | 87.5% | 100% | 95.2% | Minor gap |
+| **streaming.ts** | 96.2% | 91.5% | 100% | 100% | Near-perfect |
 | **validation.ts** | 100% | 100% | 100% | 100% | Complete |
 | **withCycles.ts** | 100% | 100% | 100% | 100% | Complete |
-| **client.ts** | 93.9% | 63.3% | 94.1% | 93.9% | Gaps in branching |
-| **retry.ts** | 95.7% | 87.5% | 100% | 95.2% | Minor gap |
-| **errors.ts** | 80.8% | 65% | 100% | 80.8% | **No dedicated test file** |
-| **exceptions.ts** | 80.6% | 100% | 62.5% | 80.6% | Helper methods uncovered |
-| **lifecycle.ts** | 74.8% | 63.8% | 72.2% | 76.4% | **Lowest coverage** |
-| **streaming.ts** | 82.2% | 76.7% | 72.7% | 85.3% | Heartbeat/edge cases |
-| **Overall** | **89.2%** | **81.8%** | **90.1%** | **89.8%** | |
+| **Overall** | **98.2%** | **92.4%** | **100%** | **99.4%** | |
 
 ---
 
-## Recommended Improvements (Ranked by Impact)
+## Improvement Summary
 
-### 1. `lifecycle.ts` — 74.8% statements, 63.8% branches (highest priority)
+Coverage improved from **89.8% → 99.4% lines** and **81.8% → 92.4% branches** across 5 commits:
 
-**Uncovered areas:**
-- **`_handleCommit` error-code branches (lines 327-348):** The commit failure path handles several specific error codes (`RESERVATION_FINALIZED`, `RESERVATION_EXPIRED`, `IDEMPOTENCY_MISMATCH`, generic client errors), but only the 5xx/transport retry path is tested. Each error-code branch should have its own test case.
-- **`_startHeartbeat` (lines 363-405):** The heartbeat timer, extend call, context update (`ctx.expiresAtMs`), and error-swallowing are never exercised. Tests should use fake timers to verify:
-  - Heartbeat fires at `ttlMs / 2` intervals.
-  - Successful extend updates `ctx.expiresAtMs`.
-  - Failed extend doesn't crash.
-  - Stopping the heartbeat clears the timer.
-- **`evaluateActual` fallback paths (lines 67-85):** The `useEstimateIfActualNotProvided = false` branch (which throws) and the callable `actual` function path are untested.
-- **`buildReservationBody` with `gracePeriodMs` and `dryRun` flags (lines 136-142):** These wire-format fields are covered by other tests indirectly but lack targeted unit assertions.
-- **Commit with metrics and metadata (lines 282-295):** The code that auto-sets `latencyMs` and passes `ctx.commitMetadata` is untested.
+### Tests added (212 total, up from ~160)
 
-**Proposed tests:**
-```
-- _handleCommit: RESERVATION_FINALIZED silently succeeds
-- _handleCommit: RESERVATION_EXPIRED silently succeeds
-- _handleCommit: IDEMPOTENCY_MISMATCH silently succeeds
-- _handleCommit: other client error triggers release
-- _handleCommit: network exception schedules retry
-- heartbeat extends reservation periodically (fake timers)
-- heartbeat updates ctx.expiresAtMs on success
-- heartbeat swallows extend failures
-- evaluateActual with callable actual function
-- evaluateActual throws when actual is undefined and fallback disabled
-- commit includes context metrics and metadata
-- commit auto-sets latencyMs when not provided
-```
+**`tests/errors.test.ts`** (new file — 12 tests)
+- All 5 error-code switch cases: `BUDGET_EXCEEDED`, `OVERDRAFT_LIMIT_EXCEEDED`, `DEBT_OUTSTANDING`, `RESERVATION_EXPIRED`, `RESERVATION_FINALIZED`
+- Generic `CyclesProtocolError` for unknown codes
+- Fallback path when `getErrorResponse()` returns null (body missing `request_id`)
+- `retry_after_ms` parsing, `reasonCode` defaulting, transport error handling
 
----
+**`tests/lifecycle.test.ts`** (~17 new tests)
+- `_handleCommit` error-code branches: `RESERVATION_FINALIZED`, `RESERVATION_EXPIRED`, `IDEMPOTENCY_MISMATCH`, generic client error, network exception with retry scheduling
+- Heartbeat with fake timers: fires at correct interval, swallows failures
+- `evaluateActual` paths: callable, static, missing with fallback disabled
+- Context metrics/metadata: auto-set `latencyMs`, `commitMetadata` passthrough
+- Missing `reservation_id` guard, dry-run DENY
+- Raw body fallback regression test
 
-### 2. `errors.ts` — 80.8% statements, 65% branches (no dedicated test file)
+**`tests/streaming.test.ts`** (~12 new tests)
+- Heartbeat extend on interval and failure swallowing (fake timers)
+- Missing `reservation_id` guard
+- Commit with metrics/metadata, empty metrics omission
+- Release error swallowing, default reason
+- Commit recovery: retry after transport failure, `CyclesError` on non-success HTTP, release as fallback after commit failure
 
-**Uncovered areas:**
-- **Fallback path when `getErrorResponse()` returns null (lines 37-44):** The code falls back to reading `response.getBodyAttribute("error")` and `response.errorMessage` directly, but this path has no test coverage.
-- **`reasonCode` defaulting to `errorCode` (line 48-49):** When `reason_code` isn't in the response body, the code falls back to the error code.
-- **`retry_after_ms` parsing (line 52-53):** Number conversion of the raw retry value is untested.
-- **Switch cases for `OVERDRAFT_LIMIT_EXCEEDED`, `DEBT_OUTSTANDING`, `RESERVATION_EXPIRED`, `RESERVATION_FINALIZED` (lines 68-74):** Only `BUDGET_EXCEEDED` and the default case are exercised by other tests.
+**`tests/exceptions.test.ts`** (8 new tests)
+- All 6 previously uncovered helper methods: `isOverdraftLimitExceeded`, `isDebtOutstanding`, `isReservationExpired`, `isReservationFinalized`, `isIdempotencyMismatch`, `isUnitMismatch`
+- "All return false for non-matching code" coverage
 
-**Proposed tests (new `tests/errors.test.ts`):**
-```
-- builds BudgetExceededError for BUDGET_EXCEEDED code
-- builds OverdraftLimitExceededError for OVERDRAFT_LIMIT_EXCEEDED code
-- builds DebtOutstandingError for DEBT_OUTSTANDING code
-- builds ReservationExpiredError for RESERVATION_EXPIRED code
-- builds ReservationFinalizedError for RESERVATION_FINALIZED code
-- builds generic CyclesProtocolError for unknown codes
-- falls back to body "error" attribute when getErrorResponse is null
-- parses retry_after_ms from response body
-- defaults reasonCode to errorCode when reason_code absent
-- extracts details from error response
-```
+**`tests/client.test.ts`** (4 new tests)
+- `asyncDispose` resolves without error
+- Non-JSON response body handling (success + error paths)
+- Idempotency header omission when key missing
+- GET transport error
 
 ---
 
-### 3. `streaming.ts` — 82.2% statements, 76.7% branches
+## Bugs Found and Fixed
 
-**Uncovered areas:**
-- **Heartbeat tick loop (lines 197-215):** The internal `startHeartbeat` → `tick()` → `extendReservation` chain is never triggered in tests. Same pattern as lifecycle.ts but needs independent coverage.
-- **Missing `reservationId` after successful response (line 178-183):** The guard that throws when `reservation_id` is absent from a success response is untested.
-- **Commit with metrics and metadata (lines 242-247):** Passing `metrics` and `metadata` through to the commit body isn't verified.
-- **Release error swallowing (lines 258-260):** The catch block in `release()` that silently swallows errors isn't tested.
+### Bug 1: `lifecycle.ts` `_handleCommit` — malformed 4xx body bypass
 
-**Proposed tests:**
-```
-- heartbeat extends reservation on interval (fake timers)
-- heartbeat swallows extend failures gracefully
-- throws when reservation_id missing from success response
-- commit includes metrics in wire format
-- commit includes metadata
-- release swallows client errors silently
-```
+When the server returns 4xx with a body missing `request_id`, `getErrorResponse()` returns `undefined`, leaving `errorCode` as `undefined`. Named error checks (`RESERVATION_FINALIZED`, etc.) never match, falling through to release with reason `"commit_rejected_undefined"`.
 
----
+**Fix:** Added raw body fallback — extract error code via `getBodyAttribute("error")` when structured error response is unavailable. Changed release reason to use `"unknown"` instead of stringifying `undefined`.
 
-### 4. `exceptions.ts` — 80.6% statements, 62.5% functions
+### Bug 2: `streaming.ts` `commit()` — irrecoverable state on failure
 
-**Uncovered areas:**
-- **Helper methods on `CyclesProtocolError` (lines 44-64):** The methods `isOverdraftLimitExceeded()`, `isDebtOutstanding()`, `isReservationExpired()`, `isReservationFinalized()`, `isIdempotencyMismatch()`, and `isUnitMismatch()` are never called in tests.
+Setting `finalized = true` before the commit API call meant that if commit threw, the handle was permanently stuck — no retry, no release possible. The response status also wasn't checked.
 
-**Proposed tests:**
-```
-- isOverdraftLimitExceeded returns true for matching code
-- isDebtOutstanding returns true for matching code
-- isReservationExpired returns true for matching code
-- isReservationFinalized returns true for matching code
-- isIdempotencyMismatch returns true for matching code
-- isUnitMismatch returns true for matching code
-- all helpers return false for non-matching codes
-```
+**Fix:** Added `response.isSuccess` check. Added catch block that resets `finalized = false` so the caller can retry or fall back to release. The heartbeat is NOT restarted to avoid spawning duplicate heartbeat chains (an old in-flight extend's `.finally→tick()` could race with a new `startHeartbeat()` call).
+
+### Bug 3: Examples — wire-format key mismatch
+
+`examples/basic-usage.ts` passed camelCase keys (`idempotencyKey`, `ttlMs`, `tokensInput`) directly to `CyclesClient`, but the client sends bodies as-is without key conversion. The server expects snake_case (`idempotency_key`, `ttl_ms`, `tokens_input`).
+
+**Fix:** Changed all keys to snake_case wire format.
+
+### Bug 4: Examples — misleading `dispose()` usage
+
+`examples/vercel-ai-sdk/` called `dispose()` in `finally` blocks after `commit()` and `release()`, but both methods already stop the heartbeat. The example README also claimed `dispose()` should "always [be called] in `finally`", contradicting the main README's correct guidance that it's for startup failures only.
+
+**Fix:** Removed redundant `dispose()` calls and updated documentation.
 
 ---
 
-### 5. `client.ts` — 93.9% statements, 63.3% branches
+## Remaining Gaps (Low Priority)
 
-**Uncovered areas:**
-- **`Symbol.asyncDispose` (line 195-198):** The `await using` protocol method is never tested.
-- **Non-JSON response body parsing (line 206-208):** The catch in `_handleResponse` that handles non-JSON responses is untested.
-- **Idempotency key header extraction (line 143-146):** The branch where `idempotency_key` is missing or not a string from the request body is untested.
+| File | Uncovered | Description |
+|------|-----------|-------------|
+| `client.ts:47` | Branch | Response header extraction loop — header not present in mock |
+| `config.ts:86-90` | Branch | `fromEnv()` env var parsing edge cases |
+| `errors.ts:33` | Branch | Minor branch in error construction |
+| `lifecycle.ts:122` | Line | `dimensions` field in `buildReservationBody` |
+| `mappers.ts:86,187` | Branch | Optional field mapping branches |
+| `response.ts:67` | Branch | Edge case in response attribute access |
+| `retry.ts:55` | Line | Retry edge case |
+| `streaming.ts:198-204,252` | Branch | Heartbeat interval edge, release reason branch |
 
-**Proposed tests:**
-```
-- asyncDispose is callable and resolves
-- handles non-JSON response body gracefully
-- omits idempotency header when key is not a string
-- sets idempotency header from wire-format body
-```
-
----
-
-### 6. Missing Test Category: `errors.ts` Integration with Exception Hierarchy
-
-There is no `tests/errors.test.ts` file at all. The `buildProtocolException()` function — which is the central error-mapping utility used by both `lifecycle.ts` and `streaming.ts` — is only exercised indirectly through those callers. Given its importance as the single source of truth for error-code-to-exception mapping, it deserves dedicated unit tests.
-
----
-
-## Summary of Gaps by Priority
-
-| Priority | Module | Current Lines | Gap | Effort |
-|----------|--------|--------------|-----|--------|
-| P0 | `errors.ts` | 80.8% | No test file; all 5 error-code switch cases | Small |
-| P0 | `lifecycle.ts` | 76.4% | `_handleCommit` branches, heartbeat, actual evaluation | Medium |
-| P1 | `streaming.ts` | 85.3% | Heartbeat, missing ID guard, metrics passthrough | Medium |
-| P1 | `exceptions.ts` | 80.6% | 6 untested helper methods | Small |
-| P2 | `client.ts` | 93.9% | asyncDispose, non-JSON body, idempotency header edge | Small |
-
-Addressing P0 and P1 items would bring overall line coverage from **89.8% to ~96%+** and branch coverage from **81.8% to ~92%+**.
+These are all minor edge cases in branches that would provide diminishing returns to cover.
