@@ -245,7 +245,22 @@ export async function reserveForStream(
       if (metadata) {
         commitBody.metadata = metadata;
       }
-      await client.commitReservation(reservationId, commitBody);
+      try {
+        const response = await client.commitReservation(reservationId, commitBody);
+        if (!response.isSuccess) {
+          throw new CyclesError(
+            `Commit failed with status ${response.status}: ${response.errorMessage ?? "unknown error"}`,
+          );
+        }
+      } catch (err) {
+        // Reset finalized so the caller can retry commit or fall back to release.
+        // The heartbeat is NOT restarted to avoid spawning duplicate heartbeat
+        // chains (an old in-flight extend's .finally→tick could race with a new
+        // startHeartbeat call). The reservation's remaining TTL should give the
+        // caller enough time to retry or release.
+        finalized = false;
+        throw err;
+      }
     },
 
     async release(reason?: string): Promise<void> {

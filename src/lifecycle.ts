@@ -325,7 +325,16 @@ export class AsyncCyclesLifecycle {
       }
 
       const errorResp = response.getErrorResponse();
-      const errorCode = errorResp?.error;
+      let errorCode = errorResp?.error;
+
+      // Fallback: extract error code directly from body when the structured
+      // error response is unavailable (e.g. body missing request_id).
+      if (errorCode === undefined) {
+        const rawError = response.getBodyAttribute("error");
+        if (typeof rawError === "string") {
+          errorCode = rawError;
+        }
+      }
 
       if (
         errorCode === "RESERVATION_FINALIZED" ||
@@ -339,7 +348,7 @@ export class AsyncCyclesLifecycle {
       if (response.isClientError) {
         await this._handleRelease(
           reservationId,
-          `commit_rejected_${errorCode}`,
+          `commit_rejected_${errorCode ?? "unknown"}`,
         );
         return;
       }

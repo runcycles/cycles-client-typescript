@@ -198,6 +198,81 @@ describe("CyclesClient", () => {
     });
   });
 
+  describe("asyncDispose", () => {
+    it("is callable and resolves without error", async () => {
+      const client = new CyclesClient(config);
+      await expect(client[Symbol.asyncDispose]()).resolves.toBeUndefined();
+    });
+  });
+
+  describe("non-JSON response", () => {
+    it("handles non-JSON response body gracefully", async () => {
+      const responseHeaders = new Headers({});
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockResolvedValue({
+          status: 200,
+          statusText: "OK",
+          json: () => Promise.reject(new Error("not JSON")),
+          headers: responseHeaders,
+        }),
+      );
+
+      const client = new CyclesClient(config);
+      const resp = await client.createReservation({ idempotency_key: "test" });
+
+      expect(resp.isSuccess).toBe(true);
+      expect(resp.body).toEqual({});
+    });
+
+    it("handles non-JSON error response", async () => {
+      const responseHeaders = new Headers({});
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockResolvedValue({
+          status: 500,
+          statusText: "Internal Server Error",
+          json: () => Promise.reject(new Error("not JSON")),
+          headers: responseHeaders,
+        }),
+      );
+
+      const client = new CyclesClient(config);
+      const resp = await client.createReservation({ idempotency_key: "test" });
+
+      expect(resp.isServerError).toBe(true);
+      expect(resp.errorMessage).toBe("Internal Server Error");
+    });
+  });
+
+  describe("idempotency header", () => {
+    it("omits idempotency header when key is not a string", async () => {
+      mockFetch(200, { decision: "ALLOW", reservation_id: "r-1", affected_scopes: [] });
+
+      const client = new CyclesClient(config);
+      await client.createReservation({
+        // No idempotency_key or non-string key
+        subject: { tenant: "acme" },
+      });
+
+      const fetchCall = vi.mocked(fetch).mock.calls[0];
+      const headers = (fetchCall[1] as RequestInit).headers as Record<string, string>;
+      expect(headers["X-Idempotency-Key"]).toBeUndefined();
+    });
+  });
+
+  describe("GET transport error", () => {
+    it("returns transport error on GET network failure", async () => {
+      mockFetchError(new Error("ECONNRESET"));
+
+      const client = new CyclesClient(config);
+      const resp = await client.listReservations({ tenant: "acme" });
+
+      expect(resp.isTransportError).toBe(true);
+      expect(resp.errorMessage).toBe("ECONNRESET");
+    });
+  });
+
   describe("wire-format passthrough", () => {
     it("passes request body through as-is (caller provides wire-format)", async () => {
       mockFetch(200, { decision: "ALLOW", reservation_id: "r-1", affected_scopes: [] });

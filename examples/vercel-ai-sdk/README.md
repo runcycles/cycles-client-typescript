@@ -61,15 +61,12 @@ const result = streamText({
   model: openai("gpt-4o"),
   messages,
   onFinish: async ({ usage }) => {
-    try {
-      // 3. Commit actual usage when the stream finishes
-      await handle.commit(actualCost, {
-        tokensInput: usage.promptTokens,
-        tokensOutput: usage.completionTokens,
-      });
-    } finally {
-      handle.dispose(); // Stop heartbeat
-    }
+    // 3. Commit actual usage when the stream finishes
+    // commit() automatically stops the heartbeat
+    await handle.commit(actualCost, {
+      tokensInput: usage.promptTokens,
+      tokensOutput: usage.completionTokens,
+    });
   },
 });
 ```
@@ -79,9 +76,9 @@ The `reserveForStream` adapter:
 - Creates a budget reservation with the estimated cost
 - Starts a heartbeat to keep the reservation alive during streaming
 - Returns a handle with `commit()`, `release()`, and `dispose()` methods
-- `commit()` — records actual usage after the stream finishes
-- `release()` — returns reserved budget on error/abort
-- `dispose()` — stops the heartbeat timer (always call in `finally`)
+- `commit()` — records actual usage after the stream finishes (stops heartbeat)
+- `release()` — returns reserved budget on error/abort (stops heartbeat)
+- `dispose()` — stops the heartbeat only, for startup failures before streaming begins
 
 ## Testing
 
