@@ -1,13 +1,15 @@
 /**
  * Next.js API route: budget-governed chat with Cycles + Vercel AI SDK.
  *
- * This route demonstrates wrapping the Vercel AI SDK's `streamText` function
- * with Cycles budget governance. Every LLM call is:
- *   1. Reserved against the tenant's budget before execution
- *   2. Streamed to the client in real time
- *   3. Committed with actual token usage after the stream completes
+ * This route demonstrates the streaming adapter pattern:
+ *   1. Reserve budget before starting the stream
+ *   2. Keep the reservation alive via heartbeat while the stream is open
+ *   3. Commit actual token usage when the stream finishes (onFinish)
+ *   4. Release the reservation if streaming fails or is aborted
  *
  * If the budget is exhausted, the request is denied before any LLM call is made.
+ *
+ * Requires Node.js runtime (for AsyncLocalStorage).
  */
 
 import { streamText, type UIMessage, convertToModelMessages } from "ai";
@@ -15,13 +17,14 @@ import { openai } from "@ai-sdk/openai";
 import {
   CyclesClient,
   CyclesConfig,
-  getCyclesContext,
-  withCycles,
+  reserveForStream,
   BudgetExceededError,
 } from "runcycles";
 
+// Force Node.js runtime (required for node:async_hooks / AsyncLocalStorage).
+export const runtime = "nodejs";
+
 // Initialize the Cycles client from environment variables.
-// Reads CYCLES_BASE_URL, CYCLES_API_KEY, CYCLES_TENANT, etc.
 const cyclesClient = new CyclesClient(CyclesConfig.fromEnv());
 
 export async function POST(req: Request) {
@@ -42,52 +45,50 @@ export async function POST(req: Request) {
     estimatedInputTokens * 250 + estimatedInputTokens * 2 * 1000,
   );
 
+  let handle;
   try {
-    // withCycles wraps the LLM call with the reserve → execute → commit lifecycle.
-    // If the tenant's budget is exceeded, a BudgetExceededError is thrown
-    // before the LLM call is made.
-    const result = await withCycles(
-      {
-        estimate: estimatedCostMicrocents,
-        actual: (streamResult: any) => {
-          // This callback is invoked after the guarded function returns.
-          // For streaming, the actual token count is not yet known at this point,
-          // so we fall back to the estimate (the default behavior).
-          // To commit exact usage, set ctx.metrics inside the function body
-          // and let the lifecycle use the estimate as actual.
-          return estimatedCostMicrocents;
-        },
-        actionKind: "llm.completion",
-        actionName: "gpt-4o",
-        unit: "USD_MICROCENTS",
-        client: cyclesClient,
-      },
-      async () => {
-        const result = streamText({
-          model: openai("gpt-4o"),
-          messages: await convertToModelMessages(messages),
-        });
+    // Reserve budget before starting the stream.
+    // Throws BudgetExceededError if the tenant's budget is exhausted.
+    handle = await reserveForStream({
+      client: cyclesClient,
+      estimate: estimatedCostMicrocents,
+      unit: "USD_MICROCENTS",
+      actionKind: "llm.completion",
+      actionName: "gpt-4o",
+      tenant: cyclesClient.config.tenant,
+    });
 
-        // Attach token usage to the Cycles context for observability.
-        // The onFinish callback fires after the stream is fully consumed,
-        // so metrics will be included in the commit.
-        const ctx = getCyclesContext();
-        if (ctx) {
-          result.usage.then((usage) => {
-            ctx.metrics = {
-              tokensInput: usage.promptTokens,
-              tokensOutput: usage.completionTokens,
-              modelVersion: "gpt-4o",
-            };
+    // Start the stream. The reservation heartbeat keeps it alive
+    // while tokens are being generated.
+    const result = streamText({
+      model: openai("gpt-4o"),
+      messages: await convertToModelMessages(messages),
+      onFinish: async ({ usage }) => {
+        try {
+          // Commit actual usage once the stream completes.
+          const actualCost = Math.ceil(
+            (usage.promptTokens ?? 0) * 250 +
+            (usage.completionTokens ?? 0) * 1000,
+          );
+          await handle!.commit(actualCost, {
+            tokensInput: usage.promptTokens,
+            tokensOutput: usage.completionTokens,
+            modelVersion: "gpt-4o",
           });
+        } finally {
+          handle!.dispose();
         }
-
-        return result;
       },
-    )();
+    });
 
     return result.toDataStreamResponse();
   } catch (err) {
+    // Release the reservation if we fail before or during streaming.
+    if (handle) {
+      await handle.release("stream_error");
+      handle.dispose();
+    }
+
     if (err instanceof BudgetExceededError) {
       return new Response(
         JSON.stringify({

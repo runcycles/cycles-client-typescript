@@ -1,4 +1,16 @@
-/** Async HTTP client for the Cycles API. */
+/**
+ * Async HTTP client for the Cycles API.
+ *
+ * The client is transport-oriented and runtime-agnostic: it sends and receives
+ * wire-format (snake_case) JSON bodies without any automatic key conversion.
+ * Callers are responsible for building wire-format request bodies; the response
+ * body is returned in wire format for explicit mapping by the caller.
+ *
+ * Timeout note: Node's built-in fetch does not distinguish connection timeout
+ * from read timeout. The config's connectTimeout and readTimeout are summed
+ * into a single AbortSignal.timeout() value that caps total request duration.
+ * For stricter timeout control, consider using a custom HTTP client.
+ */
 
 import {
   API_KEY_HEADER,
@@ -26,44 +38,6 @@ const BALANCE_FILTER_PARAMS = new Set([
   "agent",
   "toolset",
 ]);
-
-// --- Case conversion utilities ---
-
-function toSnakeCase(str: string): string {
-  return str.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
-}
-
-function toCamelCase(str: string): string {
-  return str.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
-}
-
-function convertKeysToSnakeCase(obj: unknown): unknown {
-  if (obj === null || obj === undefined) return obj;
-  if (Array.isArray(obj)) return obj.map(convertKeysToSnakeCase);
-  if (typeof obj === "object") {
-    const result: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
-      if (value !== undefined) {
-        result[toSnakeCase(key)] = convertKeysToSnakeCase(value);
-      }
-    }
-    return result;
-  }
-  return obj;
-}
-
-function convertKeysToCamelCase(obj: unknown): unknown {
-  if (obj === null || obj === undefined) return obj;
-  if (Array.isArray(obj)) return obj.map(convertKeysToCamelCase);
-  if (typeof obj === "object") {
-    const result: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
-      result[toCamelCase(key)] = convertKeysToCamelCase(value);
-    }
-    return result;
-  }
-  return obj;
-}
 
 function extractResponseHeaders(resp: Response): Record<string, string> {
   const result: Record<string, string> = {};
@@ -160,13 +134,13 @@ export class CyclesClient {
     body: Record<string, unknown>,
   ): Promise<CyclesResponse> {
     try {
-      const data = convertKeysToSnakeCase(body) as Record<string, unknown>;
       const headers: Record<string, string> = {
         "Content-Type": "application/json",
         [API_KEY_HEADER]: this._config.apiKey,
       };
 
-      const idemKey = data.idempotency_key;
+      // Extract idempotency key from wire-format body
+      const idemKey = body.idempotency_key;
       if (typeof idemKey === "string") {
         headers[IDEMPOTENCY_KEY_HEADER] = idemKey;
       }
@@ -175,7 +149,7 @@ export class CyclesClient {
       const resp = await fetch(url, {
         method: "POST",
         headers,
-        body: JSON.stringify(data),
+        body: JSON.stringify(body),
         signal: AbortSignal.timeout(
           this._config.connectTimeout + this._config.readTimeout,
         ),
@@ -219,10 +193,11 @@ export class CyclesClient {
   }
 
   private async _handleResponse(resp: Response): Promise<CyclesResponse> {
+    // Response body is stored in wire format (snake_case).
+    // Callers use explicit mappers from mappers.ts for type-safe access.
     let body: Record<string, unknown> | undefined;
     try {
-      const raw = await resp.json();
-      body = convertKeysToCamelCase(raw) as Record<string, unknown>;
+      body = (await resp.json()) as Record<string, unknown>;
     } catch {
       body = undefined;
     }

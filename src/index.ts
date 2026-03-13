@@ -9,6 +9,10 @@ export { CyclesConfig } from "./config.js";
 // Higher-order function
 export { withCycles, setDefaultClient, setDefaultConfig } from "./withCycles.js";
 
+// Streaming adapter
+export { reserveForStream } from "./streaming.js";
+export type { StreamReservation, StreamReservationOptions } from "./streaming.js";
+
 // Context
 export { getCyclesContext } from "./context.js";
 export type { CyclesContext } from "./context.js";
@@ -79,6 +83,14 @@ export type {
   ReservationListResponse,
   BalanceResponse,
 } from "./models.js";
+
+// Mappers (for advanced use — building/parsing wire-format bodies)
+export {
+  metricsToWire,
+  capsFromWire,
+  reservationCreateResponseFromWire,
+  errorResponseFromWire,
+} from "./mappers.js";
 
 // Lifecycle config type
 export type { WithCyclesConfig } from "./lifecycle.js";

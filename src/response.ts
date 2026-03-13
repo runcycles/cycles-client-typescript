@@ -1,5 +1,6 @@
 /** Uniform response wrapper for all Cycles API calls. */
 
+import { errorResponseFromWire } from "./mappers.js";
 import type { ErrorResponse } from "./models.js";
 
 export class CyclesResponse {
@@ -95,15 +96,7 @@ export class CyclesResponse {
 
   getErrorResponse(): ErrorResponse | undefined {
     if (this.body && typeof this.body === "object") {
-      const b = this.body as Record<string, unknown>;
-      if (typeof b.error === "string" && typeof b.message === "string" && typeof b.requestId === "string") {
-        return {
-          error: b.error,
-          message: b.message,
-          requestId: b.requestId,
-          details: b.details as Record<string, unknown> | undefined,
-        };
-      }
+      return errorResponseFromWire(this.body);
     }
     return undefined;
   }

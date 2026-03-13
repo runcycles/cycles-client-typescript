@@ -34,9 +34,9 @@ describe("AsyncCyclesLifecycle", () => {
     client.createReservation.mockResolvedValue(
       CyclesResponse.success(200, {
         decision: "ALLOW",
-        reservationId: "r-1",
-        affectedScopes: ["tenant:acme"],
-        expiresAtMs: Date.now() + 60000,
+        reservation_id: "r-1",
+        affected_scopes: ["tenant:acme"],
+        expires_at_ms: Date.now() + 60000,
       }),
     );
     client.commitReservation.mockResolvedValue(
@@ -57,6 +57,17 @@ describe("AsyncCyclesLifecycle", () => {
     expect(fn).toHaveBeenCalledOnce();
     expect(client.createReservation).toHaveBeenCalledOnce();
     expect(client.commitReservation).toHaveBeenCalledOnce();
+
+    // Verify wire-format keys in reservation body
+    const createBody = client.createReservation.mock.calls[0][0];
+    expect(createBody.idempotency_key).toBeDefined();
+    expect(createBody.ttl_ms).toBe(60000);
+    expect(createBody.overage_policy).toBe("REJECT");
+
+    // Verify wire-format keys in commit body
+    const commitBody = client.commitReservation.mock.calls[0][1];
+    expect(commitBody.idempotency_key).toBeDefined();
+    expect(commitBody.actual).toEqual({ unit: "USD_MICROCENTS", amount: 1000 });
   });
 
   it("provides context inside guarded function", async () => {
@@ -64,8 +75,8 @@ describe("AsyncCyclesLifecycle", () => {
     client.createReservation.mockResolvedValue(
       CyclesResponse.success(200, {
         decision: "ALLOW",
-        reservationId: "r-ctx",
-        affectedScopes: [],
+        reservation_id: "r-ctx",
+        affected_scopes: [],
       }),
     );
     client.commitReservation.mockResolvedValue(
@@ -96,8 +107,8 @@ describe("AsyncCyclesLifecycle", () => {
     client.createReservation.mockResolvedValue(
       CyclesResponse.success(200, {
         decision: "DENY",
-        affectedScopes: [],
-        reasonCode: "BUDGET_EXCEEDED",
+        affected_scopes: [],
+        reason_code: "BUDGET_EXCEEDED",
       }),
     );
 
@@ -115,7 +126,7 @@ describe("AsyncCyclesLifecycle", () => {
       CyclesResponse.httpError(402, "Budget exceeded", {
         error: "BUDGET_EXCEEDED",
         message: "Insufficient budget",
-        requestId: "req-1",
+        request_id: "req-1",
       }),
     );
 
@@ -132,8 +143,8 @@ describe("AsyncCyclesLifecycle", () => {
     client.createReservation.mockResolvedValue(
       CyclesResponse.success(200, {
         decision: "ALLOW",
-        reservationId: "r-fail",
-        affectedScopes: [],
+        reservation_id: "r-fail",
+        affected_scopes: [],
       }),
     );
     client.releaseReservation.mockResolvedValue(
@@ -163,8 +174,8 @@ describe("AsyncCyclesLifecycle", () => {
     client.createReservation.mockResolvedValue(
       CyclesResponse.success(200, {
         decision: "ALLOW",
-        affectedScopes: ["tenant:acme"],
-        scopePath: "/acme",
+        affected_scopes: ["tenant:acme"],
+        scope_path: "/acme",
         reserved: { unit: "USD_MICROCENTS", amount: 1000 },
       }),
     );
@@ -193,8 +204,8 @@ describe("AsyncCyclesLifecycle", () => {
     client.createReservation.mockResolvedValue(
       CyclesResponse.success(200, {
         decision: "ALLOW",
-        reservationId: "r-1",
-        affectedScopes: [],
+        reservation_id: "r-1",
+        affected_scopes: [],
       }),
     );
     client.commitReservation.mockResolvedValue(
@@ -217,8 +228,8 @@ describe("AsyncCyclesLifecycle", () => {
     client.createReservation.mockResolvedValue(
       CyclesResponse.success(200, {
         decision: "ALLOW",
-        reservationId: "r-1",
-        affectedScopes: [],
+        reservation_id: "r-1",
+        affected_scopes: [],
       }),
     );
     client.commitReservation.mockResolvedValue(

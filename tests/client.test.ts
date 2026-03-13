@@ -24,7 +24,7 @@ describe("CyclesClient", () => {
 
       const client = new CyclesClient(config);
       const resp = await client.createReservation({
-        idempotencyKey: "idem-1",
+        idempotency_key: "idem-1",
         subject: { tenant: "acme" },
         action: { kind: "llm.completion", name: "gpt-4" },
         estimate: { unit: "USD_MICROCENTS", amount: 1000 },
@@ -32,7 +32,8 @@ describe("CyclesClient", () => {
 
       expect(resp.isSuccess).toBe(true);
       expect(resp.getBodyAttribute("decision")).toBe("ALLOW");
-      expect(resp.getBodyAttribute("reservationId")).toBe("r-1");
+      // Body is stored in wire format (snake_case)
+      expect(resp.getBodyAttribute("reservation_id")).toBe("r-1");
 
       const fetchCall = vi.mocked(fetch).mock.calls[0];
       expect(fetchCall[0]).toBe("http://localhost:7878/v1/reservations");
@@ -50,7 +51,7 @@ describe("CyclesClient", () => {
 
       const client = new CyclesClient(config);
       const resp = await client.commitReservation("r-1", {
-        idempotencyKey: "commit-1",
+        idempotency_key: "commit-1",
         actual: { unit: "USD_MICROCENTS", amount: 500 },
       });
 
@@ -66,7 +67,7 @@ describe("CyclesClient", () => {
 
       const client = new CyclesClient(config);
       const resp = await client.releaseReservation("r-1", {
-        idempotencyKey: "release-1",
+        idempotency_key: "release-1",
         reason: "cancelled",
       });
 
@@ -82,8 +83,8 @@ describe("CyclesClient", () => {
 
       const client = new CyclesClient(config);
       const resp = await client.extendReservation("r-1", {
-        idempotencyKey: "ext-1",
-        extendByMs: 30000,
+        idempotency_key: "ext-1",
+        extend_by_ms: 30000,
       });
 
       expect(resp.isSuccess).toBe(true);
@@ -98,7 +99,7 @@ describe("CyclesClient", () => {
 
       const client = new CyclesClient(config);
       const resp = await client.decide({
-        idempotencyKey: "dec-1",
+        idempotency_key: "dec-1",
         subject: { tenant: "acme" },
         action: { kind: "llm.completion", name: "gpt-4" },
         estimate: { unit: "USD_MICROCENTS", amount: 1000 },
@@ -158,7 +159,7 @@ describe("CyclesClient", () => {
 
       const client = new CyclesClient(config);
       const resp = await client.createEvent({
-        idempotencyKey: "evt-1",
+        idempotency_key: "evt-1",
         subject: { tenant: "acme" },
         action: { kind: "api.call", name: "geocode" },
         actual: { unit: "USD_MICROCENTS", amount: 1500 },
@@ -179,7 +180,7 @@ describe("CyclesClient", () => {
       });
 
       const client = new CyclesClient(config);
-      const resp = await client.createReservation({ idempotencyKey: "test" });
+      const resp = await client.createReservation({ idempotency_key: "test" });
 
       expect(resp.isSuccess).toBe(false);
       expect(resp.isClientError).toBe(true);
@@ -189,25 +190,25 @@ describe("CyclesClient", () => {
       mockFetchError(new Error("ECONNREFUSED"));
 
       const client = new CyclesClient(config);
-      const resp = await client.createReservation({ idempotencyKey: "test" });
+      const resp = await client.createReservation({ idempotency_key: "test" });
 
       expect(resp.isTransportError).toBe(true);
       expect(resp.errorMessage).toBe("ECONNREFUSED");
     });
   });
 
-  describe("case conversion", () => {
-    it("converts camelCase to snake_case in request body", async () => {
+  describe("wire-format passthrough", () => {
+    it("passes request body through as-is (caller provides wire-format)", async () => {
       mockFetch(200, { decision: "ALLOW", reservation_id: "r-1", affected_scopes: [] });
 
       const client = new CyclesClient(config);
       await client.createReservation({
-        idempotencyKey: "idem-1",
+        idempotency_key: "idem-1",
         subject: { tenant: "acme" },
         action: { kind: "llm", name: "gpt" },
         estimate: { unit: "USD_MICROCENTS", amount: 100 },
-        ttlMs: 30000,
-        gracePeriodMs: 5000,
+        ttl_ms: 30000,
+        grace_period_ms: 5000,
       });
 
       const fetchCall = vi.mocked(fetch).mock.calls[0];
@@ -217,7 +218,7 @@ describe("CyclesClient", () => {
       expect(sentBody.grace_period_ms).toBe(5000);
     });
 
-    it("converts snake_case to camelCase in response body", async () => {
+    it("stores response body in wire format (snake_case)", async () => {
       mockFetch(200, {
         decision: "ALLOW",
         reservation_id: "r-1",
@@ -226,11 +227,12 @@ describe("CyclesClient", () => {
       });
 
       const client = new CyclesClient(config);
-      const resp = await client.createReservation({ idempotencyKey: "idem-1" });
+      const resp = await client.createReservation({ idempotency_key: "idem-1" });
 
-      expect(resp.getBodyAttribute("reservationId")).toBe("r-1");
-      expect(resp.getBodyAttribute("affectedScopes")).toEqual(["tenant:acme"]);
-      expect(resp.getBodyAttribute("expiresAtMs")).toBe(9999999);
+      // Response body is in wire format — callers use mappers for typed access
+      expect(resp.getBodyAttribute("reservation_id")).toBe("r-1");
+      expect(resp.getBodyAttribute("affected_scopes")).toEqual(["tenant:acme"]);
+      expect(resp.getBodyAttribute("expires_at_ms")).toBe(9999999);
     });
   });
 });

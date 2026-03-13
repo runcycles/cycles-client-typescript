@@ -77,11 +77,11 @@ describe("CyclesResponse", () => {
   });
 
   describe("getErrorResponse", () => {
-    it("parses error response", () => {
+    it("parses error response from wire-format body", () => {
       const resp = CyclesResponse.httpError(400, "Bad", {
         error: "INVALID_REQUEST",
         message: "Missing field",
-        requestId: "req-1",
+        request_id: "req-1",
         details: { field: "name" },
       });
       const errResp = resp.getErrorResponse();

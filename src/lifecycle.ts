@@ -11,12 +11,14 @@ import {
   ReservationExpiredError,
   ReservationFinalizedError,
 } from "./exceptions.js";
+import {
+  errorResponseFromWire,
+  metricsToWire,
+  reservationCreateResponseFromWire,
+} from "./mappers.js";
 import type {
-  Amount,
   CyclesMetrics,
   Decision,
-  DryRunResult,
-  ReservationCreateResponse,
   Subject,
 } from "./models.js";
 import { CyclesResponse } from "./response.js";
@@ -88,6 +90,7 @@ function evaluateActual(
   );
 }
 
+/** Build wire-format (snake_case) reservation create request body. */
 function buildReservationBody(
   cfg: WithCyclesConfig,
   estimate: number,
@@ -128,25 +131,26 @@ function buildReservationBody(
   const unit = cfg.unit ?? "USD_MICROCENTS";
 
   const body: Record<string, unknown> = {
-    idempotencyKey: randomUUID(),
+    idempotency_key: randomUUID(),
     subject,
     action,
     estimate: { unit, amount: estimate },
-    ttlMs,
-    overagePolicy: cfg.overagePolicy ?? "REJECT",
+    ttl_ms: ttlMs,
+    overage_policy: cfg.overagePolicy ?? "REJECT",
   };
 
   validateGracePeriodMs(cfg.gracePeriodMs);
   if (cfg.gracePeriodMs !== undefined) {
-    body.gracePeriodMs = cfg.gracePeriodMs;
+    body.grace_period_ms = cfg.gracePeriodMs;
   }
   if (cfg.dryRun) {
-    body.dryRun = true;
+    body.dry_run = true;
   }
 
   return body;
 }
 
+/** Build wire-format commit request body. */
 function buildCommitBody(
   actual: number,
   unit: string,
@@ -154,12 +158,12 @@ function buildCommitBody(
   metadata: Record<string, unknown> | undefined,
 ): Record<string, unknown> {
   const body: Record<string, unknown> = {
-    idempotencyKey: randomUUID(),
+    idempotency_key: randomUUID(),
     actual: { unit, amount: actual },
   };
 
   if (metrics && !isMetricsEmpty(metrics)) {
-    body.metrics = { ...metrics };
+    body.metrics = metricsToWire(metrics);
   }
   if (metadata) {
     body.metadata = metadata;
@@ -177,12 +181,14 @@ function isMetricsEmpty(metrics: CyclesMetrics): boolean {
   );
 }
 
+/** Build wire-format release request body. */
 function buildReleaseBody(reason: string): Record<string, unknown> {
-  return { idempotencyKey: randomUUID(), reason };
+  return { idempotency_key: randomUUID(), reason };
 }
 
+/** Build wire-format extend request body. */
 function buildExtendBody(ttlMs: number): Record<string, unknown> {
-  return { idempotencyKey: randomUUID(), extendByMs: ttlMs };
+  return { idempotency_key: randomUUID(), extend_by_ms: ttlMs };
 }
 
 function buildProtocolException(
@@ -214,12 +220,13 @@ function buildProtocolException(
     }
   }
 
-  reasonCode = response.getBodyAttribute("reasonCode") as string | undefined;
+  // Wire-format keys
+  reasonCode = response.getBodyAttribute("reason_code") as string | undefined;
   if (reasonCode === undefined && errorCode !== undefined) {
     reasonCode = errorCode;
   }
 
-  const retryRaw = response.getBodyAttribute("retryAfterMs");
+  const retryRaw = response.getBodyAttribute("retry_after_ms");
   if (retryRaw !== undefined) {
     retryAfterMs = Number(retryRaw);
   }
@@ -280,7 +287,10 @@ export class AsyncCyclesLifecycle {
       throw buildProtocolException("Failed to create reservation", resResponse);
     }
 
-    const resResult = resResponse.body as unknown as ReservationCreateResponse;
+    // Parse wire-format response into typed object
+    const resResult = reservationCreateResponseFromWire(
+      resResponse.body as Record<string, unknown>,
+    );
     const resT2 = performance.now();
 
     const decision = resResult.decision as Decision;
@@ -449,7 +459,8 @@ export class AsyncCyclesLifecycle {
           .extendReservation(reservationId, body)
           .then((response) => {
             if (response.isSuccess) {
-              const newExpires = response.getBodyAttribute("expiresAtMs");
+              // Wire-format key
+              const newExpires = response.getBodyAttribute("expires_at_ms");
               if (typeof newExpires === "number") {
                 ctx.expiresAtMs = newExpires;
               }
