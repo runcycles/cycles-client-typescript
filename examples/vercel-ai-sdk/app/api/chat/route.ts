@@ -49,13 +49,14 @@ export async function POST(req: Request) {
   try {
     // Reserve budget before starting the stream.
     // Throws BudgetExceededError if the tenant's budget is exhausted.
+    // Subject defaults (tenant, etc.) are read from cyclesClient.config
+    // automatically, so there's no need to pass them explicitly.
     handle = await reserveForStream({
       client: cyclesClient,
       estimate: estimatedCostMicrocents,
       unit: "USD_MICROCENTS",
       actionKind: "llm.completion",
       actionName: "gpt-4o",
-      tenant: cyclesClient.config.tenant,
     });
 
     // Start the stream. The reservation heartbeat keeps it alive

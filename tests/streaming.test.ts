@@ -130,7 +130,7 @@ describe("reserveForStream", () => {
     }
   });
 
-  it("throws BudgetExceededError on DENY", async () => {
+  it("throws on DENY decision", async () => {
     const client = makeMockClient();
     client.createReservation.mockResolvedValue(
       CyclesResponse.success(200, {
@@ -166,6 +166,37 @@ describe("reserveForStream", () => {
         tenant: "acme",
       }),
     ).rejects.toBeInstanceOf(BudgetExceededError);
+  });
+
+  it("uses config defaults for subject fields", async () => {
+    const client = {
+      config: new CyclesConfig({ baseUrl: "http://localhost", apiKey: "key", tenant: "from-config", workspace: "ws-1" }),
+      createReservation: vi.fn(),
+      commitReservation: vi.fn(),
+      releaseReservation: vi.fn(),
+      extendReservation: vi.fn(),
+    };
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-defaults",
+        affected_scopes: [],
+      }),
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      // tenant not specified — should fall back to config
+    });
+
+    try {
+      const createBody = client.createReservation.mock.calls[0][0];
+      expect(createBody.subject.tenant).toBe("from-config");
+      expect(createBody.subject.workspace).toBe("ws-1");
+    } finally {
+      handle.dispose();
+    }
   });
 
   it("dispose is idempotent", async () => {
