@@ -693,41 +693,34 @@ describe("reserveForStream", () => {
     expect(handle.finalized).toBe(true);
   });
 
-  it("commit restarts heartbeat on failure", async () => {
-    vi.useFakeTimers();
+  it("commit failure allows release as fallback", async () => {
     const client = makeMockClient();
     client.createReservation.mockResolvedValue(
       CyclesResponse.success(200, {
         decision: "ALLOW",
-        reservation_id: "r-hb-restart",
+        reservation_id: "r-fallback",
         affected_scopes: [],
       }),
     );
     client.commitReservation.mockRejectedValueOnce(new Error("network error"));
-    client.extendReservation.mockResolvedValue(
-      CyclesResponse.success(200, { status: "ACTIVE", expires_at_ms: Date.now() + 120000 }),
+    client.releaseReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "RELEASED" }),
     );
 
     const handle = await reserveForStream({
       client: client as any,
       estimate: 1000,
       tenant: "acme",
-      ttlMs: 60000,
     });
 
-    // Commit fails — heartbeat should be restarted
+    // Commit fails
     await expect(handle.commit(500)).rejects.toThrow("network error");
+    expect(handle.finalized).toBe(false);
 
-    // Reset extend mock call count to track post-failure heartbeats
-    client.extendReservation.mockClear();
-
-    // Advance past heartbeat interval — heartbeat should still be running
-    await vi.advanceTimersByTimeAsync(31000);
-    expect(client.extendReservation).toHaveBeenCalled();
-
-    // Clean up
-    handle.dispose();
-    vi.useRealTimers();
+    // Caller falls back to release instead of retrying
+    await handle.release("commit_failed");
+    expect(handle.finalized).toBe(true);
+    expect(client.releaseReservation).toHaveBeenCalledOnce();
   });
 
   it("passes gracePeriodMs and actionTags in request body", async () => {

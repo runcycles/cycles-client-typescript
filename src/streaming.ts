@@ -253,10 +253,12 @@ export async function reserveForStream(
           );
         }
       } catch (err) {
-        // Reset state so the caller can retry commit or fall back to release.
+        // Reset finalized so the caller can retry commit or fall back to release.
+        // The heartbeat is NOT restarted to avoid spawning duplicate heartbeat
+        // chains (an old in-flight extend's .finally→tick could race with a new
+        // startHeartbeat call). The reservation's remaining TTL should give the
+        // caller enough time to retry or release.
         finalized = false;
-        heartbeatStopped = false;
-        startHeartbeat();
         throw err;
       }
     },
