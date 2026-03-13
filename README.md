@@ -268,6 +268,8 @@ setDefaultClient(new CyclesClient(new CyclesConfig({ baseUrl: "http://localhost:
 const guarded = withCycles({ estimate: 1000 }, async () => "hello");
 ```
 
+Client resolution is deferred to the first invocation and then cached — the wrapper binds permanently to the resolved client after its first call. A later `setDefaultClient()` call will not affect already-invoked wrappers.
+
 ## `withCycles` Options
 
 The `WithCyclesConfig` interface controls the lifecycle behavior:
