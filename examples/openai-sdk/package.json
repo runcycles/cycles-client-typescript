@@ -1,0 +1,19 @@
+{
+  "name": "cycles-openai-sdk-example",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "non-streaming": "tsx src/non-streaming.ts",
+    "streaming": "tsx src/streaming.ts"
+  },
+  "dependencies": {
+    "openai": "^4.0.0",
+    "runcycles": "../../"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.4.0"
+  }
+}

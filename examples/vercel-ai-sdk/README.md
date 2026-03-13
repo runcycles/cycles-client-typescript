@@ -16,7 +16,8 @@ call is made.
 ## Requirements
 
 - **Node.js 20+** (required for `fetch`, `AsyncLocalStorage`)
-- The route uses `export const runtime = 'nodejs'` to ensure the Node.js runtime
+- An OpenAI API key
+- A running Cycles server
 
 ## Setup
 

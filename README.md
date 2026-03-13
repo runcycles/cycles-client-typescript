@@ -1,6 +1,6 @@
 # Cycles TypeScript Client
 
-TypeScript client for the [Cycles](https://runcycles.com) budget-management protocol — govern spend on AI calls, API usage, and any metered resource.
+TypeScript client for the [Cycles](https://runcycles.io) budget-management protocol — govern spend on AI calls, API usage, and any metered resource.
 
 Cycles lets you set budgets, reserve capacity before expensive operations, and track actual usage. This client handles the full reservation lifecycle: reserve budget up front, execute your work, then commit or release — with automatic heartbeats, retries, and typed error handling.
 
@@ -790,7 +790,11 @@ See the [`examples/`](./examples/) directory:
 - [`basic-usage.ts`](./examples/basic-usage.ts) — Programmatic client with full reserve/commit lifecycle
 - [`async-usage.ts`](./examples/async-usage.ts) — `withCycles` with async/await and context access
 - [`decorator-usage.ts`](./examples/decorator-usage.ts) — `withCycles` patterns
-- [`vercel-ai-sdk/`](./examples/vercel-ai-sdk/) — Vercel AI SDK streaming integration
+- [`vercel-ai-sdk/`](./examples/vercel-ai-sdk/) — Next.js + Vercel AI SDK streaming integration
+- [`openai-sdk/`](./examples/openai-sdk/) — Direct OpenAI SDK with non-streaming and streaming patterns
+- [`anthropic-sdk/`](./examples/anthropic-sdk/) — Anthropic Claude SDK with Caps-aware `max_tokens`
+- [`langchain-js/`](./examples/langchain-js/) — LangChain.js chains and ReAct agents with Caps integration
+- [`express-middleware/`](./examples/express-middleware/) — Reusable Express middleware for budget governance
 
 ## Features
 
