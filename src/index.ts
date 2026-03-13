@@ -24,7 +24,7 @@ export { CyclesResponse } from "./response.js";
 export {
   CyclesError,
   CyclesProtocolError,
-  CyclesTransportError,
+
   BudgetExceededError,
   DebtOutstandingError,
   OverdraftLimitExceededError,
