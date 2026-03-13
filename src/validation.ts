@@ -19,12 +19,6 @@ export function validateSubject(subject: Subject | undefined): void {
   }
 }
 
-export function validateReservationId(reservationId: string | undefined): void {
-  if (!reservationId) {
-    throw new Error("reservation_id is required and must be non-empty");
-  }
-}
-
 export function validateNonNegative(value: number, name: string): void {
   if (value < 0) {
     throw new Error(`${name} must be non-negative, got ${value}`);

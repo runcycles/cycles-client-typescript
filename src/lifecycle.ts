@@ -3,6 +3,7 @@
 import { randomUUID } from "node:crypto";
 import type { CyclesClient } from "./client.js";
 import { runWithContext, type CyclesContext } from "./context.js";
+import { DEFAULT_TTL_MS } from "./constants.js";
 import { buildProtocolException } from "./errors.js";
 import { CyclesProtocolError } from "./exceptions.js";
 import {
@@ -91,7 +92,7 @@ function buildReservationBody(
   defaultSubject: SubjectDefaults,
 ): Record<string, unknown> {
   validateNonNegative(estimate, "estimate");
-  const ttlMs = cfg.ttlMs ?? 60_000;
+  const ttlMs = cfg.ttlMs ?? DEFAULT_TTL_MS;
   validateTtlMs(ttlMs);
 
   const subject: Record<string, unknown> = {};
@@ -200,7 +201,6 @@ export class AsyncCyclesLifecycle {
     const estimate = evaluateAmount(cfg.estimate, args);
 
     const createBody = buildReservationBody(cfg, estimate, this._defaultSubject);
-    const _resT1 = performance.now();
     const resResponse = await this._client.createReservation(createBody);
 
     if (!resResponse.isSuccess) {
@@ -247,7 +247,7 @@ export class AsyncCyclesLifecycle {
     }
 
     const unit = cfg.unit ?? "USD_MICROCENTS";
-    const ttlMs = cfg.ttlMs ?? 60_000;
+    const ttlMs = cfg.ttlMs ?? DEFAULT_TTL_MS;
 
     // Set context
     const ctx: CyclesContext = {
