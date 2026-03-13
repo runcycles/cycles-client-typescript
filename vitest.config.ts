@@ -6,5 +6,11 @@ export default defineConfig({
   test: {
     environment: "node",
     pool: "threads",
+    coverage: {
+      thresholds: {
+        lines: 95,
+        branches: 85,
+      },
+    },
   },
 });
