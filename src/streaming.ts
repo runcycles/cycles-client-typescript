@@ -26,6 +26,7 @@ import {
 import type { Caps, CyclesMetrics, Decision, Subject } from "./models.js";
 import { isMetricsEmpty } from "./models.js";
 import {
+  validateExtendByMs,
   validateGracePeriodMs,
   validateNonNegative,
   validateSubject,
@@ -176,6 +177,7 @@ export async function reserveForStream(
       if (disposed) return;
       currentTimer = setTimeout(() => {
         if (disposed) return;
+        validateExtendByMs(ttlMs);
         const extendBody = { idempotency_key: randomUUID(), extend_by_ms: ttlMs };
         void client
           .extendReservation(reservationId, extendBody)

@@ -86,9 +86,26 @@ export type {
 
 // Mappers (for advanced use — building/parsing wire-format bodies)
 export {
+  // Request mappers (camelCase → snake_case)
   metricsToWire,
+  reservationCreateRequestToWire,
+  commitRequestToWire,
+  releaseRequestToWire,
+  reservationExtendRequestToWire,
+  decisionRequestToWire,
+  eventCreateRequestToWire,
+  // Response mappers (snake_case → camelCase)
   capsFromWire,
   reservationCreateResponseFromWire,
+  commitResponseFromWire,
+  releaseResponseFromWire,
+  reservationExtendResponseFromWire,
+  decisionResponseFromWire,
+  eventCreateResponseFromWire,
+  reservationDetailFromWire,
+  reservationSummaryFromWire,
+  reservationListResponseFromWire,
+  balanceResponseFromWire,
   errorResponseFromWire,
 } from "./mappers.js";
 
