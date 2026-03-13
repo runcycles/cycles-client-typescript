@@ -82,13 +82,33 @@ describe("withCycles", () => {
     expect(result).toBe("lazy");
   });
 
-  it("throws if no client available", () => {
-    expect(() =>
-      withCycles(
-        { estimate: 500 },
-        async () => "never",
-      ),
-    ).toThrow("No Cycles client available");
+  it("throws if no client available", async () => {
+    const guarded = withCycles(
+      { estimate: 500 },
+      async () => "never",
+    );
+
+    await expect(guarded()).rejects.toThrow("No Cycles client available");
+  });
+
+  it("supports setDefaultClient after withCycles definition", async () => {
+    // Define the guarded function BEFORE setting the default client.
+    // This deferred pattern must work for module-scope definitions.
+    const guarded = withCycles(
+      { estimate: 500 },
+      async () => "deferred",
+    );
+
+    // Set default client after definition
+    mockFetchSequence([
+      { status: 200, body: { decision: "ALLOW", reservation_id: "r-deferred", affected_scopes: [] } },
+      { status: 200, body: { status: "COMMITTED" } },
+    ]);
+    const config = new CyclesConfig({ baseUrl: "http://localhost:7878", apiKey: "key", tenant: "acme" });
+    setDefaultClient(new CyclesClient(config));
+
+    const result = await guarded();
+    expect(result).toBe("deferred");
   });
 
   it("preserves function arguments", async () => {

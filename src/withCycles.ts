@@ -41,27 +41,31 @@ export function withCycles<TArgs extends unknown[], TResult>(
   options: WithCyclesConfig & { client?: CyclesClient },
   fn: (...args: TArgs) => Promise<TResult>,
 ): (...args: TArgs) => Promise<TResult> {
-  const client = getEffectiveClient(options.client);
-  const config = client.config;
+  // Defer default client resolution to first call so setDefaultClient/
+  // setDefaultConfig can be called after withCycles(). Once resolved,
+  // the lifecycle (and its CommitRetryEngine) are cached for reuse.
+  let lifecycle: AsyncCyclesLifecycle | undefined;
 
-  const defaultSubject = {
-    tenant: config.tenant,
-    workspace: config.workspace,
-    app: config.app,
-    workflow: config.workflow,
-    agent: config.agent,
-    toolset: config.toolset,
-  };
-
-  const retryEngine = new CommitRetryEngine(config);
-  const lifecycle = new AsyncCyclesLifecycle(
-    client,
-    retryEngine,
-    defaultSubject,
-  );
+  function ensureLifecycle(): AsyncCyclesLifecycle {
+    if (!lifecycle) {
+      const client = getEffectiveClient(options.client);
+      const config = client.config;
+      const defaultSubject = {
+        tenant: config.tenant,
+        workspace: config.workspace,
+        app: config.app,
+        workflow: config.workflow,
+        agent: config.agent,
+        toolset: config.toolset,
+      };
+      const retryEngine = new CommitRetryEngine(config);
+      lifecycle = new AsyncCyclesLifecycle(client, retryEngine, defaultSubject);
+    }
+    return lifecycle;
+  }
 
   return async (...args: TArgs): Promise<TResult> => {
-    return lifecycle.execute(
+    return ensureLifecycle().execute(
       fn as (...args: unknown[]) => Promise<TResult>,
       args,
       options,
