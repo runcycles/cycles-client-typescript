@@ -345,6 +345,37 @@ describe("reservationDetailFromWire", () => {
     expect(parsed.finalizedAtMs).toBeUndefined();
     expect(parsed.metadata).toBeUndefined();
   });
+
+  it("parses subject with all optional fields", () => {
+    const parsed = reservationDetailFromWire({
+      reservation_id: "r-3",
+      status: "ACTIVE",
+      subject: {
+        tenant: "acme",
+        workspace: "prod",
+        app: "chat",
+        workflow: "refund",
+        agent: "planner",
+        toolset: "search-tools",
+        dimensions: { env: "staging", region: "us-east" },
+      },
+      action: { kind: "llm.completion", name: "gpt-4o" },
+      reserved: { unit: "USD_MICROCENTS", amount: 1000 },
+      created_at_ms: 1700000000000,
+      expires_at_ms: 1700000060000,
+      scope_path: "/acme/prod/chat/refund/planner/search-tools",
+      affected_scopes: ["tenant:acme"],
+    });
+    expect(parsed.subject).toEqual({
+      tenant: "acme",
+      workspace: "prod",
+      app: "chat",
+      workflow: "refund",
+      agent: "planner",
+      toolset: "search-tools",
+      dimensions: { env: "staging", region: "us-east" },
+    });
+  });
 });
 
 describe("reservationSummaryFromWire", () => {
@@ -437,6 +468,12 @@ describe("balanceResponseFromWire", () => {
     expect(b.isOverLimit).toBe(false);
     expect(parsed.nextCursor).toBe("cursor-xyz");
     expect(parsed.hasMore).toBe(true);
+  });
+
+  it("handles undefined balances", () => {
+    const parsed = balanceResponseFromWire({});
+    expect(parsed.balances).toEqual([]);
+    expect(parsed.hasMore).toBeUndefined();
   });
 
   it("handles empty balances", () => {
