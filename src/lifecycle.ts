@@ -200,7 +200,7 @@ export class AsyncCyclesLifecycle {
     const estimate = evaluateAmount(cfg.estimate, args);
 
     const createBody = buildReservationBody(cfg, estimate, this._defaultSubject);
-    const resT1 = performance.now();
+    const _resT1 = performance.now();
     const resResponse = await this._client.createReservation(createBody);
 
     if (!resResponse.isSuccess) {
