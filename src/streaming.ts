@@ -245,7 +245,20 @@ export async function reserveForStream(
       if (metadata) {
         commitBody.metadata = metadata;
       }
-      await client.commitReservation(reservationId, commitBody);
+      try {
+        const response = await client.commitReservation(reservationId, commitBody);
+        if (!response.isSuccess) {
+          throw new CyclesError(
+            `Commit failed with status ${response.status}: ${response.errorMessage ?? "unknown error"}`,
+          );
+        }
+      } catch (err) {
+        // Reset state so the caller can retry commit or fall back to release.
+        finalized = false;
+        heartbeatStopped = false;
+        startHeartbeat();
+        throw err;
+      }
     },
 
     async release(reason?: string): Promise<void> {

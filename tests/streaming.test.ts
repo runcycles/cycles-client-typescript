@@ -625,6 +625,111 @@ describe("reserveForStream", () => {
     expect(releaseBody.reason).toBe("stream_aborted");
   });
 
+  // --- Bug fix regression: commit failure recovery ---
+
+  it("commit resets finalized on transport failure so caller can retry", async () => {
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-retry",
+        affected_scopes: [],
+      }),
+    );
+    // First commit throws (network error)
+    client.commitReservation
+      .mockRejectedValueOnce(new Error("ECONNRESET"))
+      // Second commit succeeds
+      .mockResolvedValueOnce(CyclesResponse.success(200, { status: "COMMITTED" }));
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+    });
+
+    // First commit fails
+    await expect(handle.commit(500)).rejects.toThrow("ECONNRESET");
+    // Handle should NOT be finalized — caller can retry
+    expect(handle.finalized).toBe(false);
+
+    // Retry succeeds
+    await handle.commit(500);
+    expect(handle.finalized).toBe(true);
+    expect(client.commitReservation).toHaveBeenCalledTimes(2);
+  });
+
+  it("commit throws CyclesError on non-success HTTP response", async () => {
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-4xx",
+        affected_scopes: [],
+      }),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.httpError(409, "Reservation expired", {
+        error: "RESERVATION_EXPIRED",
+        message: "Reservation has expired",
+        request_id: "req-1",
+      }),
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+    });
+
+    await expect(handle.commit(500)).rejects.toThrow("Commit failed with status 409");
+    // Should be recoverable — can fall back to release
+    expect(handle.finalized).toBe(false);
+
+    client.releaseReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "RELEASED" }),
+    );
+    await handle.release("commit_failed");
+    expect(handle.finalized).toBe(true);
+  });
+
+  it("commit restarts heartbeat on failure", async () => {
+    vi.useFakeTimers();
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-hb-restart",
+        affected_scopes: [],
+      }),
+    );
+    client.commitReservation.mockRejectedValueOnce(new Error("network error"));
+    client.extendReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "ACTIVE", expires_at_ms: Date.now() + 120000 }),
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+      ttlMs: 60000,
+    });
+
+    // Commit fails — heartbeat should be restarted
+    await expect(handle.commit(500)).rejects.toThrow("network error");
+
+    // Reset extend mock call count to track post-failure heartbeats
+    client.extendReservation.mockClear();
+
+    // Advance past heartbeat interval — heartbeat should still be running
+    await vi.advanceTimersByTimeAsync(31000);
+    expect(client.extendReservation).toHaveBeenCalled();
+
+    // Clean up
+    handle.dispose();
+    vi.useRealTimers();
+  });
+
   it("passes gracePeriodMs and actionTags in request body", async () => {
     const client = makeMockClient();
     client.createReservation.mockResolvedValue(

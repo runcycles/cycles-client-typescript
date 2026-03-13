@@ -667,6 +667,66 @@ describe("AsyncCyclesLifecycle", () => {
     ).rejects.toThrow("Dry-run denied");
   });
 
+  // --- Bug fix regression: malformed 4xx body fallback ---
+
+  it("extracts error code from raw body when getErrorResponse returns undefined", async () => {
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-1",
+        affected_scopes: [],
+      }),
+    );
+    // 409 with error code but missing request_id — getErrorResponse() returns undefined
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.httpError(409, "Finalized", {
+        error: "RESERVATION_FINALIZED",
+        message: "Already finalized",
+        // No request_id — errorResponseFromWire returns undefined
+      }),
+    );
+
+    const retryEngine = makeRetryEngine();
+    const scheduleSpy = vi.spyOn(retryEngine, "schedule");
+    const lifecycle = new AsyncCyclesLifecycle(client as any, retryEngine, { tenant: "acme" });
+
+    const result = await lifecycle.execute(async () => "ok", [], { estimate: 1000 });
+    expect(result).toBe("ok");
+    // Should still detect RESERVATION_FINALIZED via raw body fallback
+    expect(scheduleSpy).not.toHaveBeenCalled();
+    expect(client.releaseReservation).not.toHaveBeenCalled();
+  });
+
+  it("uses 'unknown' in release reason when error code is truly missing", async () => {
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-1",
+        affected_scopes: [],
+      }),
+    );
+    // 400 with no error code at all in body
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.httpError(400, "Bad request", {
+        message: "Malformed body",
+      }),
+    );
+    client.releaseReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "RELEASED" }),
+    );
+
+    const retryEngine = makeRetryEngine();
+    const lifecycle = new AsyncCyclesLifecycle(client as any, retryEngine, { tenant: "acme" });
+
+    await lifecycle.execute(async () => "ok", [], { estimate: 1000 });
+
+    expect(client.releaseReservation).toHaveBeenCalledOnce();
+    const releaseBody = client.releaseReservation.mock.calls[0][1];
+    expect(releaseBody.reason).toBe("commit_rejected_unknown");
+  });
+
   it("uses gracePeriodMs and dimensions in request body", async () => {
     const client = makeMockClient();
     client.createReservation.mockResolvedValue(
