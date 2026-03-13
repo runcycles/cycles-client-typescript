@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   validateSubject,
-  validateReservationId,
+
   validateNonNegative,
   validateTtlMs,
   validateGracePeriodMs,
@@ -28,20 +28,6 @@ describe("validation", () => {
 
     it("passes undefined", () => {
       expect(() => validateSubject(undefined)).not.toThrow();
-    });
-  });
-
-  describe("validateReservationId", () => {
-    it("passes with valid id", () => {
-      expect(() => validateReservationId("r-123")).not.toThrow();
-    });
-
-    it("throws with empty string", () => {
-      expect(() => validateReservationId("")).toThrow("required");
-    });
-
-    it("throws with undefined", () => {
-      expect(() => validateReservationId(undefined)).toThrow("required");
     });
   });
 

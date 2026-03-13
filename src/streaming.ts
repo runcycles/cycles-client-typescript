@@ -28,6 +28,7 @@
 
 import { randomUUID } from "node:crypto";
 import type { CyclesClient } from "./client.js";
+import { DEFAULT_TTL_MS } from "./constants.js";
 import { buildProtocolException } from "./errors.js";
 import { CyclesError, CyclesProtocolError } from "./exceptions.js";
 import {
@@ -117,7 +118,7 @@ export async function reserveForStream(
     actionKind = "unknown",
     actionName = "unknown",
     actionTags,
-    ttlMs = 60_000,
+    ttlMs = DEFAULT_TTL_MS,
     gracePeriodMs,
     overagePolicy = "REJECT",
     dimensions,

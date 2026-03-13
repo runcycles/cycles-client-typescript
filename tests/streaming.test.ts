@@ -1,14 +1,8 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { reserveForStream } from "../src/streaming.js";
-import { CyclesClient } from "../src/client.js";
 import { CyclesConfig } from "../src/config.js";
 import { CyclesResponse } from "../src/response.js";
 import { BudgetExceededError, CyclesError } from "../src/exceptions.js";
-
-function makeClient() {
-  const config = new CyclesConfig({ baseUrl: "http://localhost", apiKey: "key", tenant: "acme" });
-  return new CyclesClient(config);
-}
 
 function makeMockClient() {
   return {
