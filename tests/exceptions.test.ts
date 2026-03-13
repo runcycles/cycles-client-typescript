@@ -60,6 +60,54 @@ describe("exceptions", () => {
     });
   });
 
+  describe("helper methods on CyclesProtocolError", () => {
+    it("isOverdraftLimitExceeded returns true for matching code", () => {
+      const err = new CyclesProtocolError("test", { errorCode: "OVERDRAFT_LIMIT_EXCEEDED" });
+      expect(err.isOverdraftLimitExceeded()).toBe(true);
+      expect(err.isBudgetExceeded()).toBe(false);
+    });
+
+    it("isDebtOutstanding returns true for matching code", () => {
+      const err = new CyclesProtocolError("test", { errorCode: "DEBT_OUTSTANDING" });
+      expect(err.isDebtOutstanding()).toBe(true);
+      expect(err.isBudgetExceeded()).toBe(false);
+    });
+
+    it("isReservationExpired returns true for matching code", () => {
+      const err = new CyclesProtocolError("test", { errorCode: "RESERVATION_EXPIRED" });
+      expect(err.isReservationExpired()).toBe(true);
+      expect(err.isReservationFinalized()).toBe(false);
+    });
+
+    it("isReservationFinalized returns true for matching code", () => {
+      const err = new CyclesProtocolError("test", { errorCode: "RESERVATION_FINALIZED" });
+      expect(err.isReservationFinalized()).toBe(true);
+      expect(err.isReservationExpired()).toBe(false);
+    });
+
+    it("isIdempotencyMismatch returns true for matching code", () => {
+      const err = new CyclesProtocolError("test", { errorCode: "IDEMPOTENCY_MISMATCH" });
+      expect(err.isIdempotencyMismatch()).toBe(true);
+    });
+
+    it("isUnitMismatch returns true for matching code", () => {
+      const err = new CyclesProtocolError("test", { errorCode: "UNIT_MISMATCH" });
+      expect(err.isUnitMismatch()).toBe(true);
+    });
+
+    it("all helpers return false for non-matching error code", () => {
+      const err = new CyclesProtocolError("test", { errorCode: "UNKNOWN" });
+      expect(err.isBudgetExceeded()).toBe(false);
+      expect(err.isOverdraftLimitExceeded()).toBe(false);
+      expect(err.isDebtOutstanding()).toBe(false);
+      expect(err.isReservationExpired()).toBe(false);
+      expect(err.isReservationFinalized()).toBe(false);
+      expect(err.isIdempotencyMismatch()).toBe(false);
+      expect(err.isUnitMismatch()).toBe(false);
+      expect(err.isRetryable()).toBe(true); // UNKNOWN is retryable
+    });
+  });
+
   describe("CyclesTransportError", () => {
     it("stores cause", () => {
       const cause = new Error("ECONNREFUSED");

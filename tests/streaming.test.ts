@@ -430,4 +430,225 @@ describe("reserveForStream", () => {
 
     expect(client.releaseReservation).not.toHaveBeenCalled();
   });
+
+  // --- Heartbeat tests ---
+
+  it("heartbeat extends reservation on interval", async () => {
+    vi.useFakeTimers();
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-hb",
+        affected_scopes: [],
+      }),
+    );
+    client.extendReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "ACTIVE", expires_at_ms: Date.now() + 120000 }),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+      ttlMs: 60000,
+    });
+
+    // Advance past heartbeat interval (ttlMs/2 = 30000)
+    await vi.advanceTimersByTimeAsync(31000);
+    expect(client.extendReservation).toHaveBeenCalled();
+
+    await handle.commit(500);
+    vi.useRealTimers();
+  });
+
+  it("heartbeat swallows extend failures gracefully", async () => {
+    vi.useFakeTimers();
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-hb-fail",
+        affected_scopes: [],
+      }),
+    );
+    client.extendReservation.mockRejectedValue(new Error("extend failed"));
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+      ttlMs: 60000,
+    });
+
+    // Should not throw even though extend fails
+    await vi.advanceTimersByTimeAsync(31000);
+    expect(client.extendReservation).toHaveBeenCalled();
+
+    await handle.commit(500);
+    vi.useRealTimers();
+  });
+
+  // --- Missing reservation_id guard ---
+
+  it("throws when reservation_id missing from success response", async () => {
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        // No reservation_id
+        affected_scopes: [],
+      }),
+    );
+
+    await expect(
+      reserveForStream({
+        client: client as any,
+        estimate: 1000,
+        tenant: "acme",
+      }),
+    ).rejects.toThrow("reservation_id missing");
+  });
+
+  // --- Commit with metrics and metadata ---
+
+  it("commit includes metadata in wire format", async () => {
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-meta",
+        affected_scopes: [],
+      }),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+    });
+
+    await handle.commit(
+      800,
+      { tokensInput: 50, tokensOutput: 100 },
+      { model: "gpt-4o", provider: "openai" },
+    );
+
+    const [, commitBody] = client.commitReservation.mock.calls[0];
+    expect(commitBody.metrics).toEqual({
+      tokens_input: 50,
+      tokens_output: 100,
+    });
+    expect(commitBody.metadata).toEqual({ model: "gpt-4o", provider: "openai" });
+  });
+
+  it("commit omits empty metrics", async () => {
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-empty-m",
+        affected_scopes: [],
+      }),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+    });
+
+    await handle.commit(800, {});
+
+    const [, commitBody] = client.commitReservation.mock.calls[0];
+    expect(commitBody.metrics).toBeUndefined();
+  });
+
+  // --- Release error swallowing ---
+
+  it("release swallows client errors silently", async () => {
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-release-err",
+        affected_scopes: [],
+      }),
+    );
+    client.releaseReservation.mockRejectedValue(new Error("server exploded"));
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+    });
+
+    // Should not throw
+    await handle.release("abort");
+    expect(handle.finalized).toBe(true);
+  });
+
+  it("release uses default reason when not specified", async () => {
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-default-reason",
+        affected_scopes: [],
+      }),
+    );
+    client.releaseReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "RELEASED" }),
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+    });
+
+    await handle.release();
+
+    const [, releaseBody] = client.releaseReservation.mock.calls[0];
+    expect(releaseBody.reason).toBe("stream_aborted");
+  });
+
+  it("passes gracePeriodMs and actionTags in request body", async () => {
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-opts",
+        affected_scopes: [],
+      }),
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+      gracePeriodMs: 5000,
+      actionTags: ["streaming", "llm"],
+      dimensions: { env: "prod" },
+    });
+
+    const createBody = client.createReservation.mock.calls[0][0];
+    expect(createBody.grace_period_ms).toBe(5000);
+    expect(createBody.action.tags).toEqual(["streaming", "llm"]);
+    expect(createBody.subject.dimensions).toEqual({ env: "prod" });
+
+    handle.dispose();
+  });
 });
