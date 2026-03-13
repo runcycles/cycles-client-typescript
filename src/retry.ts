@@ -72,5 +72,9 @@ export class CommitRetryEngine {
         // Continue retrying on transport errors
       }
     }
+
+    console.warn(
+      `[runcycles] Commit retry exhausted after ${this._maxAttempts} attempts for reservation ${reservationId}`,
+    );
   }
 }
