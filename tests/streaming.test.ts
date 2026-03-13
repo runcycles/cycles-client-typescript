@@ -3,7 +3,7 @@ import { reserveForStream } from "../src/streaming.js";
 import { CyclesClient } from "../src/client.js";
 import { CyclesConfig } from "../src/config.js";
 import { CyclesResponse } from "../src/response.js";
-import { BudgetExceededError } from "../src/exceptions.js";
+import { BudgetExceededError, CyclesError } from "../src/exceptions.js";
 
 function makeClient() {
   const config = new CyclesConfig({ baseUrl: "http://localhost", apiKey: "key", tenant: "acme" });
@@ -216,5 +216,218 @@ describe("reserveForStream", () => {
 
     handle.dispose();
     handle.dispose(); // Should not throw
+  });
+
+  // --- Race-safety / once-only finalization tests ---
+
+  it("finalized is false initially, true after commit", async () => {
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-fin-1",
+        affected_scopes: [],
+      }),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+    });
+
+    expect(handle.finalized).toBe(false);
+    await handle.commit(500);
+    expect(handle.finalized).toBe(true);
+  });
+
+  it("finalized is true after release", async () => {
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-fin-2",
+        affected_scopes: [],
+      }),
+    );
+    client.releaseReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "RELEASED" }),
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+    });
+
+    expect(handle.finalized).toBe(false);
+    await handle.release();
+    expect(handle.finalized).toBe(true);
+  });
+
+  it("finalized is true after dispose", async () => {
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-fin-3",
+        affected_scopes: [],
+      }),
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+    });
+
+    expect(handle.finalized).toBe(false);
+    handle.dispose();
+    expect(handle.finalized).toBe(true);
+  });
+
+  it("commit then release is no-op", async () => {
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-race-1",
+        affected_scopes: [],
+      }),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+    });
+
+    await handle.commit(800);
+    await handle.release("too_late"); // Should be a no-op
+
+    expect(client.commitReservation).toHaveBeenCalledOnce();
+    expect(client.releaseReservation).not.toHaveBeenCalled();
+  });
+
+  it("release then commit throws", async () => {
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-race-2",
+        affected_scopes: [],
+      }),
+    );
+    client.releaseReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "RELEASED" }),
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+    });
+
+    await handle.release("aborted");
+    await expect(handle.commit(800)).rejects.toThrow("already finalized");
+    expect(client.commitReservation).not.toHaveBeenCalled();
+  });
+
+  it("double commit throws on second call", async () => {
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-race-3",
+        affected_scopes: [],
+      }),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+    });
+
+    await handle.commit(800);
+    await expect(handle.commit(900)).rejects.toBeInstanceOf(CyclesError);
+    expect(client.commitReservation).toHaveBeenCalledOnce();
+  });
+
+  it("double release only calls server once", async () => {
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-race-4",
+        affected_scopes: [],
+      }),
+    );
+    client.releaseReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "RELEASED" }),
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+    });
+
+    await handle.release("error_1");
+    await handle.release("error_2"); // Should be a no-op
+
+    expect(client.releaseReservation).toHaveBeenCalledOnce();
+  });
+
+  it("dispose then commit throws", async () => {
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-race-5",
+        affected_scopes: [],
+      }),
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+    });
+
+    handle.dispose();
+    await expect(handle.commit(500)).rejects.toThrow("already finalized");
+    expect(client.commitReservation).not.toHaveBeenCalled();
+  });
+
+  it("dispose then release is no-op", async () => {
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-race-6",
+        affected_scopes: [],
+      }),
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+    });
+
+    handle.dispose();
+    await handle.release("too_late"); // Should be a no-op
+
+    expect(client.releaseReservation).not.toHaveBeenCalled();
   });
 });

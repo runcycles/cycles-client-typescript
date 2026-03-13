@@ -12,6 +12,12 @@
  * block around the stream — the heartbeat lives until a terminal
  * operation (commit/release) is reached.
  *
+ * RACE SAFETY: In real streaming code, multiple terminal paths can fire
+ * concurrently (onFinish, error handler, abort signal, client disconnect).
+ * The handle is once-only: the first terminal call (commit/release/dispose)
+ * wins, and subsequent calls are either no-ops (release, dispose) or throw
+ * (commit). Check `handle.finalized` to inspect state.
+ *
  * Typical lifecycle:
  *   1. `reserveForStream(...)` — creates reservation + starts heartbeat
  *   2. Start streaming (e.g. `streamText(...)`)
@@ -23,7 +29,7 @@
 import { randomUUID } from "node:crypto";
 import type { CyclesClient } from "./client.js";
 import { buildProtocolException } from "./errors.js";
-import { CyclesProtocolError } from "./exceptions.js";
+import { CyclesError, CyclesProtocolError } from "./exceptions.js";
 import {
   metricsToWire,
   reservationCreateResponseFromWire,
@@ -64,10 +70,13 @@ export interface StreamReservation {
   readonly decision: Decision;
   /** Caps imposed by the budget, if any. */
   readonly caps: Caps | undefined;
+  /** True after commit(), release(), or dispose() has been called. */
+  readonly finalized: boolean;
 
   /**
    * Commit actual usage after the stream completes successfully.
    * Automatically stops the heartbeat. Call from `onFinish` or equivalent.
+   * Throws `CyclesError` if the handle is already finalized.
    */
   commit(
     actual: number,
@@ -78,6 +87,7 @@ export interface StreamReservation {
   /**
    * Release the reservation on error or abort.
    * Automatically stops the heartbeat. Best-effort — errors are swallowed.
+   * No-op if the handle is already finalized.
    */
   release(reason?: string): Promise<void>;
 
@@ -85,7 +95,7 @@ export interface StreamReservation {
    * Stop the heartbeat timer without committing or releasing.
    * Use only for stream startup failures where the stream was never started.
    * For normal finalization, use `commit()` or `release()` instead.
-   * Safe to call multiple times.
+   * No-op if the handle is already finalized.
    */
   dispose(): void;
 }
@@ -172,13 +182,14 @@ export async function reserveForStream(
     );
   }
 
-  // Heartbeat management
-  let disposed = false;
+  // Heartbeat and finalization state
+  let heartbeatStopped = false;
+  let finalized = false;
   let currentTimer: ReturnType<typeof setTimeout>;
 
   const stopHeartbeat = (): void => {
-    if (!disposed) {
-      disposed = true;
+    if (!heartbeatStopped) {
+      heartbeatStopped = true;
       clearTimeout(currentTimer);
     }
   };
@@ -188,9 +199,9 @@ export async function reserveForStream(
     const intervalMs = Math.max(ttlMs / 2, 1_000);
 
     const tick = (): void => {
-      if (disposed) return;
+      if (heartbeatStopped) return;
       currentTimer = setTimeout(() => {
-        if (disposed) return;
+        if (heartbeatStopped) return;
         validateExtendByMs(ttlMs);
         const extendBody = { idempotency_key: randomUUID(), extend_by_ms: ttlMs };
         void client
@@ -210,11 +221,19 @@ export async function reserveForStream(
     decision: parsed.decision as Decision,
     caps: parsed.caps,
 
+    get finalized(): boolean {
+      return finalized;
+    },
+
     async commit(
       actual: number,
       metrics?: CyclesMetrics,
       metadata?: Record<string, unknown>,
     ): Promise<void> {
+      if (finalized) {
+        throw new CyclesError("StreamReservation already finalized");
+      }
+      finalized = true;
       stopHeartbeat();
       const commitBody: Record<string, unknown> = {
         idempotency_key: randomUUID(),
@@ -230,6 +249,8 @@ export async function reserveForStream(
     },
 
     async release(reason?: string): Promise<void> {
+      if (finalized) return;
+      finalized = true;
       stopHeartbeat();
       try {
         const releaseBody = { idempotency_key: randomUUID(), reason: reason ?? "stream_aborted" };
@@ -240,6 +261,8 @@ export async function reserveForStream(
     },
 
     dispose(): void {
+      if (finalized) return;
+      finalized = true;
       stopHeartbeat();
     },
   };

@@ -104,10 +104,17 @@ The handle owns its finalization: `commit()` and `release()` automatically stop 
 There is no need for a `finally { handle.dispose() }` block — in a streaming handler, the
 `finally` would run when the handler returns the response object, not when the stream ends.
 
+The handle is **once-only and race-safe**: in real streaming code, multiple terminal paths
+can fire (onFinish, error, abort signal, client disconnect). Only the first terminal call wins:
+- `commit()` throws `CyclesError` if already finalized (dropping a commit silently hides bugs)
+- `release()` is a silent no-op if already finalized (best-effort by design)
+- `handle.finalized` — check whether the handle has been finalized
+
 The `StreamReservation` handle provides:
-- `handle.commit(actual, metrics?, metadata?)` — commit actual usage and stop heartbeat
-- `handle.release(reason?)` — release reservation and stop heartbeat (best-effort)
-- `handle.dispose()` — stop heartbeat only (for stream startup failures where neither commit nor release applies)
+- `handle.commit(actual, metrics?, metadata?)` — commit actual usage and stop heartbeat (throws if finalized)
+- `handle.release(reason?)` — release reservation and stop heartbeat (no-op if finalized)
+- `handle.dispose()` — stop heartbeat only, for startup failures (no-op if finalized)
+- `handle.finalized` — true after any terminal call
 - `handle.reservationId` — the reservation ID
 - `handle.decision` — the budget decision (ALLOW or ALLOW_WITH_CAPS)
 - `handle.caps` — soft-landing caps, if any
