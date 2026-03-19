@@ -1,6 +1,6 @@
 # Cycles Protocol v0.1.23 — Client (TypeScript) Audit
 
-**Date:** 2026-03-14
+**Date:** 2026-03-19 (updated), 2026-03-14 (initial)
 **Spec:** `cycles-protocol-v0.yaml` (OpenAPI 3.1.0, v0.1.23)
 **Client:** `runcycles` (Node 20+ / native fetch / TypeScript 5)
 **Server audit:** See `cycles-server/AUDIT.md` (all passing)
@@ -23,6 +23,8 @@
 | Client-Side Spec Constraint Validation | — | 0 |
 | Wire-Format Mapping (camelCase ↔ snake_case) | — | 0 |
 | Lifecycle Orchestration | — | 0 |
+| Type Safety (`WithCyclesConfig` generics) | — | 0 (fixed) |
+| Compile-Time Type Tests | — | 0 |
 
 **Overall: Client is protocol-conformant.** All endpoints, schemas, field names, JSON keys, and enum values match the OpenAPI spec. Wire-format mappers translate between camelCase TypeScript and snake_case wire format for every request and response. No open issues.
 
@@ -162,6 +164,24 @@ All spec constraints are validated via explicit validation functions in `validat
 - Error responses parsed via `errorResponseFromWire()` with `ErrorCode` mapping
 - Typed exceptions: `BudgetExceededError`, `OverdraftLimitExceededError`, `DebtOutstandingError`, `ReservationExpiredError`, `ReservationFinalizedError`
 - `CyclesTransportError` wraps network-level failures with cause chain
+
+### Type Safety — `WithCyclesConfig` Generics (fixed)
+
+**Issue:** `WithCyclesConfig.estimate` was typed as `number | ((...args: unknown[]) => number)`, which rejected typed callbacks like `(prompt: string) => prompt.length * 5` because `unknown` is not assignable to `string`. Same issue with `actual` accepting `(result: unknown) => number`.
+
+**Fix:** Made `WithCyclesConfig` generic: `WithCyclesConfig<TArgs extends unknown[] = unknown[], TResult = unknown>`. The `withCycles` HOF now threads `TArgs` and `TResult` from the wrapped function's signature into the config, so `estimate` and `actual` callbacks are fully type-safe.
+
+**Files changed:**
+- `src/lifecycle.ts` — `WithCyclesConfig` interface now generic
+- `src/withCycles.ts` — `options` parameter uses `WithCyclesConfig<TArgs, TResult>`
+
+**Regression prevention:**
+- `tsconfig.typecheck.json` — extends base tsconfig, includes `tests/` directory for `tsc --noEmit`
+- `tests/withCycles.typecheck.ts` — compile-time-only type test with `@ts-expect-error` assertions that verify typed callbacks compile and mismatched types are rejected
+- `package.json` — `typecheck` script updated to use `tsconfig.typecheck.json`
+- CI already runs `npm run typecheck` — these type tests are now covered
+
+**Validation:** typecheck PASS, build PASS, lint PASS, 211/211 tests PASS.
 
 ---
 
