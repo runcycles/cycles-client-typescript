@@ -1,6 +1,6 @@
 {
   "name": "runcycles",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "TypeScript client for the Cycles budget-management protocol",
   "license": "Apache-2.0",
   "author": "runcycles",
@@ -52,7 +52,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit -p tsconfig.typecheck.json",
     "prepublishOnly": "npm run lint && npm run build"
   },
   "devDependencies": {

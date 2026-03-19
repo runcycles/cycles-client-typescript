@@ -25,9 +25,12 @@ import {
   validateTtlMs,
 } from "./validation.js";
 
-export interface WithCyclesConfig {
-  estimate: number | ((...args: unknown[]) => number);
-  actual?: number | ((result: unknown) => number);
+export interface WithCyclesConfig<
+  TArgs extends unknown[] = unknown[],
+  TResult = unknown,
+> {
+  estimate: number | ((...args: TArgs) => number);
+  actual?: number | ((result: TResult) => number);
   actionKind?: string;
   actionName?: string;
   actionTags?: string[];

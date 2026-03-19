@@ -215,8 +215,8 @@ describe("AsyncCyclesLifecycle", () => {
     const retryEngine = makeRetryEngine();
     const lifecycle = new AsyncCyclesLifecycle(client as any, retryEngine, { tenant: "acme" });
 
-    await lifecycle.execute(async (x: number) => x * 2, [42], {
-      estimate: (x: number) => x * 10,
+    await lifecycle.execute(async (x) => (x as number) * 2, [42], {
+      estimate: (x) => (x as number) * 10,
     });
 
     const createBody = client.createReservation.mock.calls[0][0];
@@ -483,7 +483,7 @@ describe("AsyncCyclesLifecycle", () => {
 
     await lifecycle.execute(async () => 42, [], {
       estimate: 1000,
-      actual: (result: number) => result * 100,
+      actual: (result) => (result as number) * 100,
     });
 
     const commitBody = client.commitReservation.mock.calls[0][1];
