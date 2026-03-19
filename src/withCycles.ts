@@ -38,7 +38,7 @@ function getEffectiveClient(
 }
 
 export function withCycles<TArgs extends unknown[], TResult>(
-  options: WithCyclesConfig & { client?: CyclesClient },
+  options: WithCyclesConfig<TArgs, TResult> & { client?: CyclesClient },
   fn: (...args: TArgs) => Promise<TResult>,
 ): (...args: TArgs) => Promise<TResult> {
   // Defer default client resolution to first call so setDefaultClient/
@@ -68,7 +68,7 @@ export function withCycles<TArgs extends unknown[], TResult>(
     return ensureLifecycle().execute(
       fn as (...args: unknown[]) => Promise<TResult>,
       args,
-      options,
+      options as WithCyclesConfig,
     );
   };
 }
