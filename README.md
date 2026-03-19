@@ -1,3 +1,7 @@
+[![npm](https://img.shields.io/npm/v/runcycles)](https://www.npmjs.com/package/runcycles)
+[![CI](https://github.com/runcycles/cycles-client-typescript/actions/workflows/ci.yml/badge.svg)](https://github.com/runcycles/cycles-client-typescript/actions)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
+
 # Cycles TypeScript Client
 
 TypeScript client for the [Cycles](https://runcycles.io) budget-management protocol — govern spend on AI calls, API usage, and any metered resource.
