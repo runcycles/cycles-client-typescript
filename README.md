@@ -828,6 +828,13 @@ See the [`examples/`](./examples/) directory:
 - **Dual ESM/CJS**: Works with both module systems
 - **Input validation**: Client-side validation of TTL, amounts, subject fields, and more
 
+## Documentation
+
+- [Cycles Documentation](https://runcycles.io) — full docs site
+- [TypeScript Quickstart](https://runcycles.io/quickstart/getting-started-with-the-typescript-client) — getting started guide
+- [TypeScript Client Configuration Reference](https://runcycles.io/configuration/typescript-client-configuration-reference) — all configuration options
+- [Error Handling Patterns in TypeScript](https://runcycles.io/how-to/error-handling-patterns-in-typescript) — handling budget errors
+
 ## License
 
 Apache-2.0
