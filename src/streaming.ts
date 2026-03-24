@@ -120,7 +120,7 @@ export async function reserveForStream(
     actionTags,
     ttlMs = DEFAULT_TTL_MS,
     gracePeriodMs,
-    overagePolicy = "REJECT",
+    overagePolicy = "ALLOW_IF_AVAILABLE",
     dimensions,
   } = options;
 

@@ -325,7 +325,7 @@ interface WithCyclesConfig {
   // Reservation settings
   ttlMs?: number;          // Time-to-live in ms (default: 60000, range: 1000–86400000)
   gracePeriodMs?: number;  // Grace period in ms (range: 0–60000)
-  overagePolicy?: string;  // "REJECT" (default), "ALLOW_IF_AVAILABLE", "ALLOW_WITH_OVERDRAFT"
+  overagePolicy?: string;  // "ALLOW_IF_AVAILABLE" (default), "REJECT", "ALLOW_WITH_OVERDRAFT"
   dryRun?: boolean;        // Shadow mode — evaluates budget without executing
 
   // Subject fields (override config defaults)

@@ -62,7 +62,7 @@ describe("AsyncCyclesLifecycle", () => {
     const createBody = client.createReservation.mock.calls[0][0];
     expect(createBody.idempotency_key).toBeDefined();
     expect(createBody.ttl_ms).toBe(60000);
-    expect(createBody.overage_policy).toBe("REJECT");
+    expect(createBody.overage_policy).toBe("ALLOW_IF_AVAILABLE");
 
     // Verify wire-format keys in commit body
     const commitBody = client.commitReservation.mock.calls[0][1];
