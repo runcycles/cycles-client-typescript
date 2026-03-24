@@ -73,6 +73,24 @@ const result = await callLlm("Hello", 100);
 
 **What happens:** `withCycles` reserves budget before calling your function, runs it inside an async context (so `getCyclesContext()` works), commits the actual cost on success, or releases the reservation on failure. A background heartbeat keeps the reservation alive.
 
+### Budget lifecycle
+
+| Scenario | Outcome | Detail |
+|---|---|---|
+| Reservation denied | **Neither** | `BudgetExceededError`, `OverdraftLimitExceededError`, or `DebtOutstandingError` thrown; function never executes |
+| `dryRun: true`, any decision | **Neither** | Returns `DryRunResult` or throws; no real reservation created |
+| Function returns successfully | **Commit** | Actual amount charged; unused remainder auto-released |
+| Function throws any error | **Release** | Full reserved amount returned to budget; error re-thrown |
+| Commit fails (5xx / network) | **Retry** | Exponential backoff with configurable attempts |
+| Commit fails (non-retryable 4xx) | **Release** | Reservation released after non-retryable client error |
+| Commit gets RESERVATION_EXPIRED | **Neither** | Server already reclaimed budget on TTL expiry |
+| Commit gets RESERVATION_FINALIZED | **Neither** | Already committed or released (idempotent replay) |
+| Commit gets IDEMPOTENCY_MISMATCH | **Neither** | Previous commit already processed; no release attempted |
+
+**Streaming (`reserveForStream`):** Call `handle.commit(actual)` on success or `handle.release(reason)` on failure. If neither is called, the server reclaims the budget when the reservation TTL expires.
+
+All thrown errors from the guarded function trigger release. See [How Reserve-Commit Works](https://runcycles.io/protocol/how-reserve-commit-works-in-cycles) for the full protocol-level explanation.
+
 ### 2. Streaming adapter
 
 For LLM streaming where usage is only known after the stream finishes:
