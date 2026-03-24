@@ -134,7 +134,7 @@ function buildReservationBody(
     action,
     estimate: { unit, amount: estimate },
     ttl_ms: ttlMs,
-    overage_policy: cfg.overagePolicy ?? "REJECT",
+    overage_policy: cfg.overagePolicy ?? "ALLOW_IF_AVAILABLE",
   };
 
   validateGracePeriodMs(cfg.gracePeriodMs);
