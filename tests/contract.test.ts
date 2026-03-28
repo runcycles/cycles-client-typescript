@@ -1,9 +1,16 @@
 import { describe, it, expect, beforeAll } from "vitest";
-import Ajv, { type ValidateFunction } from "ajv";
-import addFormats from "ajv-formats";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import YAML from "yaml";
+
+// Ajv and ajv-formats use CJS default exports that conflict with NodeNext
+// module resolution. Use dynamic import to get the runtime values.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let Ajv: any;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let addFormats: any;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type ValidateFunction = any;
 
 // ---------------------------------------------------------------------------
 // Load OpenAPI spec and register component schemas with Ajv
@@ -13,14 +20,17 @@ const specPath = resolve(import.meta.dirname, "fixtures/cycles-protocol-v0.yaml"
 const spec = YAML.parse(readFileSync(specPath, "utf-8"));
 const schemas = spec.components.schemas as Record<string, Record<string, unknown>>;
 
-let ajv: Ajv;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let ajv: any;
 const validators: Record<string, ValidateFunction> = {};
 
-beforeAll(() => {
-  // OpenAPI 3.1 aligns with JSON Schema Draft 2020-12 but Ajv's default
-  // draft-07 mode handles the subset we need. We disable strict mode so that
-  // OpenAPI-specific keywords (description, example, default, etc.) don't
-  // cause errors.
+beforeAll(async () => {
+  // Dynamic imports to handle CJS/ESM interop with NodeNext resolution
+  const ajvMod = await import("ajv");
+  const fmtMod = await import("ajv-formats");
+  Ajv = ajvMod.default ?? ajvMod;
+  addFormats = fmtMod.default ?? fmtMod;
+
   ajv = new Ajv({ strict: false, allErrors: true });
   addFormats(ajv);
 
