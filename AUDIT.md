@@ -185,6 +185,19 @@ All spec constraints are validated via explicit validation functions in `validat
 
 ---
 
+### OpenAPI Contract Tests (added 2026-03-28)
+
+Added `tests/contract.test.ts` — 90 automated tests that load the OpenAPI spec YAML and validate request/response fixtures against the actual JSON Schema definitions using Ajv:
+
+- **Request schemas validated:** `DecisionRequest`, `ReservationCreateRequest`, `CommitRequest`, `EventCreateRequest` — valid bodies pass, missing required fields and additional properties are rejected
+- **Response schemas validated:** `DecisionResponse`, `ReservationCreateResponse`, `CommitResponse`, `EventCreateResponse`, `ErrorResponse` — valid bodies pass, missing required fields and invalid enum values are rejected
+- **Leaf object schemas validated:** `Amount`, `Subject`, `Action` — constraints (required fields, additionalProperties, minimum values, anyOf) enforced
+- **Enum completeness verified:** `UnitEnum` has exactly `[USD_MICROCENTS, TOKENS, CREDITS, RISK_POINTS]`; `ErrorCode` has all 15 expected values
+- Spec fixture stored at `tests/fixtures/cycles-protocol-v0.yaml`
+- Dev dependencies added: `ajv`, `ajv-formats`, `yaml`
+
+---
+
 ## Verdict
 
-The client is **fully protocol-conformant** with the Cycles Protocol v0.1.23 OpenAPI spec. All 9 endpoints, 6 request schemas, 10 response schemas, 5 enum types, and all nested object serializations match the spec exactly. Wire-format mappers correctly translate between camelCase TypeScript and snake_case JSON throughout. Auth headers, idempotency handling, subject validation, response header capture, and spec constraint validation all follow spec normative rules. No open issues.
+The client is **fully protocol-conformant** with the Cycles Protocol v0.1.23 OpenAPI spec. All 9 endpoints, 6 request schemas, 10 response schemas, 5 enum types, and all nested object serializations match the spec exactly. Wire-format mappers correctly translate between camelCase TypeScript and snake_case JSON throughout. Auth headers, idempotency handling, subject validation, response header capture, and spec constraint validation all follow spec normative rules. OpenAPI contract tests (90 tests) provide automated regression coverage against the spec YAML. No open issues.
