@@ -8,7 +8,7 @@
     "type": "git",
     "url": "https://github.com/runcycles/cycles-client-typescript.git"
   },
-  "homepage": "https://github.com/runcycles/cycles-client-typescript#readme",
+  "homepage": "https://runcycles.io",
   "bugs": {
     "url": "https://github.com/runcycles/cycles-client-typescript/issues"
   },
@@ -20,7 +20,14 @@
     "api-client",
     "ai",
     "llm",
-    "runcycles"
+    "runcycles",
+    "cost-control",
+    "governance",
+    "agents",
+    "anthropic",
+    "openai",
+    "token-budget",
+    "spend-limit"
   ],
   "type": "module",
   "main": "./dist/index.cjs",
