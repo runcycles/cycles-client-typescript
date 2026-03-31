@@ -37,7 +37,7 @@ describe.skipIf(!BASE_URL)("Live Server Integration", () => {
         ttl_ms: 60000,
       }),
     });
-    expect(reserve.status).toBe(201);
+    expect(reserve.status).toBe(200);
     const { reservation_id } = (await reserve.json()) as {
       reservation_id: string;
     };
@@ -70,7 +70,7 @@ describe.skipIf(!BASE_URL)("Live Server Integration", () => {
         ttl_ms: 60000,
       }),
     });
-    expect(reserve.status).toBe(201);
+    expect(reserve.status).toBe(200);
     const { reservation_id } = (await reserve.json()) as {
       reservation_id: string;
     };
@@ -107,7 +107,7 @@ describe.skipIf(!BASE_URL)("Live Server Integration", () => {
 
   it("balance query", async () => {
     const res = await fetch(
-      `${BASE_URL}/v1/balances?tenant_id=${TENANT}`,
+      `${BASE_URL}/v1/balances?tenant=${TENANT}`,
       { headers }
     );
     expect(res.status).toBe(200);
