@@ -1,5 +1,6 @@
 {
   "compilerOptions": {
+    "ignoreDeprecations": "6.0",
     "target": "ES2022",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
@@ -9,6 +10,7 @@
     "outDir": "dist",
     "rootDir": "src",
     "lib": ["ES2022", "ESNext.Disposable"],
+    "types": ["node"],
     "skipLibCheck": true
   },
   "include": ["src"],
