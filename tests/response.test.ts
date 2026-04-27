@@ -56,6 +56,8 @@ describe("CyclesResponse", () => {
       const resp = CyclesResponse.success(200, {});
       expect(resp.requestId).toBeUndefined();
       expect(resp.rateLimitRemaining).toBeUndefined();
+      expect(resp.rateLimitReset).toBeUndefined();
+      expect(resp.cyclesTenant).toBeUndefined();
     });
   });
 

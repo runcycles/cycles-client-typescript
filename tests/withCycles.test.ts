@@ -47,6 +47,28 @@ describe("withCycles", () => {
     expect(fetch).toHaveBeenCalledTimes(2);
   });
 
+  it("caches the lifecycle across repeated calls of the same wrapper", async () => {
+    // Two full reserve+commit cycles back-to-back; the second call must reuse
+    // the lifecycle resolved on the first call (covers the cached-path branch
+    // in ensureLifecycle).
+    mockFetchSequence([
+      { status: 200, body: { decision: "ALLOW", reservation_id: "r-a", affected_scopes: ["tenant:acme"] } },
+      { status: 200, body: { status: "COMMITTED" } },
+      { status: 200, body: { decision: "ALLOW", reservation_id: "r-b", affected_scopes: ["tenant:acme"] } },
+      { status: 200, body: { status: "COMMITTED" } },
+    ]);
+
+    const config = new CyclesConfig({ baseUrl: "http://localhost:7878", apiKey: "key", tenant: "acme" });
+    const client = new CyclesClient(config);
+
+    const guarded = withCycles({ estimate: 1, client }, async () => "ok");
+
+    await guarded();
+    await guarded();
+
+    expect(fetch).toHaveBeenCalledTimes(4);
+  });
+
   it("uses default client", async () => {
     mockFetchSequence([
       { status: 200, body: { decision: "ALLOW", reservation_id: "r-2", affected_scopes: [] } },

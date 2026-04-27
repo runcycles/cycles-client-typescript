@@ -70,5 +70,33 @@ describe("CyclesConfig", () => {
       expect(config.baseUrl).toBe("http://custom:7878");
       expect(config.apiKey).toBe("custom-key");
     });
+
+    it("parses retry/timeout numeric env vars when set", () => {
+      process.env.CYCLES_BASE_URL = "http://test:7878";
+      process.env.CYCLES_API_KEY = "test-key";
+      process.env.CYCLES_CONNECT_TIMEOUT = "1500";
+      process.env.CYCLES_READ_TIMEOUT = "9000";
+      process.env.CYCLES_RETRY_MAX_ATTEMPTS = "7";
+      process.env.CYCLES_RETRY_INITIAL_DELAY = "250";
+      process.env.CYCLES_RETRY_MULTIPLIER = "1.5";
+      process.env.CYCLES_RETRY_MAX_DELAY = "10000";
+
+      const config = CyclesConfig.fromEnv();
+      expect(config.connectTimeout).toBe(1500);
+      expect(config.readTimeout).toBe(9000);
+      expect(config.retryMaxAttempts).toBe(7);
+      expect(config.retryInitialDelay).toBe(250);
+      expect(config.retryMultiplier).toBe(1.5);
+      expect(config.retryMaxDelay).toBe(10000);
+    });
+
+    it("disables retry when CYCLES_RETRY_ENABLED=false", () => {
+      process.env.CYCLES_BASE_URL = "http://test:7878";
+      process.env.CYCLES_API_KEY = "test-key";
+      process.env.CYCLES_RETRY_ENABLED = "false";
+
+      const config = CyclesConfig.fromEnv();
+      expect(config.retryEnabled).toBe(false);
+    });
   });
 });

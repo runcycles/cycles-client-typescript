@@ -316,9 +316,9 @@ interface WithCyclesConfig {
   actual?: number | ((result) => number);    // Actual cost (static or computed from result)
   useEstimateIfActualNotProvided?: boolean;  // Default: true — use estimate as actual
 
-  // Action identification
-  actionKind?: string;   // e.g. "llm.completion" (default: "unknown")
-  actionName?: string;   // e.g. "gpt-4" (default: "unknown")
+  // Action identification (static or computed from args)
+  actionKind?: string | ((...args) => string | undefined);  // e.g. "llm.completion" (default: "unknown")
+  actionName?: string | ((...args) => string | undefined);  // e.g. "gpt-4" (default: "unknown")
   actionTags?: string[]; // Optional tags for categorization
 
   // Budget unit
@@ -330,18 +330,40 @@ interface WithCyclesConfig {
   overagePolicy?: string;  // "ALLOW_IF_AVAILABLE" (default), "REJECT", "ALLOW_WITH_OVERDRAFT"
   dryRun?: boolean;        // Shadow mode — evaluates budget without executing
 
-  // Subject fields (override config defaults)
-  tenant?: string;
-  workspace?: string;
-  app?: string;
-  workflow?: string;
-  agent?: string;
-  toolset?: string;
+  // Subject fields (override config defaults; static or computed from args)
+  tenant?: string | ((...args) => string | undefined);
+  workspace?: string | ((...args) => string | undefined);
+  app?: string | ((...args) => string | undefined);
+  workflow?: string | ((...args) => string | undefined);
+  agent?: string | ((...args) => string | undefined);
+  toolset?: string | ((...args) => string | undefined);
   dimensions?: Record<string, string>;  // Custom key-value dimensions
 
   // Client
   client?: CyclesClient;  // Override the default client
 }
+```
+
+A callable returning `undefined` falls through to the client-config default for subject fields, or to `"unknown"` for `actionKind` / `actionName` — same fallback semantics as a missing static. Callables run before the reservation is created; if one throws, the reservation is never attempted and the error propagates to the caller.
+
+### Dynamic subject and action fields
+
+Derive the subject scope or action identity from per-call arguments:
+
+```typescript
+const runRequest = withCycles(
+  {
+    estimate: (req, workspaceId) => req.tokens * 10,
+    workspace: (_req, workspaceId) => workspaceId,
+    actionKind: "llm.completion",
+    actionName: (req) => req.model,
+    client,
+  },
+  async (req: { tokens: number; model: string }, workspaceId: string) => {
+    // ... the reservation routes to this workspaceId ...
+    return callLLM(req);
+  },
+);
 ```
 
 ## Context Access
