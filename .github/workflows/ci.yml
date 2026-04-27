@@ -50,27 +50,15 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-      - name: Extract release notes from CHANGELOG.md
-        id: notes
-        run: |
-          tag="${GITHUB_REF_NAME}"
-          version="${tag#v}"
-          # Pull the section between the matching `## [X.Y.Z]` heading and the next `## [` heading.
-          awk -v ver="$version" '
-            $0 ~ "^## \\[" ver "\\]" { found = 1; next }
-            found && /^## \[/ { exit }
-            found { print }
-          ' CHANGELOG.md > release_notes.md
-          if [ ! -s release_notes.md ]; then
-            echo "No CHANGELOG entry for $tag — falling back to tag annotation." >&2
-            git tag -l --format='%(contents)' "$tag" > release_notes.md
-          fi
-          echo "notes_file=release_notes.md" >> "$GITHUB_OUTPUT"
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Mirrors the cycles-client-python release flow: GitHub auto-generates
+        # the body (## What's Changed, * PR-title by @user in PR-url,
+        # **Full Changelog**: compare/PREV...CUR). The author can edit the
+        # release post-hoc to add a richer description if desired.
         run: |
           gh release create "${GITHUB_REF_NAME}" \
             --title "${GITHUB_REF_NAME}" \
-            --notes-file "${{ steps.notes.outputs.notes_file }}" \
+            --generate-notes \
             --latest
