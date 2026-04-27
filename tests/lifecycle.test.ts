@@ -754,3 +754,202 @@ describe("AsyncCyclesLifecycle", () => {
     expect(createBody.subject.dimensions).toEqual({ env: "prod" });
   });
 });
+
+describe("dynamic subject and action fields", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function setupClient() {
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-dyn",
+        affected_scopes: [],
+      }),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+    return client;
+  }
+
+  it("resolves callable subject field to per-call value", async () => {
+    const client = setupClient();
+    const lifecycle = new AsyncCyclesLifecycle(client as any, makeRetryEngine(), {});
+
+    await lifecycle.execute(async () => "ok", [{ workspaceId: "ws-42" }], {
+      estimate: 1,
+      workspace: (req) => (req as { workspaceId: string }).workspaceId,
+    });
+
+    const body = client.createReservation.mock.calls[0][0];
+    expect(body.subject.workspace).toBe("ws-42");
+  });
+
+  it("falls through to client default when callable subject returns undefined", async () => {
+    const client = setupClient();
+    const lifecycle = new AsyncCyclesLifecycle(client as any, makeRetryEngine(), {
+      workspace: "default-ws",
+    });
+
+    await lifecycle.execute(async () => "ok", [], {
+      estimate: 1,
+      workspace: () => undefined,
+    });
+
+    const body = client.createReservation.mock.calls[0][0];
+    expect(body.subject.workspace).toBe("default-ws");
+  });
+
+  it("keeps static subject string working (regression)", async () => {
+    const client = setupClient();
+    const lifecycle = new AsyncCyclesLifecycle(client as any, makeRetryEngine(), {});
+
+    await lifecycle.execute(async () => "ok", [], {
+      estimate: 1,
+      workspace: "production",
+    });
+
+    const body = client.createReservation.mock.calls[0][0];
+    expect(body.subject.workspace).toBe("production");
+  });
+
+  it("propagates errors thrown by subject callable before reservation", async () => {
+    const client = setupClient();
+    const lifecycle = new AsyncCyclesLifecycle(client as any, makeRetryEngine(), {});
+
+    await expect(
+      lifecycle.execute(async () => "ok", [], {
+        estimate: 1,
+        workspace: () => {
+          throw new Error("boom");
+        },
+      }),
+    ).rejects.toThrow("boom");
+
+    expect(client.createReservation).not.toHaveBeenCalled();
+  });
+
+  it("resolves all six subject fields with mixed callables and statics", async () => {
+    const client = setupClient();
+    const lifecycle = new AsyncCyclesLifecycle(client as any, makeRetryEngine(), {});
+
+    type Arg = {
+      tenantId: string;
+      wsId: string;
+      appId: string;
+      flowId: string;
+      agentId: string;
+      toolsetId: string;
+    };
+    const arg: Arg = {
+      tenantId: "t",
+      wsId: "w",
+      appId: "a",
+      flowId: "f",
+      agentId: "ag",
+      toolsetId: "ts",
+    };
+
+    await lifecycle.execute(async () => "ok", [arg], {
+      estimate: 1,
+      tenant: (a) => (a as Arg).tenantId,
+      workspace: (a) => (a as Arg).wsId,
+      app: "static-app",
+      workflow: (a) => (a as Arg).flowId,
+      agent: "static-agent",
+      toolset: (a) => (a as Arg).toolsetId,
+    });
+
+    const subject = client.createReservation.mock.calls[0][0].subject;
+    expect(subject).toEqual({
+      tenant: "t",
+      workspace: "w",
+      app: "static-app",
+      workflow: "f",
+      agent: "static-agent",
+      toolset: "ts",
+    });
+  });
+
+  it("resolves callable actionKind to per-call value", async () => {
+    const client = setupClient();
+    const lifecycle = new AsyncCyclesLifecycle(client as any, makeRetryEngine(), {
+      tenant: "acme",
+    });
+
+    await lifecycle.execute(async () => "ok", [{ kind: "llm.completion" }], {
+      estimate: 1,
+      actionKind: (req) => (req as { kind: string }).kind,
+    });
+
+    const body = client.createReservation.mock.calls[0][0];
+    expect(body.action.kind).toBe("llm.completion");
+  });
+
+  it("resolves callable actionName to per-call value", async () => {
+    const client = setupClient();
+    const lifecycle = new AsyncCyclesLifecycle(client as any, makeRetryEngine(), {
+      tenant: "acme",
+    });
+
+    await lifecycle.execute(async () => "ok", [{ model: "gpt-4o" }], {
+      estimate: 1,
+      actionName: (req) => (req as { model: string }).model,
+    });
+
+    const body = client.createReservation.mock.calls[0][0];
+    expect(body.action.name).toBe("gpt-4o");
+  });
+
+  it("falls through to \"unknown\" when callable action field returns undefined", async () => {
+    const client = setupClient();
+    const lifecycle = new AsyncCyclesLifecycle(client as any, makeRetryEngine(), {
+      tenant: "acme",
+    });
+
+    await lifecycle.execute(async () => "ok", [], {
+      estimate: 1,
+      actionKind: () => undefined,
+      actionName: () => undefined,
+    });
+
+    const body = client.createReservation.mock.calls[0][0];
+    expect(body.action.kind).toBe("unknown");
+    expect(body.action.name).toBe("unknown");
+  });
+
+  it("keeps static actionKind / actionName working (regression)", async () => {
+    const client = setupClient();
+    const lifecycle = new AsyncCyclesLifecycle(client as any, makeRetryEngine(), {
+      tenant: "acme",
+    });
+
+    await lifecycle.execute(async () => "ok", [], {
+      estimate: 1,
+      actionKind: "llm.completion",
+      actionName: "gpt-4",
+    });
+
+    const body = client.createReservation.mock.calls[0][0];
+    expect(body.action.kind).toBe("llm.completion");
+    expect(body.action.name).toBe("gpt-4");
+  });
+
+  it("passes actionTags through to the reservation body", async () => {
+    const client = setupClient();
+    const lifecycle = new AsyncCyclesLifecycle(client as any, makeRetryEngine(), {
+      tenant: "acme",
+    });
+
+    await lifecycle.execute(async () => "ok", [], {
+      estimate: 1,
+      actionTags: ["llm", "completion"],
+    });
+
+    const body = client.createReservation.mock.calls[0][0];
+    expect(body.action.tags).toEqual(["llm", "completion"]);
+  });
+});

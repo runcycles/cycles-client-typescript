@@ -198,6 +198,22 @@ Added `tests/contract.test.ts` — 90 automated tests that load the OpenAPI spec
 
 ---
 
+### Dynamic subject + action fields on `withCycles` (added 2026-04-27)
+
+**Issue [#72](https://github.com/runcycles/cycles-client-typescript/issues/72):** Subject fields (`tenant`, `workspace`, `app`, `workflow`, `agent`, `toolset`) and action fields (`actionKind`, `actionName`) on `WithCyclesConfig` were `string | undefined` only — no first-class way to derive them from per-call args. Java parity: `cycles-spring-boot-starter` 0.2.1 shipped SpEL on `@Cycles` subject fields ([#50](https://github.com/runcycles/cycles-spring-boot-starter/pull/50)).
+
+**Fix:** All eight string fields now accept `(...args: TArgs) => string | undefined` in addition to a static string, resolved at `AsyncCyclesLifecycle.execute` against the wrapped function's args via a single `evaluateStringField` helper that mirrors the existing `evaluateAmount` / `evaluateActual` pattern. A callable returning `undefined` falls through to the client-config default (subject fields) or `"unknown"` (action fields) — matching the static-string fallback. Callables run before the reservation is created; throwing propagates fail-fast. Static strings unchanged (regression-tested).
+
+**Files changed:**
+- `src/lifecycle.ts` — widened 6 subject + 2 action field types in `WithCyclesConfig`; added `evaluateStringField` helper; threaded `args` into `buildReservationBody` and the call site in `execute`
+- `tests/lifecycle.test.ts` — new `dynamic subject and action fields` describe block: callable resolution, undefined fall-through to default, static-string regression, throwing-callable propagation, all-six-fields smoke test, action-kind/name callable + undefined + static
+- `tests/withCycles.typecheck.ts` — appended type-level tests with `@ts-expect-error` for mismatched-args (subject + action), valid typed callbacks, and static regressions
+- `README.md` — documented callable form on action + subject blocks of the `WithCyclesConfig` snippet; added a "Dynamic subject and action fields" usage example
+
+**Validation:** typecheck PASS, lint PASS, build PASS, all tests PASS, coverage ≥95% lines / ≥85% branches.
+
+---
+
 ## Verdict
 
 The client is **fully protocol-conformant** with the Cycles Protocol v0.1.23 OpenAPI spec. All 9 endpoints, 6 request schemas, 10 response schemas, 5 enum types, and all nested object serializations match the spec exactly. Wire-format mappers correctly translate between camelCase TypeScript and snake_case JSON throughout. Auth headers, idempotency handling, subject validation, response header capture, and spec constraint validation all follow spec normative rules. OpenAPI contract tests (90 tests) provide automated regression coverage against the spec YAML. No open issues.

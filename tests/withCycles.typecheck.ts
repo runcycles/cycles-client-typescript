@@ -63,3 +63,66 @@ withCycles(
   // @ts-expect-error — fn returns string but actual infers TResult as number
   async (prompt: string) => `Response to: ${prompt}`,
 );
+
+// ── Valid: typed subject callback matching wrapped function args ──
+
+withCycles(
+  {
+    estimate: 1000,
+    workspace: (req: { workspaceId: string }) => req.workspaceId,
+    client,
+  },
+  async (req: { workspaceId: string }) => req.workspaceId,
+);
+
+// ── Valid: typed actionKind / actionName callbacks ──
+
+withCycles(
+  {
+    estimate: 1000,
+    actionKind: (req: { kind: string }) => req.kind,
+    actionName: (req: { kind: string }) => `op-${req.kind}`,
+    client,
+  },
+  async (req: { kind: string }) => req.kind,
+);
+
+// ── Valid: callable returning undefined (falls through to default) ──
+
+withCycles(
+  {
+    estimate: 1000,
+    tenant: () => undefined,
+    actionKind: () => undefined,
+    client,
+  },
+  async () => "result",
+);
+
+// ── Valid: static strings still work (regression) ──
+
+withCycles(
+  {
+    estimate: 1000,
+    workspace: "production",
+    actionKind: "llm.completion",
+    client,
+  },
+  async (prompt: string) => prompt,
+);
+
+// ── Invalid: subject callback arg doesn't match wrapped fn ──
+
+withCycles(
+  { estimate: 1000, workspace: (x: number) => String(x), client },
+  // @ts-expect-error — fn takes string but workspace infers TArgs as [number]
+  async (prompt: string) => prompt,
+);
+
+// ── Invalid: actionKind callback arg doesn't match wrapped fn ──
+
+withCycles(
+  { estimate: 1000, actionKind: (x: number) => String(x), client },
+  // @ts-expect-error — fn takes string but actionKind infers TArgs as [number]
+  async (prompt: string) => prompt,
+);

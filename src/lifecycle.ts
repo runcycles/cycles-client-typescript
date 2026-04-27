@@ -31,20 +31,20 @@ export interface WithCyclesConfig<
 > {
   estimate: number | ((...args: TArgs) => number);
   actual?: number | ((result: TResult) => number);
-  actionKind?: string;
-  actionName?: string;
+  actionKind?: string | ((...args: TArgs) => string | undefined);
+  actionName?: string | ((...args: TArgs) => string | undefined);
   actionTags?: string[];
   unit?: string;
   ttlMs?: number;
   gracePeriodMs?: number;
   overagePolicy?: string;
   dryRun?: boolean;
-  tenant?: string;
-  workspace?: string;
-  app?: string;
-  workflow?: string;
-  agent?: string;
-  toolset?: string;
+  tenant?: string | ((...args: TArgs) => string | undefined);
+  workspace?: string | ((...args: TArgs) => string | undefined);
+  app?: string | ((...args: TArgs) => string | undefined);
+  workflow?: string | ((...args: TArgs) => string | undefined);
+  agent?: string | ((...args: TArgs) => string | undefined);
+  toolset?: string | ((...args: TArgs) => string | undefined);
   dimensions?: Record<string, string>;
   useEstimateIfActualNotProvided?: boolean;
 }
@@ -88,11 +88,22 @@ function evaluateActual(
   );
 }
 
+function evaluateStringField(
+  expr: string | ((...args: unknown[]) => string | undefined) | undefined,
+  args: unknown[],
+): string | undefined {
+  if (typeof expr === "function") {
+    return expr(...args);
+  }
+  return expr;
+}
+
 /** Build wire-format (snake_case) reservation create request body. */
 function buildReservationBody(
   cfg: WithCyclesConfig,
   estimate: number,
   defaultSubject: SubjectDefaults,
+  args: unknown[],
 ): Record<string, unknown> {
   validateNonNegative(estimate, "estimate");
   const ttlMs = cfg.ttlMs ?? DEFAULT_TTL_MS;
@@ -107,7 +118,8 @@ function buildReservationBody(
     "agent",
     "toolset",
   ] as const) {
-    const val = cfg[field] ?? defaultSubject[field];
+    const resolved = evaluateStringField(cfg[field], args);
+    const val = resolved ?? defaultSubject[field];
     if (val) {
       subject[field] = val;
     }
@@ -119,8 +131,8 @@ function buildReservationBody(
   validateSubject(subject as Subject);
 
   const action: Record<string, unknown> = {
-    kind: cfg.actionKind ?? "unknown",
-    name: cfg.actionName ?? "unknown",
+    kind: evaluateStringField(cfg.actionKind, args) ?? "unknown",
+    name: evaluateStringField(cfg.actionName, args) ?? "unknown",
   };
   if (cfg.actionTags) {
     action.tags = cfg.actionTags;
@@ -203,7 +215,12 @@ export class AsyncCyclesLifecycle {
   ): Promise<T> {
     const estimate = evaluateAmount(cfg.estimate, args);
 
-    const createBody = buildReservationBody(cfg, estimate, this._defaultSubject);
+    const createBody = buildReservationBody(
+      cfg,
+      estimate,
+      this._defaultSubject,
+      args,
+    );
     const resResponse = await this._client.createReservation(createBody);
 
     if (!resResponse.isSuccess) {

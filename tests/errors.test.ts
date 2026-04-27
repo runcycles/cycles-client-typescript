@@ -152,4 +152,20 @@ describe("buildProtocolException", () => {
     expect(err.message).toBe("Connection failed: ECONNREFUSED");
     expect(err.status).toBe(-1);
   });
+
+  it("keeps prefix as-is when structured error response has empty message", () => {
+    // errorResponseFromWire requires error/message/request_id to all be strings;
+    // an empty-string message satisfies the type guard but is falsy at runtime,
+    // so the `if (errorResp.message)` guard skips appending it.
+    const response = CyclesResponse.httpError(400, "Bad request", {
+      error: "INVALID_REQUEST",
+      message: "",
+      request_id: "req-empty",
+    });
+
+    const err = buildProtocolException("Failed", response);
+    expect(err.message).toBe("Failed");
+    expect(err.errorCode).toBe("INVALID_REQUEST");
+    expect(err.requestId).toBe("req-empty");
+  });
 });

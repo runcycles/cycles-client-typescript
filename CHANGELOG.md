@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.0] - 2026-04-27
+
+Java parity: dynamic subject and action fields on `withCycles`.
+
+### Added
+
+- Dynamic subject + action fields on `withCycles` config — `tenant`, `workspace`, `app`, `workflow`, `agent`, `toolset`, `actionKind`, and `actionName` now accept `(...args: TArgs) => string | undefined` in addition to a static string. Callables are resolved against the wrapped function's per-call args; returning `undefined` falls through to the client-config default (subject) or `"unknown"` (action). Static strings unchanged. Java parity with [`cycles-spring-boot-starter#50`](https://github.com/runcycles/cycles-spring-boot-starter/pull/50). ([#72](https://github.com/runcycles/cycles-client-typescript/issues/72))
+
 ## [0.2.0] - 2026-03-24
 
 Bug fixes, support 0.1.24 spec.
