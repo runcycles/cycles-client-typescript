@@ -4,11 +4,11 @@
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 [![Coverage](https://img.shields.io/badge/coverage-98%25-brightgreen)](https://github.com/runcycles/cycles-client-typescript/actions)
 
-# Cycles TypeScript Client
+# Cycles TypeScript Client — AI agent budget and action authority SDK
 
-TypeScript client for the [Cycles](https://runcycles.io) budget-management protocol — govern spend on AI calls, API usage, and any metered resource.
+**TypeScript/Node.js SDK for AI agent budget governance — enforce cost limits, tool permissions, and multi-tenant policies before LLM calls or agent actions execute.** Works with OpenAI, Anthropic, MCP servers, OpenAI Agents SDK, LangChain.js, and any Node.js agent runtime.
 
-Cycles lets you set budgets, reserve capacity before expensive operations, and track actual usage. This client handles the full reservation lifecycle: reserve budget up front, execute your work, then commit or release — with automatic heartbeats, retries, and typed error handling.
+Higher-order function and `AsyncLocalStorage`-based API for the [Cycles Protocol](https://github.com/runcycles/cycles-protocol): reserve capacity before expensive operations, execute your work, commit or release — with automatic heartbeats, retries, and typed error handling. Install via `npm install runcycles`.
 
 ## Requirements
 
