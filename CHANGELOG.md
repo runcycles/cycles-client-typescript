@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.1] - 2026-05-07
+
+npm metadata refresh for category-search discovery. **No code changes** — bundle and runtime behavior are identical to 0.3.0.
+
+### Changed
+
+- `package.json`: rewrote `description` to lead with the cost / action / audit pillars (*"TypeScript AI agent runtime control — enforce LLM cost limits, action permissions, and audit trails for agents before execution."*) and expanded `keywords` from 15 to 26. Drops legacy keywords (`billing`, `metering`, `api-client`, `ai`, `llm`, `agents`, `token-budget`, `spend-limit`) in favor of category-search variants (`ai-agent`, `agent-budget`, `budget-control`, `cost-enforcement`, `spending-limit`, `llm-cost`, `runtime-authority`, `action-control`, `action-authority`, `audit-trail`, `audit`, `compliance`, `multi-tenant`) plus framework targeting (`langchain`, `langgraph`, `openai-agents`, `vercel-ai-sdk`, `mcp`).
+
 ## [0.3.0] - 2026-04-27
 
 Java parity: dynamic subject and action fields on `withCycles`.
