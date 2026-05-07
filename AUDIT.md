@@ -217,3 +217,14 @@ Added `tests/contract.test.ts` — 90 automated tests that load the OpenAPI spec
 ## Verdict
 
 The client is **fully protocol-conformant** with the Cycles Protocol v0.1.23 OpenAPI spec. All 9 endpoints, 6 request schemas, 10 response schemas, 5 enum types, and all nested object serializations match the spec exactly. Wire-format mappers correctly translate between camelCase TypeScript and snake_case JSON throughout. Auth headers, idempotency handling, subject validation, response header capture, and spec constraint validation all follow spec normative rules. OpenAPI contract tests (90 tests) provide automated regression coverage against the spec YAML. No open issues.
+
+---
+
+## 0.3.1 — npm Metadata Refresh (2026-05-07)
+
+**Files:** `package.json`. **No code changes.** Bundle, runtime behavior, protocol conformance, and test coverage are identical to 0.3.0.
+
+- **Description rewritten** to lead with the cost / action / audit pillars: *"TypeScript AI agent runtime control — enforce LLM cost limits, action permissions, and audit trails for agents before execution."*
+- **Keywords expanded** 15 → 26. Drops legacy keywords (`billing`, `metering`, `api-client`, `ai`, `llm`, `agents`, `token-budget`, `spend-limit`) in favor of category-search variants and framework targeting (`langchain`, `langgraph`, `openai-agents`, `vercel-ai-sdk`, `mcp`).
+
+Driven by package-portfolio SEO diagnostic. The cost / action / audit triad now leads the description, matching the three pillars of Cycles' value proposition.
