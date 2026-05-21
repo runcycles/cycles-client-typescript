@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.2] - 2026-05-21
+
+Wire-passthrough verification for the new `from` / `to` query params on `listReservations`. Implements `cycles-protocol-v0.yaml` revision 2026-05-21 ([runcycles/cycles-protocol#97](https://github.com/runcycles/cycles-protocol/pull/97)) on the client side; runcycles/cycles-server#160 ships the server impl.
+
+### Added
+
+- Regression test on `client.listReservations` confirming that `from` / `to` ISO-8601 date-time params are URL-encoded and forwarded to the query string. The client's `params?: Record<string, string>` signature already accepted these — the test locks the contract so future tightening cannot drop them silently. Both colons are URL-encoded (`from=2026-05-21T00%3A00%3A00Z`).
+
+### Notes
+
+- No protocol or wire-format change. Servers older than v0.1.25.20 silently ignore the new params per the additive-parameter guarantee in `cycles-protocol-v0.yaml`.
+- 316 tests pass; coverage 98.4% statements / 99.62% lines (gate ≥95% per `CLAUDE.md`).
+
 ## [0.3.1] - 2026-05-07
 
 npm metadata refresh for category-search discovery. **No code changes** — bundle and runtime behavior are identical to 0.3.0.
