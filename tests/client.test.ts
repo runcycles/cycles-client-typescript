@@ -123,6 +123,29 @@ describe("CyclesClient", () => {
       const fetchCall = vi.mocked(fetch).mock.calls[0];
       expect(fetchCall[0]).toContain("tenant=acme");
     });
+
+    // cycles-protocol-v0.yaml revision 2026-05-21 — from/to ISO-8601 window
+    // filter passthrough. The existing Record<string, string> signature already
+    // accepts the new params; this test pins the contract so future tightening
+    // cannot silently drop them.
+    it("forwards from/to ISO-8601 window params to the URL query string", async () => {
+      mockFetch(200, { reservations: [] });
+
+      const client = new CyclesClient(config);
+      const resp = await client.listReservations({
+        tenant: "acme",
+        from: "2026-05-21T00:00:00Z",
+        to: "2026-05-22T00:00:00Z",
+      });
+
+      expect(resp.isSuccess).toBe(true);
+      const fetchCall = vi.mocked(fetch).mock.calls[0];
+      const url = String(fetchCall[0]);
+      expect(url).toContain("tenant=acme");
+      // URL-encoded form of "2026-05-21T00:00:00Z" — the colons are escaped.
+      expect(url).toContain("from=2026-05-21T00%3A00%3A00Z");
+      expect(url).toContain("to=2026-05-22T00%3A00%3A00Z");
+    });
   });
 
   describe("getReservation", () => {
