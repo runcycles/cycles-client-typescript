@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.3] - 2026-05-22
+
+Wire-passthrough verification for `expires_from`/`expires_to` and `finalized_from`/`finalized_to` query params on `listReservations`. Implements `cycles-protocol-v0.yaml` revision 2026-05-22 ([runcycles/cycles-protocol#98](https://github.com/runcycles/cycles-protocol/pull/98)) on the client side; runcycles/cycles-server#163 ships the server impl. Closes the TypeScript-client side of runcycles/cycles-server#162.
+
+### Added
+
+- Regression test on `client.listReservations` confirming the four new ISO-8601 window params are URL-encoded and forwarded to the query string. The existing `params?: Record<string, string>` signature already accepted them — the test locks the contract so future tightening cannot drop them silently. Colons URL-encoded to `%3A` per native fetch + URLSearchParams behavior.
+
+### Notes
+
+- No protocol or wire-format change. Servers older than v0.1.25.21 silently ignore the new params per the additive-parameter guarantee in `cycles-protocol-v0.yaml`.
+- 317 tests pass; coverage 98.4% statements / 99.62% lines (gate ≥95% per `CLAUDE.md`).
+
 ## [0.3.2] - 2026-05-21
 
 Wire-passthrough verification for the new `from` / `to` query params on `listReservations`. Implements `cycles-protocol-v0.yaml` revision 2026-05-21 ([runcycles/cycles-protocol#97](https://github.com/runcycles/cycles-protocol/pull/97)) on the client side; runcycles/cycles-server#160 ships the server impl.
