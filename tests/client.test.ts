@@ -146,6 +146,32 @@ describe("CyclesClient", () => {
       expect(url).toContain("from=2026-05-21T00%3A00%3A00Z");
       expect(url).toContain("to=2026-05-22T00%3A00%3A00Z");
     });
+
+    // cycles-protocol-v0.yaml revision 2026-05-22 — expires_*/finalized_*
+    // ISO-8601 window filter passthrough. Same shape as from/to: existing
+    // Record<string, string> signature accepts; test pins the four new
+    // params on the wire under their spec-mandated names.
+    it("forwards expires_*/finalized_* ISO-8601 window params to the URL query string", async () => {
+      mockFetch(200, { reservations: [] });
+
+      const client = new CyclesClient(config);
+      const resp = await client.listReservations({
+        tenant: "acme",
+        expires_from: "2026-05-22T00:00:00Z",
+        expires_to: "2026-05-23T00:00:00Z",
+        finalized_from: "2026-05-15T00:00:00Z",
+        finalized_to: "2026-05-22T00:00:00Z",
+      });
+
+      expect(resp.isSuccess).toBe(true);
+      const fetchCall = vi.mocked(fetch).mock.calls[0];
+      const url = String(fetchCall[0]);
+      expect(url).toContain("tenant=acme");
+      expect(url).toContain("expires_from=2026-05-22T00%3A00%3A00Z");
+      expect(url).toContain("expires_to=2026-05-23T00%3A00%3A00Z");
+      expect(url).toContain("finalized_from=2026-05-15T00%3A00%3A00Z");
+      expect(url).toContain("finalized_to=2026-05-22T00%3A00%3A00Z");
+    });
   });
 
   describe("getReservation", () => {

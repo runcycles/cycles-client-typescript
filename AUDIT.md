@@ -1,6 +1,7 @@
 # Cycles Protocol v0.1.25 — Client (TypeScript) Audit
 
-**Date:** 2026-05-21 (v0.3.2 — `from` / `to` ISO-8601 window-filter passthrough on `listReservations` per `cycles-protocol-v0.yaml` revision 2026-05-21; closes the TypeScript-client side of runcycles/cycles-server#159. No code change — `params?: Record<string, string>` already forwards arbitrary keys; added a regression test that pins the URL-encoded passthrough. 316 tests pass at 98.4% statement / 99.62% line coverage.),
+**Date:** 2026-05-22 (v0.3.3 — `expires_from`/`expires_to` and `finalized_from`/`finalized_to` ISO-8601 window-filter passthrough on `listReservations` per `cycles-protocol-v0.yaml` revision 2026-05-22; closes the TypeScript-client side of runcycles/cycles-server#162. No code change — `params?: Record<string, string>` already forwards arbitrary keys; added a regression test that pins all four new params URL-encoded on the wire. 317 tests pass at 98.4% statement / 99.62% line coverage.),
+2026-05-21 (v0.3.2 — `from` / `to` ISO-8601 window-filter passthrough on `listReservations` per `cycles-protocol-v0.yaml` revision 2026-05-21; closes the TypeScript-client side of runcycles/cycles-server#159. No code change — `params?: Record<string, string>` already forwards arbitrary keys; added a regression test that pins the URL-encoded passthrough. 316 tests pass at 98.4% statement / 99.62% line coverage.),
 2026-03-19 (updated), 2026-03-14 (initial)
 **Spec:** `cycles-protocol-v0.yaml` (OpenAPI 3.1.0, v0.1.25)
 **Client:** `runcycles` (Node 20+ / native fetch / TypeScript 5)

@@ -1,6 +1,6 @@
 {
   "name": "runcycles",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "TypeScript AI agent runtime control — enforce LLM cost limits, action permissions, and audit trails for agents before execution.",
   "license": "Apache-2.0",
   "author": "runcycles",
