@@ -20,7 +20,10 @@ const headers: Record<string, string> = {
 
 describe.skipIf(!BASE_URL)("Live Server Integration", () => {
   it("health check", async () => {
-    const res = await fetch(`${BASE_URL}/actuator/health`);
+    // Aggregate /actuator/health requires X-Admin-API-Key since
+    // cycles-server v0.1.25.45; the readiness probe is the public,
+    // Redis-aware health contract a credential-less client can rely on.
+    const res = await fetch(`${BASE_URL}/actuator/health/readiness`);
     expect(res.status).toBe(200);
   });
 
