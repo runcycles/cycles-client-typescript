@@ -94,7 +94,7 @@ Compared the following across spec YAML and client TypeScript source:
 | `CommitResponse` | `commitResponseFromWire()` | `status`, `charged`, `released`, `balances` | PASS |
 | `ReleaseResponse` | `releaseResponseFromWire()` | `status`, `released`, `balances` | PASS |
 | `DecisionResponse` | `decisionResponseFromWire()` | `decision`, `caps`, `reason_code`, `retry_after_ms`, `affected_scopes` | PASS |
-| `EventCreateResponse` | `eventCreateResponseFromWire()` | `status`, `event_id`, `balances` | PASS |
+| `EventCreateResponse` | `eventCreateResponseFromWire()` | `status`, `event_id`, `charged`, `balances` | PASS |
 | `ReservationExtendResponse` | `reservationExtendResponseFromWire()` | `status`, `expires_at_ms`, `balances` | PASS |
 | `BalanceResponse` | `balanceResponseFromWire()` | `balances`, `has_more`, `next_cursor` | PASS |
 | `ReservationDetail` | `reservationDetailFromWire()` | `reservation_id`, `status`, `idempotency_key`, `subject`, `action`, `reserved`, `committed`, `created_at_ms`, `expires_at_ms`, `finalized_at_ms`, `scope_path`, `affected_scopes`, `metadata` | PASS |
