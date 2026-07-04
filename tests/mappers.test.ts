@@ -285,6 +285,26 @@ describe("eventCreateResponseFromWire", () => {
     expect(parsed.balances).toHaveLength(1);
   });
 
+  it("maps charged (ALLOW_IF_AVAILABLE capped events, v0.1.24 additive field)", () => {
+    // Regression: charged was declared on EventCreateResponse but silently
+    // dropped by the mapper — callers could not see the effective charge
+    // when the actual amount was capped to remaining budget.
+    const parsed = eventCreateResponseFromWire({
+      status: "APPLIED",
+      event_id: "evt-capped",
+      charged: { unit: "USD_MICROCENTS", amount: 1500 },
+    });
+    expect(parsed.charged).toEqual({ unit: "USD_MICROCENTS", amount: 1500 });
+  });
+
+  it("leaves charged undefined when absent", () => {
+    const parsed = eventCreateResponseFromWire({
+      status: "APPLIED",
+      event_id: "evt-uncapped",
+    });
+    expect(parsed.charged).toBeUndefined();
+  });
+
   it("handles response without balances", () => {
     const parsed = eventCreateResponseFromWire({
       status: "APPLIED",

@@ -176,6 +176,9 @@ export function eventCreateResponseFromWire(
   return {
     status: wire.status as EventCreateResponse["status"],
     eventId: wire.event_id as string,
+    // Present when overage_policy=ALLOW_IF_AVAILABLE capped the actual to
+    // the remaining budget — the caller must see the effective charge.
+    charged: amountFromWire(wire.charged as Record<string, unknown> | undefined),
     balances: balancesFromWire(wire.balances as unknown[] | undefined),
   };
 }
