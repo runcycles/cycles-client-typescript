@@ -456,7 +456,7 @@ try {
 | Exception | When |
 |-----------|------|
 | `CyclesError` | Base for all Cycles errors |
-| `CyclesProtocolError` | Server returned a protocol-level error |
+| `CyclesProtocolError` | Server returned a protocol-level error; also thrown with `status === -1` when a helper surface wraps a reservation-time transport failure |
 | `BudgetExceededError` | Budget insufficient for the reservation |
 | `OverdraftLimitExceededError` | Debt exceeds the overdraft limit |
 | `DebtOutstandingError` | Outstanding debt blocks new reservations |
@@ -468,7 +468,7 @@ try {
 
 Transport failures (DNS failure, timeout, connection refused) do not surface as a distinct exception class. The SDK never throws `CyclesTransportError` itself — the class is exported for use in your own code (e.g. wrapping transport-level failures in higher-level integrations). Instead:
 
-- **`withCycles` / `reserveForStream`** throw `CyclesProtocolError` with `status === -1` and `errorCode` `undefined`.
+- **`withCycles` / `reserveForStream`** throw `CyclesProtocolError` with `status === -1` and `errorCode` `undefined` for **reservation-time** transport failures. Commit-time failures differ: `withCycles` retries the commit in the background (fire-and-forget), while `StreamReservation.commit()` throws and resets `finalized` so you can retry or `release()`.
 - **Programmatic `CyclesClient` calls** never throw on transport failure — they return a `CyclesResponse` with `isTransportError` set and `status` of `-1` (see below).
 
 ### With `CyclesClient` (programmatic)

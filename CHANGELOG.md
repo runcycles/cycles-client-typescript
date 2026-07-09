@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.
 
 ### Fixed
 
-- README error-handling docs no longer describe `CyclesTransportError` as thrown on network failure — the SDK never constructs it. Transport failures surface as `CyclesProtocolError` with `status: -1` (`withCycles` / `reserveForStream`) or as `CyclesResponse` with `isTransportError` / `status: -1` (programmatic client). The class remains exported for use in user code; a new "Transport failures (status -1)" README subsection documents the actual behavior.
+- README error-handling docs no longer describe `CyclesTransportError` as thrown on network failure — the SDK never constructs it. Reservation-time transport failures surface as `CyclesProtocolError` with `status: -1` (`withCycles` / `reserveForStream`) or as `CyclesResponse` with `isTransportError` / `status: -1` (programmatic client); commit-time failures are retried in the background by `withCycles`, while `StreamReservation.commit()` throws and resets `finalized` for caller retry or release. The class remains exported for use in user code; a new "Transport failures (status -1)" README subsection documents the actual behavior.
 - `examples/vercel-ai-sdk` chat route no longer mixes AI SDK v4 and v5 APIs (it compiled under neither while `package.json` pins `"ai": "^4.0.0"`): now pure v4 — `Message` type and `convertToCoreMessages` replace v5's `UIMessage` / `convertToModelMessages`. `runcycles` usage unchanged.
 
 ### Notes
