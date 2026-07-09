@@ -167,7 +167,7 @@ All spec constraints are validated via explicit validation functions in `validat
 - `CyclesResponse` correctly classifies 2xx (success), 4xx (client error), 5xx (server error)
 - Error responses parsed via `errorResponseFromWire()` with `ErrorCode` mapping
 - Typed exceptions: `BudgetExceededError`, `OverdraftLimitExceededError`, `DebtOutstandingError`, `ReservationExpiredError`, `ReservationFinalizedError`
-- `CyclesTransportError` wraps network-level failures with cause chain
+- Transport failures surface as `status: -1`: HOF paths (`withCycles` / `reserveForStream`) throw `CyclesProtocolError` with `status: -1`; the programmatic client returns `CyclesResponse` with `isTransportError` set (`CyclesResponse.transportError()` in `response.ts`). `CyclesTransportError` is exported for user code but never thrown by the SDK (see 2026-07-09 entry below)
 
 ### Type Safety — `WithCyclesConfig` Generics (fixed)
 
@@ -232,3 +232,26 @@ The client is **fully protocol-conformant** with the Cycles Protocol v0.1.23 Ope
 - **Keywords expanded** 15 → 26. Drops legacy keywords (`billing`, `metering`, `api-client`, `ai`, `llm`, `agents`, `token-budget`, `spend-limit`) in favor of category-search variants and framework targeting (`langchain`, `langgraph`, `openai-agents`, `vercel-ai-sdk`, `mcp`).
 
 Driven by package-portfolio SEO diagnostic. The cost / action / audit triad now leads the description, matching the three pillars of Cycles' value proposition.
+
+---
+
+## README Transport-Error Docs + Vercel AI SDK Example Fix (2026-07-09)
+
+**Files:** `README.md`, `examples/vercel-ai-sdk/app/api/chat/route.ts`, `CHANGELOG.md`. **No library code changes** — docs and example only; bundle and runtime behavior unchanged.
+
+### README: `CyclesTransportError` documented as thrown, but never constructed
+
+The README's error-handling section imported `CyclesTransportError` and showed an `err instanceof CyclesTransportError` catch branch, and the exception-hierarchy table described it as "Network-level failure (connection, DNS, timeout)" — implying the SDK throws it. Nothing in `src/` ever constructs it. Actual behavior:
+
+- **HOF paths (`withCycles` / `reserveForStream`):** transport failure at reserve time throws `CyclesProtocolError` with `status: -1` and `errorCode` `undefined`; commit-time transport failures are retried by the commit retry engine (`retry.ts`), not thrown.
+- **Programmatic client:** never throws on transport failure — returns `CyclesResponse` with `isTransportError` set and `status` of `-1` (`CyclesResponse.transportError()` in `response.ts`).
+
+**Fix:** removed the dead `instanceof CyclesTransportError` branch, added a `status === -1` check inside the `CyclesProtocolError` branch, corrected the hierarchy-table row (class remains exported for user code), and added a "Transport failures (status -1)" subsection covering both API surfaces. Wording matches the docs site (`cycles-docs/how-to/error-handling-patterns-in-typescript.md`). Also corrected the stale statement in this file's "HTTP Status Code Handling" section. `CyclesTransportError` remains exported from `src/index.ts` — no API change.
+
+### `examples/vercel-ai-sdk`: route mixed AI SDK v4 and v5 APIs
+
+`app/api/chat/route.ts` used AI SDK v5 APIs (`UIMessage` type, `convertToModelMessages`) alongside v4 APIs (`usage.promptTokens` / `usage.completionTokens`, `result.toDataStreamResponse()`) while `package.json` pins `"ai": "^4.0.0"` — the file compiled under neither major version.
+
+**Fix:** converted to pure v4: `type Message` (with `.content`) instead of `UIMessage`, synchronous `convertToCoreMessages(messages)` instead of `await convertToModelMessages(messages)`. The already-v4-correct parts (`usage.promptTokens` / `completionTokens`, `toDataStreamResponse()`) are unchanged, as is all `runcycles` usage (`reserveForStream`, `handle.commit()` / `handle.release()` — previously verified correct). No other files in the example used v5 APIs (verified by grep for `UIMessage`, `convertToModelMessages`, `.parts`, `maxOutputTokens`, `inputTokens`/`outputTokens`).
+
+**Validation:** library `src/` untouched. Example typecheck (`tsc --noEmit`) skipped: `npm install` in the example directory could not complete on the fixing machine (known npm-internal "Exit handler never called" bug). Verified instead by review against the AI SDK v4 API surface (`Message` / `.content`, `convertToCoreMessages`, `usage.promptTokens` / `completionTokens`, `result.toDataStreamResponse()`) and by grep confirming no v5 identifiers remain anywhere in the example.

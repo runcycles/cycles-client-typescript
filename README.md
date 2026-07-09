@@ -412,7 +412,6 @@ import {
   withCycles,
   BudgetExceededError,
   CyclesProtocolError,
-  CyclesTransportError,
 } from "runcycles";
 
 const guarded = withCycles({ estimate: 1000, client }, async () => "result");
@@ -442,9 +441,12 @@ try {
     console.log(err.reasonCode);  // Server-provided reason
     console.log(err.requestId);   // For support/debugging
     console.log(err.details);     // Additional error context
-    console.log(err.status);      // HTTP status code
-  } else if (err instanceof CyclesTransportError) {
-    console.log("Network error:", err.message, err.cause);
+    console.log(err.status);      // HTTP status code (-1 for transport failures)
+
+    // Transport failures (network error — the server was never reached)
+    if (err.status === -1) {
+      console.log("Network error:", err.message);
+    }
   }
 }
 ```
@@ -460,7 +462,14 @@ try {
 | `DebtOutstandingError` | Outstanding debt blocks new reservations |
 | `ReservationExpiredError` | Operating on an expired reservation |
 | `ReservationFinalizedError` | Operating on an already-committed/released reservation |
-| `CyclesTransportError` | Network-level failure (connection, DNS, timeout) |
+| `CyclesTransportError` | Exported for use in your own code; never thrown by the SDK — transport failures surface as `status === -1` (see below) |
+
+### Transport failures (status -1)
+
+Transport failures (DNS failure, timeout, connection refused) do not surface as a distinct exception class. The SDK never throws `CyclesTransportError` itself — the class is exported for use in your own code (e.g. wrapping transport-level failures in higher-level integrations). Instead:
+
+- **`withCycles` / `reserveForStream`** throw `CyclesProtocolError` with `status === -1` and `errorCode` `undefined`.
+- **Programmatic `CyclesClient` calls** never throw on transport failure — they return a `CyclesResponse` with `isTransportError` set and `status` of `-1` (see below).
 
 ### With `CyclesClient` (programmatic)
 

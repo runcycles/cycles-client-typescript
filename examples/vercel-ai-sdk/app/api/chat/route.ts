@@ -12,7 +12,7 @@
  * Requires Node.js runtime (for AsyncLocalStorage).
  */
 
-import { streamText, type UIMessage, convertToModelMessages } from "ai";
+import { streamText, type Message, convertToCoreMessages } from "ai";
 import { openai } from "@ai-sdk/openai";
 import {
   CyclesClient,
@@ -28,7 +28,7 @@ export const runtime = "nodejs";
 const cyclesClient = new CyclesClient(CyclesConfig.fromEnv());
 
 export async function POST(req: Request) {
-  const { messages }: { messages: UIMessage[] } = await req.json();
+  const { messages }: { messages: Message[] } = await req.json();
 
   // Rough token estimate from message content length (1 token ≈ 4 chars).
   // In production, use a proper tokenizer like tiktoken.
@@ -73,7 +73,7 @@ export async function POST(req: Request) {
   try {
     const result = streamText({
       model: openai("gpt-4o"),
-      messages: await convertToModelMessages(messages),
+      messages: convertToCoreMessages(messages),
       onFinish: async ({ usage }) => {
         // Commit actual usage once the stream completes.
         // commit() automatically stops the heartbeat.
