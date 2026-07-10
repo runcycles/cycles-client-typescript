@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.
 
 ## [Unreleased]
 
+### Added
+
+- `TENANT_CLOSED` error-code support per runtime spec v0.1.25.13 of `cycles-protocol-v0.yaml` (PR pending in runcycles/cycles-protocol): servers return HTTP 409 `error=TENANT_CLOSED` on reservation create/commit/release/extend when the owning tenant is CLOSED (mirrors governance spec Rule 2). New `ErrorCode.TENANT_CLOSED` enum member, `TenantClosedError` class (thrown by `withCycles` / lifecycle / streaming surfaces via `buildProtocolException`), and `CyclesProtocolError.isTenantClosed()` helper. Purely additive — before this change the unrecognized code produced a generic `CyclesProtocolError` with the raw `errorCode: "TENANT_CLOSED"` preserved and `isRetryable()` already `false` (409 < 500); `errorCodeFromString` mapped it to `ErrorCode.UNKNOWN`, which `isRetryableErrorCode` reports as retryable — now it maps to the typed, non-retryable member. The vendored spec fixture (pinned pre-v0.1.25.13) is intentionally untouched until the spec PR merges.
+
 ### Fixed
 
 - README error-handling docs no longer describe `CyclesTransportError` as thrown on network failure — the SDK never constructs it. Reservation-time transport failures surface as `CyclesProtocolError` with `status: -1` (`withCycles` / `reserveForStream`) or as `CyclesResponse` with `isTransportError` / `status: -1` (programmatic client); commit-time failures are retried in the background by `withCycles`, while `StreamReservation.commit()` throws and resets `finalized` for caller retry or release. The class remains exported for use in user code; a new "Transport failures (status -1)" README subsection documents the actual behavior.
@@ -13,7 +17,7 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.
 
 ### Notes
 
-- Docs + example only; no library code changes.
+- The Fixed items are docs + example only; the Added item is a small additive library change (no wire-format change).
 
 ## [0.3.3] - 2026-05-22
 

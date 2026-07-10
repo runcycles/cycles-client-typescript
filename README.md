@@ -430,6 +430,7 @@ try {
     if (err.isReservationFinalized()) { /* ... */ }
     if (err.isIdempotencyMismatch()) { /* ... */ }
     if (err.isUnitMismatch()) { /* ... */ }
+    if (err.isTenantClosed()) { /* ... */ }
 
     // Retry handling
     if (err.isRetryable() && err.retryAfterMs) {
@@ -462,6 +463,7 @@ try {
 | `DebtOutstandingError` | Outstanding debt blocks new reservations |
 | `ReservationExpiredError` | Operating on an expired reservation |
 | `ReservationFinalizedError` | Operating on an already-committed/released reservation |
+| `TenantClosedError` | The owning tenant is CLOSED (HTTP 409 `TENANT_CLOSED`, runtime spec v0.1.25.13) — reserve/commit/release/extend rejected until the tenant is reopened |
 | `CyclesTransportError` | Exported for use in your own code; never thrown by the SDK — transport failures surface as `status === -1` (see below) |
 
 ### Transport failures (status -1)

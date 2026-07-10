@@ -12,6 +12,7 @@ import {
   OverdraftLimitExceededError,
   ReservationExpiredError,
   ReservationFinalizedError,
+  TenantClosedError,
 } from "./exceptions.js";
 import type { CyclesResponse } from "./response.js";
 
@@ -72,6 +73,8 @@ export function buildProtocolException(
       return new ReservationExpiredError(message, opts);
     case "RESERVATION_FINALIZED":
       return new ReservationFinalizedError(message, opts);
+    case "TENANT_CLOSED":
+      return new TenantClosedError(message, opts);
     default:
       return new CyclesProtocolError(message, opts);
   }

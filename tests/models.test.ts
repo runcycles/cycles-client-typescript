@@ -42,11 +42,19 @@ describe("models", () => {
     it("BUDGET_EXCEEDED is not retryable", () => {
       expect(isRetryableErrorCode(ErrorCode.BUDGET_EXCEEDED)).toBe(false);
     });
+
+    it("TENANT_CLOSED is not retryable", () => {
+      expect(isRetryableErrorCode(ErrorCode.TENANT_CLOSED)).toBe(false);
+    });
   });
 
   describe("errorCodeFromString", () => {
     it("returns known code", () => {
       expect(errorCodeFromString("BUDGET_EXCEEDED")).toBe(ErrorCode.BUDGET_EXCEEDED);
+    });
+
+    it("returns TENANT_CLOSED (runtime spec v0.1.25.13)", () => {
+      expect(errorCodeFromString("TENANT_CLOSED")).toBe(ErrorCode.TENANT_CLOSED);
     });
 
     it("returns UNKNOWN for unrecognized", () => {

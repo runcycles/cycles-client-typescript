@@ -8,6 +8,7 @@ import {
   OverdraftLimitExceededError,
   ReservationExpiredError,
   ReservationFinalizedError,
+  TenantClosedError,
 } from "../src/exceptions.js";
 
 describe("buildProtocolException", () => {
@@ -73,6 +74,20 @@ describe("buildProtocolException", () => {
     const err = buildProtocolException("Failed", response);
     expect(err).toBeInstanceOf(ReservationFinalizedError);
     expect(err.errorCode).toBe("RESERVATION_FINALIZED");
+  });
+
+  it("returns TenantClosedError for TENANT_CLOSED", () => {
+    const response = CyclesResponse.httpError(409, "Tenant closed", {
+      error: "TENANT_CLOSED",
+      message: "Owning tenant is CLOSED",
+      request_id: "req-7",
+    });
+
+    const err = buildProtocolException("Failed", response);
+    expect(err).toBeInstanceOf(TenantClosedError);
+    expect(err.errorCode).toBe("TENANT_CLOSED");
+    expect(err.isTenantClosed()).toBe(true);
+    expect(err.isRetryable()).toBe(false);
   });
 
   it("returns generic CyclesProtocolError for unknown error codes", () => {

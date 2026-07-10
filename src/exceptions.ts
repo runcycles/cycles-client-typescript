@@ -48,6 +48,10 @@ export class CyclesProtocolError extends CyclesError {
     return this.errorCode === "DEBT_OUTSTANDING";
   }
 
+  isTenantClosed(): boolean {
+    return this.errorCode === "TENANT_CLOSED";
+  }
+
   isReservationExpired(): boolean {
     return this.errorCode === "RESERVATION_EXPIRED";
   }
@@ -100,6 +104,24 @@ export class DebtOutstandingError extends CyclesProtocolError {
   ) {
     super(message, options);
     this.name = "DebtOutstandingError";
+  }
+}
+
+/**
+ * The owning tenant is CLOSED (HTTP 409, `TENANT_CLOSED`).
+ *
+ * Servers return this on reservation create/commit/release/extend when the
+ * owning tenant's status is CLOSED, per runtime spec v0.1.25.13 (mirrors
+ * governance spec Rule 2). Not retryable — the tenant must be reopened
+ * administratively before further budget operations succeed.
+ */
+export class TenantClosedError extends CyclesProtocolError {
+  constructor(
+    message: string,
+    options: ConstructorParameters<typeof CyclesProtocolError>[1] = {},
+  ) {
+    super(message, options);
+    this.name = "TenantClosedError";
   }
 }
 
