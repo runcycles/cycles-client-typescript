@@ -2,7 +2,7 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import { reserveForStream } from "../src/streaming.js";
 import { CyclesConfig } from "../src/config.js";
 import { CyclesResponse } from "../src/response.js";
-import { BudgetExceededError, CyclesError } from "../src/exceptions.js";
+import { BudgetExceededError, CyclesError, TenantClosedError } from "../src/exceptions.js";
 
 function makeMockClient() {
   return {
@@ -161,6 +161,27 @@ describe("reserveForStream", () => {
         tenant: "acme",
       }),
     ).rejects.toBeInstanceOf(BudgetExceededError);
+  });
+
+  it("throws TenantClosedError on TENANT_CLOSED create failure", async () => {
+    // Runtime spec v0.1.25.13: HTTP 409 TENANT_CLOSED on reservation
+    // create when the owning tenant is CLOSED.
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.httpError(409, "Tenant closed", {
+        error: "TENANT_CLOSED",
+        message: "Owning tenant is CLOSED",
+        request_id: "req-tc",
+      }),
+    );
+
+    await expect(
+      reserveForStream({
+        client: client as any,
+        estimate: 10000,
+        tenant: "acme",
+      }),
+    ).rejects.toBeInstanceOf(TenantClosedError);
   });
 
   it("uses config defaults for subject fields", async () => {

@@ -4,7 +4,7 @@ import { CyclesResponse } from "../src/response.js";
 import { CommitRetryEngine } from "../src/retry.js";
 import { CyclesConfig } from "../src/config.js";
 import { getCyclesContext } from "../src/context.js";
-import { BudgetExceededError, CyclesProtocolError } from "../src/exceptions.js";
+import { BudgetExceededError, CyclesProtocolError, TenantClosedError } from "../src/exceptions.js";
 
 function makeConfig() {
   return new CyclesConfig({ baseUrl: "http://localhost", apiKey: "key" });
@@ -136,6 +136,26 @@ describe("AsyncCyclesLifecycle", () => {
     await expect(
       lifecycle.execute(async () => "never", [], { estimate: 1000 }),
     ).rejects.toBeInstanceOf(BudgetExceededError);
+  });
+
+  it("throws TenantClosedError on TENANT_CLOSED", async () => {
+    // Runtime spec v0.1.25.13: HTTP 409 TENANT_CLOSED on reservation
+    // create when the owning tenant is CLOSED.
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.httpError(409, "Tenant closed", {
+        error: "TENANT_CLOSED",
+        message: "Owning tenant is CLOSED",
+        request_id: "req-tc",
+      }),
+    );
+
+    const retryEngine = makeRetryEngine();
+    const lifecycle = new AsyncCyclesLifecycle(client as any, retryEngine, { tenant: "acme" });
+
+    await expect(
+      lifecycle.execute(async () => "never", [], { estimate: 1000 }),
+    ).rejects.toBeInstanceOf(TenantClosedError);
   });
 
   it("releases reservation on function error", async () => {

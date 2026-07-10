@@ -93,6 +93,18 @@ describe("CyclesResponse", () => {
       expect(errResp!.requestId).toBe("req-1");
     });
 
+    it("parses TENANT_CLOSED error response (runtime spec v0.1.25.13)", () => {
+      const resp = CyclesResponse.httpError(409, "Tenant closed", {
+        error: "TENANT_CLOSED",
+        message: "Owning tenant is CLOSED",
+        request_id: "req-tc",
+      });
+      const errResp = resp.getErrorResponse();
+      expect(errResp).toBeDefined();
+      expect(errResp!.error).toBe("TENANT_CLOSED");
+      expect(errResp!.requestId).toBe("req-tc");
+    });
+
     it("returns undefined for non-error body", () => {
       const resp = CyclesResponse.success(200, { foo: "bar" });
       expect(resp.getErrorResponse()).toBeUndefined();

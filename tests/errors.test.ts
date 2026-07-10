@@ -103,6 +103,22 @@ describe("buildProtocolException", () => {
     expect(err.errorCode).toBe("INVALID_REQUEST");
   });
 
+  it("returns generic CyclesProtocolError for a future server code, preserving the raw errorCode", () => {
+    // Forward compat: a code this client has never heard of must fall
+    // back to the generic class with the raw wire string intact.
+    const response = CyclesResponse.httpError(409, "New thing", {
+      error: "NEW_SERVER_CODE",
+      message: "Something from a newer protocol revision",
+      request_id: "req-future",
+    });
+
+    const err = buildProtocolException("Failed", response);
+    expect(err).toBeInstanceOf(CyclesProtocolError);
+    expect(err.constructor).toBe(CyclesProtocolError);
+    expect(err.errorCode).toBe("NEW_SERVER_CODE");
+    expect(err.isRetryable()).toBe(false); // 409 < 500, not a retryable code
+  });
+
   it("falls back to body error attribute when getErrorResponse returns null", () => {
     // A success-shaped response with an error field in the body but no
     // structured error_response. This triggers the fallback path.

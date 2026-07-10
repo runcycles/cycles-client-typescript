@@ -463,7 +463,7 @@ try {
 | `DebtOutstandingError` | Outstanding debt blocks new reservations |
 | `ReservationExpiredError` | Operating on an expired reservation |
 | `ReservationFinalizedError` | Operating on an already-committed/released reservation |
-| `TenantClosedError` | The owning tenant is CLOSED (HTTP 409 `TENANT_CLOSED`, runtime spec v0.1.25.13) — reserve/commit/release/extend rejected until the tenant is reopened |
+| `TenantClosedError` | The owning tenant is CLOSED (HTTP 409 `TENANT_CLOSED`, runtime spec v0.1.25.13); thrown at reservation time by `withCycles` / `reserveForStream` — commit-time client errors are handled/released internally, and `StreamReservation.commit()` throws generic `CyclesError` |
 | `CyclesTransportError` | Exported for use in your own code; never thrown by the SDK — transport failures surface as `status === -1` (see below) |
 
 ### Transport failures (status -1)
@@ -848,6 +848,7 @@ ErrorCode.INVALID_REQUEST
 ErrorCode.UNAUTHORIZED
 ErrorCode.FORBIDDEN
 ErrorCode.NOT_FOUND
+ErrorCode.TENANT_CLOSED
 ErrorCode.INTERNAL_ERROR
 ErrorCode.UNKNOWN
 ```
