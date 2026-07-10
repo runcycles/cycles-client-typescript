@@ -69,9 +69,12 @@ export class CyclesProtocolError extends CyclesError {
   }
 
   isRetryable(): boolean {
+    // LIMIT_EXCEEDED (HTTP 429 rate limiting, runtime spec v0.1.25.12)
+    // is transient: retry after retryAfterMs / Retry-After.
     return (
       this.errorCode === "INTERNAL_ERROR" ||
       this.errorCode === "UNKNOWN" ||
+      this.errorCode === "LIMIT_EXCEEDED" ||
       this.status >= 500
     );
   }

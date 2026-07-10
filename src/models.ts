@@ -52,7 +52,6 @@ export enum ErrorCode {
   BUDGET_EXCEEDED = "BUDGET_EXCEEDED",
   BUDGET_FROZEN = "BUDGET_FROZEN",
   BUDGET_CLOSED = "BUDGET_CLOSED",
-  TENANT_CLOSED = "TENANT_CLOSED",
   RESERVATION_EXPIRED = "RESERVATION_EXPIRED",
   RESERVATION_FINALIZED = "RESERVATION_FINALIZED",
   IDEMPOTENCY_MISMATCH = "IDEMPOTENCY_MISMATCH",
@@ -60,6 +59,8 @@ export enum ErrorCode {
   OVERDRAFT_LIMIT_EXCEEDED = "OVERDRAFT_LIMIT_EXCEEDED",
   DEBT_OUTSTANDING = "DEBT_OUTSTANDING",
   MAX_EXTENSIONS_EXCEEDED = "MAX_EXTENSIONS_EXCEEDED",
+  LIMIT_EXCEEDED = "LIMIT_EXCEEDED",
+  TENANT_CLOSED = "TENANT_CLOSED",
   INTERNAL_ERROR = "INTERNAL_ERROR",
   UNKNOWN = "UNKNOWN",
 }
@@ -290,7 +291,14 @@ export function isDenied(decision: Decision): boolean {
 }
 
 export function isRetryableErrorCode(code: ErrorCode): boolean {
-  return code === ErrorCode.INTERNAL_ERROR || code === ErrorCode.UNKNOWN;
+  // LIMIT_EXCEEDED is HTTP 429 rate limiting (runtime spec v0.1.25.12):
+  // transient by definition — the spec instructs clients to retry after
+  // the indicated delay (Retry-After / X-RateLimit-Reset).
+  return (
+    code === ErrorCode.INTERNAL_ERROR ||
+    code === ErrorCode.UNKNOWN ||
+    code === ErrorCode.LIMIT_EXCEEDED
+  );
 }
 
 export function errorCodeFromString(value: string | undefined): ErrorCode | undefined {

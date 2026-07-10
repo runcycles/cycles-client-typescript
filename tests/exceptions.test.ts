@@ -115,6 +115,16 @@ describe("exceptions", () => {
       expect(err.isBudgetExceeded()).toBe(false);
     });
 
+    it("LIMIT_EXCEEDED (HTTP 429 rate limiting) is retryable", () => {
+      const err = new CyclesProtocolError("rate limited", {
+        status: 429,
+        errorCode: "LIMIT_EXCEEDED",
+        retryAfterMs: 3000,
+      });
+      expect(err.isRetryable()).toBe(true);
+      expect(err.retryAfterMs).toBe(3000);
+    });
+
     it("all helpers return false for non-matching error code", () => {
       const err = new CyclesProtocolError("test", { errorCode: "UNKNOWN" });
       expect(err.isBudgetExceeded()).toBe(false);
