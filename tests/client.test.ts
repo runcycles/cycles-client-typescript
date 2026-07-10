@@ -245,6 +245,22 @@ describe("CyclesClient", () => {
       expect(resp.isTransportError).toBe(true);
       expect(resp.errorMessage).toBe("ECONNREFUSED");
     });
+
+    it("captures the Retry-After header on 429 LIMIT_EXCEEDED (spec v0.1.25.12)", async () => {
+      mockFetch(
+        429,
+        { error: "LIMIT_EXCEEDED", message: "Rate limited", request_id: "req-rl" },
+        { "Retry-After": "3", "X-RateLimit-Reset": "1700000000" },
+      );
+
+      const client = new CyclesClient(config);
+      const resp = await client.createReservation({ idempotency_key: "test" });
+
+      expect(resp.status).toBe(429);
+      expect(resp.retryAfterMsHeader).toBe(3000);
+      expect(resp.rateLimitReset).toBe(1700000000);
+      expect(resp.getErrorResponse()?.error).toBe("LIMIT_EXCEEDED");
+    });
   });
 
   describe("asyncDispose", () => {

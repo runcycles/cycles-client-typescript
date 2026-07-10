@@ -50,8 +50,12 @@ export function buildProtocolException(
     reasonCode = errorCode;
   }
 
+  // Body field wins; otherwise fall back to the HTTP Retry-After header
+  // (seconds → ms), which is how 429 LIMIT_EXCEEDED responses carry the
+  // delay per runtime spec v0.1.25.12.
   const retryRaw = response.getBodyAttribute("retry_after_ms");
-  const retryAfterMs = retryRaw !== undefined ? Number(retryRaw) : undefined;
+  const retryAfterMs =
+    retryRaw !== undefined ? Number(retryRaw) : response.retryAfterMsHeader;
 
   const opts = {
     status: response.status,

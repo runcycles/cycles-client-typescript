@@ -29,7 +29,7 @@ Coverage improved from **89.8% → 99.4% lines** and **81.8% → 92.4% branches*
 ### Tests added (212 total, up from ~160)
 
 **`tests/errors.test.ts`** (new file — 12 tests)
-- All 5 error-code switch cases: `BUDGET_EXCEEDED`, `OVERDRAFT_LIMIT_EXCEEDED`, `DEBT_OUTSTANDING`, `RESERVATION_EXPIRED`, `RESERVATION_FINALIZED`
+- All 6 error-code switch cases: `BUDGET_EXCEEDED`, `OVERDRAFT_LIMIT_EXCEEDED`, `DEBT_OUTSTANDING`, `RESERVATION_EXPIRED`, `RESERVATION_FINALIZED`, `TENANT_CLOSED` (added 2026-07-10)
 - Generic `CyclesProtocolError` for unknown codes
 - Fallback path when `getErrorResponse()` returns null (body missing `request_id`)
 - `retry_after_ms` parsing, `reasonCode` defaulting, transport error handling

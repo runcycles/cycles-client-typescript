@@ -144,6 +144,41 @@ describe("buildProtocolException", () => {
     expect(err.retryAfterMs).toBe(5000);
   });
 
+  it("falls back to the Retry-After header for retryAfterMs (429 LIMIT_EXCEEDED, spec v0.1.25.12)", () => {
+    const response = CyclesResponse.httpError(
+      429,
+      "Rate limited",
+      {
+        error: "LIMIT_EXCEEDED",
+        message: "Rate limited",
+        request_id: "req-rl",
+      },
+      { "retry-after": "3" },
+    );
+
+    const err = buildProtocolException("Failed", response);
+    expect(err.errorCode).toBe("LIMIT_EXCEEDED");
+    expect(err.retryAfterMs).toBe(3000);
+    expect(err.isRetryable()).toBe(true);
+  });
+
+  it("prefers body retry_after_ms over the Retry-After header", () => {
+    const response = CyclesResponse.httpError(
+      429,
+      "Rate limited",
+      {
+        error: "LIMIT_EXCEEDED",
+        message: "Rate limited",
+        request_id: "req-rl2",
+        retry_after_ms: 1500,
+      },
+      { "retry-after": "3" },
+    );
+
+    const err = buildProtocolException("Failed", response);
+    expect(err.retryAfterMs).toBe(1500);
+  });
+
   it("defaults reasonCode to errorCode when reason_code absent", () => {
     const response = CyclesResponse.httpError(402, "Budget exceeded", {
       error: "BUDGET_EXCEEDED",

@@ -52,12 +52,27 @@ describe("CyclesResponse", () => {
       expect(resp.cyclesTenant).toBe("acme");
     });
 
+    it("converts Retry-After header seconds to ms (429 LIMIT_EXCEEDED, spec v0.1.25.12)", () => {
+      const resp = CyclesResponse.httpError(429, "Rate limited", undefined, {
+        "retry-after": "3",
+      });
+      expect(resp.retryAfterMsHeader).toBe(3000);
+    });
+
+    it("ignores non-integer Retry-After header gracefully", () => {
+      const resp = CyclesResponse.httpError(429, "Rate limited", undefined, {
+        "retry-after": "Wed, 21 Oct 2026 07:28:00 GMT",
+      });
+      expect(resp.retryAfterMsHeader).toBeUndefined();
+    });
+
     it("returns undefined for missing headers", () => {
       const resp = CyclesResponse.success(200, {});
       expect(resp.requestId).toBeUndefined();
       expect(resp.rateLimitRemaining).toBeUndefined();
       expect(resp.rateLimitReset).toBeUndefined();
       expect(resp.cyclesTenant).toBeUndefined();
+      expect(resp.retryAfterMsHeader).toBeUndefined();
     });
   });
 

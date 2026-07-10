@@ -799,7 +799,7 @@ isAllowed(decision);  // true for ALLOW or ALLOW_WITH_CAPS
 isDenied(decision);   // true for DENY
 
 // Error code helpers
-isRetryableErrorCode(errorCode);       // true for INTERNAL_ERROR or UNKNOWN
+isRetryableErrorCode(errorCode);       // true for INTERNAL_ERROR, UNKNOWN, or LIMIT_EXCEEDED (429 rate limiting)
 errorCodeFromString("BUDGET_EXCEEDED"); // ErrorCode.BUDGET_EXCEEDED (or UNKNOWN for unrecognized)
 
 // Caps helpers — check if a tool is allowed given the caps
