@@ -52,12 +52,27 @@ describe("CyclesResponse", () => {
       expect(resp.cyclesTenant).toBe("acme");
     });
 
+    it("converts Retry-After header seconds to ms (429 LIMIT_EXCEEDED, spec v0.1.25.12)", () => {
+      const resp = CyclesResponse.httpError(429, "Rate limited", undefined, {
+        "retry-after": "3",
+      });
+      expect(resp.retryAfterMsHeader).toBe(3000);
+    });
+
+    it("ignores non-integer Retry-After header gracefully", () => {
+      const resp = CyclesResponse.httpError(429, "Rate limited", undefined, {
+        "retry-after": "Wed, 21 Oct 2026 07:28:00 GMT",
+      });
+      expect(resp.retryAfterMsHeader).toBeUndefined();
+    });
+
     it("returns undefined for missing headers", () => {
       const resp = CyclesResponse.success(200, {});
       expect(resp.requestId).toBeUndefined();
       expect(resp.rateLimitRemaining).toBeUndefined();
       expect(resp.rateLimitReset).toBeUndefined();
       expect(resp.cyclesTenant).toBeUndefined();
+      expect(resp.retryAfterMsHeader).toBeUndefined();
     });
   });
 
@@ -91,6 +106,18 @@ describe("CyclesResponse", () => {
       expect(errResp!.error).toBe("INVALID_REQUEST");
       expect(errResp!.message).toBe("Missing field");
       expect(errResp!.requestId).toBe("req-1");
+    });
+
+    it("parses TENANT_CLOSED error response (runtime spec v0.1.25.13)", () => {
+      const resp = CyclesResponse.httpError(409, "Tenant closed", {
+        error: "TENANT_CLOSED",
+        message: "Owning tenant is CLOSED",
+        request_id: "req-tc",
+      });
+      const errResp = resp.getErrorResponse();
+      expect(errResp).toBeDefined();
+      expect(errResp!.error).toBe("TENANT_CLOSED");
+      expect(errResp!.requestId).toBe("req-tc");
     });
 
     it("returns undefined for non-error body", () => {

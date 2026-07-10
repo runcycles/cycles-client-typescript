@@ -8,6 +8,7 @@ import {
   OverdraftLimitExceededError,
   ReservationExpiredError,
   ReservationFinalizedError,
+  TenantClosedError,
 } from "../src/exceptions.js";
 
 describe("buildProtocolException", () => {
@@ -75,6 +76,20 @@ describe("buildProtocolException", () => {
     expect(err.errorCode).toBe("RESERVATION_FINALIZED");
   });
 
+  it("returns TenantClosedError for TENANT_CLOSED", () => {
+    const response = CyclesResponse.httpError(409, "Tenant closed", {
+      error: "TENANT_CLOSED",
+      message: "Owning tenant is CLOSED",
+      request_id: "req-7",
+    });
+
+    const err = buildProtocolException("Failed", response);
+    expect(err).toBeInstanceOf(TenantClosedError);
+    expect(err.errorCode).toBe("TENANT_CLOSED");
+    expect(err.isTenantClosed()).toBe(true);
+    expect(err.isRetryable()).toBe(false);
+  });
+
   it("returns generic CyclesProtocolError for unknown error codes", () => {
     const response = CyclesResponse.httpError(400, "Bad request", {
       error: "INVALID_REQUEST",
@@ -86,6 +101,22 @@ describe("buildProtocolException", () => {
     expect(err).toBeInstanceOf(CyclesProtocolError);
     expect(err).not.toBeInstanceOf(BudgetExceededError);
     expect(err.errorCode).toBe("INVALID_REQUEST");
+  });
+
+  it("returns generic CyclesProtocolError for a future server code, preserving the raw errorCode", () => {
+    // Forward compat: a code this client has never heard of must fall
+    // back to the generic class with the raw wire string intact.
+    const response = CyclesResponse.httpError(409, "New thing", {
+      error: "NEW_SERVER_CODE",
+      message: "Something from a newer protocol revision",
+      request_id: "req-future",
+    });
+
+    const err = buildProtocolException("Failed", response);
+    expect(err).toBeInstanceOf(CyclesProtocolError);
+    expect(err.constructor).toBe(CyclesProtocolError);
+    expect(err.errorCode).toBe("NEW_SERVER_CODE");
+    expect(err.isRetryable()).toBe(false); // 409 < 500, not a retryable code
   });
 
   it("falls back to body error attribute when getErrorResponse returns null", () => {
@@ -111,6 +142,41 @@ describe("buildProtocolException", () => {
 
     const err = buildProtocolException("Failed", response);
     expect(err.retryAfterMs).toBe(5000);
+  });
+
+  it("falls back to the Retry-After header for retryAfterMs (429 LIMIT_EXCEEDED, spec v0.1.25.12)", () => {
+    const response = CyclesResponse.httpError(
+      429,
+      "Rate limited",
+      {
+        error: "LIMIT_EXCEEDED",
+        message: "Rate limited",
+        request_id: "req-rl",
+      },
+      { "retry-after": "3" },
+    );
+
+    const err = buildProtocolException("Failed", response);
+    expect(err.errorCode).toBe("LIMIT_EXCEEDED");
+    expect(err.retryAfterMs).toBe(3000);
+    expect(err.isRetryable()).toBe(true);
+  });
+
+  it("prefers body retry_after_ms over the Retry-After header", () => {
+    const response = CyclesResponse.httpError(
+      429,
+      "Rate limited",
+      {
+        error: "LIMIT_EXCEEDED",
+        message: "Rate limited",
+        request_id: "req-rl2",
+        retry_after_ms: 1500,
+      },
+      { "retry-after": "3" },
+    );
+
+    const err = buildProtocolException("Failed", response);
+    expect(err.retryAfterMs).toBe(1500);
   });
 
   it("defaults reasonCode to errorCode when reason_code absent", () => {

@@ -139,6 +139,20 @@ describe("errorResponseFromWire", () => {
     });
   });
 
+  it("parses TENANT_CLOSED wire-format error (runtime spec v0.1.25.13)", () => {
+    const result = errorResponseFromWire({
+      error: "TENANT_CLOSED",
+      message: "Owning tenant is CLOSED",
+      request_id: "req-tc",
+    });
+    expect(result).toEqual({
+      error: "TENANT_CLOSED",
+      message: "Owning tenant is CLOSED",
+      requestId: "req-tc",
+      details: undefined,
+    });
+  });
+
   it("returns undefined for incomplete body", () => {
     expect(errorResponseFromWire({ error: "FOO" })).toBeUndefined();
     expect(errorResponseFromWire({ error: "FOO", message: "bar" })).toBeUndefined();

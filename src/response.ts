@@ -71,6 +71,21 @@ export class CyclesResponse {
     return this.headers["x-cycles-tenant"];
   }
 
+  /**
+   * `Retry-After` header (seconds, per spec) converted to milliseconds.
+   *
+   * Servers send this on 429 `LIMIT_EXCEEDED` rate-limit responses
+   * (runtime spec v0.1.25.12). Returns `undefined` when the header is
+   * absent or not a plain integer (the HTTP-date form is not used by the
+   * spec and is ignored gracefully).
+   */
+  get retryAfterMsHeader(): number | undefined {
+    const val = this.headers["retry-after"];
+    if (val === undefined) return undefined;
+    const seconds = Number(val);
+    return Number.isInteger(seconds) ? seconds * 1000 : undefined;
+  }
+
   get isSuccess(): boolean {
     return this.status >= 200 && this.status < 300;
   }

@@ -12,6 +12,7 @@ import {
   OverdraftLimitExceededError,
   ReservationExpiredError,
   ReservationFinalizedError,
+  TenantClosedError,
 } from "./exceptions.js";
 import type { CyclesResponse } from "./response.js";
 
@@ -49,8 +50,12 @@ export function buildProtocolException(
     reasonCode = errorCode;
   }
 
+  // Body field wins; otherwise fall back to the HTTP Retry-After header
+  // (seconds → ms), which is how 429 LIMIT_EXCEEDED responses carry the
+  // delay per runtime spec v0.1.25.12.
   const retryRaw = response.getBodyAttribute("retry_after_ms");
-  const retryAfterMs = retryRaw !== undefined ? Number(retryRaw) : undefined;
+  const retryAfterMs =
+    retryRaw !== undefined ? Number(retryRaw) : response.retryAfterMsHeader;
 
   const opts = {
     status: response.status,
@@ -72,6 +77,8 @@ export function buildProtocolException(
       return new ReservationExpiredError(message, opts);
     case "RESERVATION_FINALIZED":
       return new ReservationFinalizedError(message, opts);
+    case "TENANT_CLOSED":
+      return new TenantClosedError(message, opts);
     default:
       return new CyclesProtocolError(message, opts);
   }

@@ -430,6 +430,7 @@ try {
     if (err.isReservationFinalized()) { /* ... */ }
     if (err.isIdempotencyMismatch()) { /* ... */ }
     if (err.isUnitMismatch()) { /* ... */ }
+    if (err.isTenantClosed()) { /* ... */ }
 
     // Retry handling
     if (err.isRetryable() && err.retryAfterMs) {
@@ -462,6 +463,7 @@ try {
 | `DebtOutstandingError` | Outstanding debt blocks new reservations |
 | `ReservationExpiredError` | Operating on an expired reservation |
 | `ReservationFinalizedError` | Operating on an already-committed/released reservation |
+| `TenantClosedError` | The owning tenant is CLOSED (HTTP 409 `TENANT_CLOSED`, runtime spec v0.1.25.13); thrown at reservation time by `withCycles` / `reserveForStream` — commit-time client errors are handled/released internally, and `StreamReservation.commit()` throws generic `CyclesError` |
 | `CyclesTransportError` | Exported for use in your own code; never thrown by the SDK — transport failures surface as `status === -1` (see below) |
 
 ### Transport failures (status -1)
@@ -797,7 +799,7 @@ isAllowed(decision);  // true for ALLOW or ALLOW_WITH_CAPS
 isDenied(decision);   // true for DENY
 
 // Error code helpers
-isRetryableErrorCode(errorCode);       // true for INTERNAL_ERROR or UNKNOWN
+isRetryableErrorCode(errorCode);       // true for INTERNAL_ERROR, UNKNOWN, or LIMIT_EXCEEDED (429 rate limiting)
 errorCodeFromString("BUDGET_EXCEEDED"); // ErrorCode.BUDGET_EXCEEDED (or UNKNOWN for unrecognized)
 
 // Caps helpers — check if a tool is allowed given the caps
@@ -846,6 +848,8 @@ ErrorCode.INVALID_REQUEST
 ErrorCode.UNAUTHORIZED
 ErrorCode.FORBIDDEN
 ErrorCode.NOT_FOUND
+ErrorCode.LIMIT_EXCEEDED
+ErrorCode.TENANT_CLOSED
 ErrorCode.INTERNAL_ERROR
 ErrorCode.UNKNOWN
 ```

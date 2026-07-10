@@ -31,6 +31,7 @@ export {
   OverdraftLimitExceededError,
   ReservationExpiredError,
   ReservationFinalizedError,
+  TenantClosedError,
 } from "./exceptions.js";
 
 // Models - Enums

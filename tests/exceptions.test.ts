@@ -8,6 +8,7 @@ import {
   DebtOutstandingError,
   ReservationExpiredError,
   ReservationFinalizedError,
+  TenantClosedError,
 } from "../src/exceptions.js";
 
 describe("exceptions", () => {
@@ -57,6 +58,19 @@ describe("exceptions", () => {
       expect(new DebtOutstandingError("test")).toBeInstanceOf(CyclesProtocolError);
       expect(new ReservationExpiredError("test")).toBeInstanceOf(CyclesProtocolError);
       expect(new ReservationFinalizedError("test")).toBeInstanceOf(CyclesProtocolError);
+      expect(new TenantClosedError("test")).toBeInstanceOf(CyclesProtocolError);
+    });
+
+    it("TenantClosedError is CyclesProtocolError", () => {
+      const err = new TenantClosedError("tenant closed", {
+        status: 409,
+        errorCode: "TENANT_CLOSED",
+      });
+      expect(err).toBeInstanceOf(CyclesProtocolError);
+      expect(err).toBeInstanceOf(CyclesError);
+      expect(err.name).toBe("TenantClosedError");
+      expect(err.isTenantClosed()).toBe(true);
+      expect(err.isRetryable()).toBe(false);
     });
   });
 
@@ -95,6 +109,22 @@ describe("exceptions", () => {
       expect(err.isUnitMismatch()).toBe(true);
     });
 
+    it("isTenantClosed returns true for matching code", () => {
+      const err = new CyclesProtocolError("test", { errorCode: "TENANT_CLOSED" });
+      expect(err.isTenantClosed()).toBe(true);
+      expect(err.isBudgetExceeded()).toBe(false);
+    });
+
+    it("LIMIT_EXCEEDED (HTTP 429 rate limiting) is retryable", () => {
+      const err = new CyclesProtocolError("rate limited", {
+        status: 429,
+        errorCode: "LIMIT_EXCEEDED",
+        retryAfterMs: 3000,
+      });
+      expect(err.isRetryable()).toBe(true);
+      expect(err.retryAfterMs).toBe(3000);
+    });
+
     it("all helpers return false for non-matching error code", () => {
       const err = new CyclesProtocolError("test", { errorCode: "UNKNOWN" });
       expect(err.isBudgetExceeded()).toBe(false);
@@ -104,6 +134,7 @@ describe("exceptions", () => {
       expect(err.isReservationFinalized()).toBe(false);
       expect(err.isIdempotencyMismatch()).toBe(false);
       expect(err.isUnitMismatch()).toBe(false);
+      expect(err.isTenantClosed()).toBe(false);
       expect(err.isRetryable()).toBe(true); // UNKNOWN is retryable
     });
   });
