@@ -82,7 +82,7 @@
     "ajv-formats": "^3.0.1",
     "eslint": "^10.0.3",
     "tsup": "^8.0.0",
-    "typescript": "^6.0.2",
+    "typescript": "^7.0.2",
     "vite": "^8.0.3",
     "vitest": "^4.1.0",
     "yaml": "^2.8.3"
