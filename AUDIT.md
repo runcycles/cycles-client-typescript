@@ -256,3 +256,13 @@ The README's error-handling section imported `CyclesTransportError` and showed a
 **Fix:** converted to pure v4: `type Message` (with `.content`) instead of `UIMessage`, synchronous `convertToCoreMessages(messages)` instead of `await convertToModelMessages(messages)`. The already-v4-correct parts (`usage.promptTokens` / `completionTokens`, `toDataStreamResponse()`) are unchanged, as is all `runcycles` usage (`reserveForStream`, `handle.commit()` / `handle.release()` — previously verified correct). No other files in the example used v5 APIs (verified by grep for `UIMessage`, `convertToModelMessages`, `.parts`, `maxOutputTokens`, `inputTokens`/`outputTokens`).
 
 **Validation:** library `src/` untouched. Example typecheck (`tsc --noEmit`) skipped: `npm install` in the example directory could not complete on the fixing machine (known npm-internal "Exit handler never called" bug). Verified instead by review against the AI SDK v4 API surface (`Message` / `.content`, `convertToCoreMessages`, `usage.promptTokens` / `completionTokens`, `result.toDataStreamResponse()`) and by grep confirming no v5 identifiers remain anywhere in the example.
+
+---
+
+## Publish Pipeline — npm Trusted Publishing (2026-07-21)
+
+**Files:** `.github/workflows/ci.yml`, `package.json`, `CHANGELOG.md`. **No library code changes.**
+
+**Issue:** The publish job authenticated with the long-lived org-level `NPM_TOKEN` secret. The same token expired and broke the `cycles-mcp-server` v0.3.0 release (npm reports an expired token on a scoped package as `E404` on PUT), requiring manual rotation. Any repo publishing with that shared token has the same failure mode.
+
+**Fix:** The publish job now uses npm Trusted Publishing (OIDC): `NODE_AUTH_TOKEN` removed. The job already carried `id-token: write` and `npm install -g npm@latest` (OIDC requires npm >= 11.5.1; Node 20 bundles npm 10), so no other workflow changes were needed. `package.json` `repository.url` normalized to `git+https://github.com/runcycles/cycles-client-typescript.git` via `npm pkg fix` — this is also the exact form npm's trusted-publisher repository check compares against. The trusted publisher for the `runcycles` package must be configured on npmjs.com (GitHub Actions: `runcycles/cycles-client-typescript`, workflow `ci.yml`, no environment) before the next tagged release.

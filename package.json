@@ -6,7 +6,7 @@
   "author": "runcycles",
   "repository": {
     "type": "git",
-    "url": "https://github.com/runcycles/cycles-client-typescript.git"
+    "url": "git+https://github.com/runcycles/cycles-client-typescript.git"
   },
   "homepage": "https://runcycles.io",
   "bugs": {
