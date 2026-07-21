@@ -73,6 +73,9 @@
     "typecheck": "tsc --noEmit -p tsconfig.typecheck.json",
     "prepublishOnly": "npm run lint && npm run build"
   },
+  "overrides": {
+    "esbuild": "^0.28.1"
+  },
   "devDependencies": {
     "@types/node": "^26.0.0",
     "@typescript-eslint/eslint-plugin": "^8.58.0",

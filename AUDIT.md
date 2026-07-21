@@ -266,3 +266,15 @@ The README's error-handling section imported `CyclesTransportError` and showed a
 **Issue:** The publish job authenticated with the long-lived org-level `NPM_TOKEN` secret. The same token expired and broke the `cycles-mcp-server` v0.3.0 release (npm reports an expired token on a scoped package as `E404` on PUT), requiring manual rotation. Any repo publishing with that shared token has the same failure mode.
 
 **Fix:** The publish job now uses npm Trusted Publishing (OIDC): `NODE_AUTH_TOKEN` removed. The job already carried `id-token: write` and `npm install -g npm@latest` (OIDC requires npm >= 11.5.1; Node 20 bundles npm 10), so no other workflow changes were needed. `package.json` `repository.url` normalized to `git+https://github.com/runcycles/cycles-client-typescript.git` via `npm pkg fix` — this is also the exact form npm's trusted-publisher repository check compares against. The trusted publisher for the `runcycles` package must be configured on npmjs.com (GitHub Actions: `runcycles/cycles-client-typescript`, workflow `ci.yml`, no environment) before the next tagged release.
+
+---
+
+## Dependency Advisory — esbuild < 0.28.1 (2026-07-21)
+
+**Files:** `package.json`, `package-lock.json`. **No library code changes** — esbuild is a development-only transitive dependency (via `tsup` and `vite`); nothing ships in `dist/`.
+
+**Issue:** Dependabot alert #9 (low severity): esbuild >= 0.27.3, < 0.28.1 allows arbitrary file read when running the development server on Windows. The lockfile resolved esbuild 0.27.4. No Dependabot PR was possible because `tsup` pins `esbuild ^0.27.0`.
+
+**Fix:** npm `overrides` entry forcing `esbuild ^0.28.1` tree-wide (same fix as `cycles-mcp-server`, 2026-07-21). `npm audit` reports 0 vulnerabilities. Remove the override once `tsup` moves its esbuild range to >= 0.28.
+
+**Verified (2026-07-21):** build (tsup on esbuild 0.28.1), test suite with coverage (99.81% lines / 93.88% branches; 337 passed, 5 skipped) all pass.

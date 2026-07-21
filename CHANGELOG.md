@@ -17,6 +17,10 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.
 - npm publish now uses npm Trusted Publishing (OIDC) instead of the long-lived `NPM_TOKEN` secret (`NODE_AUTH_TOKEN` removed from the publish job; the job already had `id-token: write` and upgrades npm, which OIDC requires at >= 11.5.1). The trusted publisher must be configured for the `runcycles` package on npmjs.com before the next tagged release. Mirrors the same change in `cycles-mcp-server`, whose v0.3.0 release initially failed on an expired token.
 - `package.json` `repository.url` normalized to `git+https://...` per `npm pkg fix`, which also makes it match the exact form npm's trusted-publisher repository check expects.
 
+### Security
+
+- Forced transitive `esbuild` to >= 0.28.1 via npm `overrides`, resolving Dependabot alert #9 (low severity, dev-only: arbitrary file read via the esbuild development server on Windows; `tsup` pins `esbuild ^0.27.0` so no direct range reaches the patched version). Remove the override once `tsup` allows esbuild >= 0.28.
+
 ### Fixed
 
 - README error-handling docs no longer describe `CyclesTransportError` as thrown on network failure — the SDK never constructs it. Reservation-time transport failures surface as `CyclesProtocolError` with `status: -1` (`withCycles` / `reserveForStream`) or as `CyclesResponse` with `isTransportError` / `status: -1` (programmatic client); commit-time failures are retried in the background by `withCycles`, while `StreamReservation.commit()` throws and resets `finalized` for caller retry or release. The class remains exported for use in user code; a new "Transport failures (status -1)" README subsection documents the actual behavior.
