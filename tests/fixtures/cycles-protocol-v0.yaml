@@ -1,11 +1,14 @@
 openapi: 3.1.0
 info:
   title: Cycles Budget Authority API
-  version: 0.1.24
+  version: 0.1.25.15
   license:
     name: Apache 2.0
     url: https://www.apache.org/licenses/LICENSE-2.0
   summary: v0 protocol for deterministic budget governance (reserve/commit) with optional decide + balance queries, plus debt/overdraft support with soft-limit reconciliation.
+  x-changelog:
+    url: ./changelogs/cycles-protocol-v0.md
+    format: keep-a-changelog
   description: |-
     PURPOSE (v0):
       - Provide a minimal, language-agnostic protocol to enforce deterministic spend exposure for agent runtimes
@@ -20,8 +23,24 @@ info:
       - A reservation lifecycle is denominated in exactly one unit (single-unit reserve/commit/release).
         Multi-unit atomic reservation/settlement is a v1+ concern.
 
+    PAYMENT-RAIL TERMINOLOGY BOUNDARY (NORMATIVE):
+      - A Cycles reservation holds spending authority in a budget ledger; it does not hold funds
+        on a card, bank, blockchain, or other payment rail.
+      - A Cycles commit finalizes recorded economic exposure; it does not authorize, capture,
+        charge, or settle a payment on a payment rail.
+      - A Cycles release returns unused budget authority; it does not void or refund a payment.
+      - Implementations that move money MUST execute and reconcile payment-rail operations separately
+        and MUST NOT represent a Cycles lifecycle transition as proof that funds moved or were reversed.
+
     AUTH & TENANCY (NORMATIVE):
-      - Requests are authenticated via X-Cycles-API-Key.
+      - Requests are authenticated via X-Cycles-API-Key, EXCEPT endpoints that
+        explicitly declare `security: []`, which are PUBLIC and require no API key.
+        Two such endpoints exist, both in the CyclesEvidence surface:
+        `GET /v1/evidence/{evidence_id}` (envelope retrieval — its `evidence_id`
+        is an unguessable content-hash capability and the envelope is
+        content-addressed and signed) and `GET /v1/.well-known/cycles-jwks.json`
+        (the signer's public JWK Set — public keys only, the standard posture for
+        a verification key set). See each operation's description for the rationale.
       - Server determines an "effective tenant" from the API key (or other auth context).
       - Subject.tenant is a budgeting dimension and MUST be validated against the effective tenant.
         If mismatched, server MUST return 403 FORBIDDEN.
@@ -48,12 +67,99 @@ info:
         2. During reservation: when the scope is in over-limit state (debt > overdraft_limit due to prior concurrent commits)
       - Outstanding debt blocking reservation MUST return HTTP 409 with error=DEBT_OUTSTANDING
         (when debt > 0 and new reservation is attempted).
+      - Closed owning tenant MUST return HTTP 409 with error=TENANT_CLOSED on the persisting
+        mutation surface — reservation create (POST /v1/reservations with dry_run
+        absent or false), commit, release, extend, AND POST /v1/events (createEvent) — when the
+        owning tenant's status is CLOSED and the CLOSED flip is durable
+        (added to the ErrorCode enum in revision 2026-07-10, mirroring the governance spec's
+        code of the same name). POST /v1/events is a persisting BUDGET DEBIT (post-only
+        accounting that directly mutates remaining/spent on every budgeted derived scope and
+        MAY accrue overdraft debt under overage_policy=ALLOW_WITH_OVERDRAFT, with concurrency
+        semantics as for commit) — it is on the same runtime-plane persisting surface as the
+        reservation mutations and MUST be guarded identically. This is the runtime-plane half
+        of the terminal-owner mutation guard in cycles-governance-admin-v0.1.25.yaml (CASCADE
+        SEMANTICS Rule 2); that section enumerates "any reservation create/commit/release/extend"
+        on the runtime plane, and createEvent is the remaining runtime-plane persisting budget
+        mutation subject to the same Mode B invariant, so the runtime plane guards it on the
+        same basis. Rationale: the close
+        cascade revokes the tenant's API keys, so a closed tenant usually surfaces on this
+        plane as 401 UNAUTHORIZED — but Mode B invariant (a) of that cascade requires that a
+        mutation observed AFTER the CLOSED flip MUST NOT succeed even in the window before
+        keys are revoked; this binding closes that race on the runtime plane.
+        POST /v1/events has no dry_run or decide mode — it always persists — so on a FRESH
+        (non-replay) request the closed-tenant outcome there is the 409 TENANT_CLOSED of the
+        persisting surface; it never returns a decision=DENY. Everything below that the
+        persisting surface inherits — fail-closed on a malformed/undeterminable tenant record
+        (500 INTERNAL_ERROR), the not-applicable case when no governance plane exists, and the
+        idempotent same-key replay exception (a same-key replay of a pre-close event returns the
+        original stored 201 response, taking precedence over the guard exactly as on the
+        reservation surface) — applies to createEvent unchanged.
+        Non-persisting evaluations: POST /v1/reservations with dry_run=true and POST /v1/decide
+        MUST NOT produce HTTP 409 TENANT_CLOSED for a closed owning tenant. A fresh (non-replay)
+        evaluation MUST instead reflect the closed tenant as-if-live: decision=DENY with
+        reason_code=TENANT_CLOSED. (Same-key replays of pre-close evaluations return the
+        original stored response per the IDEMPOTENCY section — replay precedence applies here
+        exactly as on the persisting surface.) Rationale: dry-run and /decide outcomes are attestations of
+        what live execution would do (and MAY be captured as signed evidence per
+        cycles-evidence-v0.2.yaml); an evaluation that ignores a durable CLOSED flip would
+        attest ALLOW for a request whose live execution MUST fail.
+        Guard evaluation (both surfaces): a tenant record with status CLOSED triggers the
+        guard (409 on the persisting surface, decision=DENY on the non-persisting surface); a
+        tenant record that exists but whose status cannot be determined (malformed or corrupt
+        record) MUST fail closed with HTTP 500 INTERNAL_ERROR — on the non-persisting surface
+        too, because the server cannot attest against corrupt governance state; a subject
+        tenant with no tenant record is not guarded (there is no status to observe).
+        Precedence: for non-replay mutations on a closed tenant's reservations,
+        TENANT_CLOSED takes precedence over the reservation-state errors
+        (RESERVATION_FINALIZED, RESERVATION_EXPIRED) — Rule 2 rejects "regardless of
+        that child's own current status". Idempotent replays are the exception: a
+        same-key replay of a mutation that succeeded BEFORE the close retains replay
+        precedence and MUST return the original stored response payload per the
+        IDEMPOTENCY section (consistent with Rule 2's invariant (b) — the cascade is
+        idempotent and does not rewrite already-finalized outcomes).
+        Cross-plane applicability: a deployment that operates a governance plane (tenant
+        records exist) MUST enforce this guard — either by making the owning tenant's
+        CLOSED status observable to the runtime plane, or by enforcing an equivalent
+        post-flip mutation guard at a central enforcement point in front of these
+        operations. The requirement is behavioral (the 409 TENANT_CLOSED rejection),
+        not architectural: choosing not to wire tenant status through to the runtime
+        plane does NOT exempt a deployment. Only deployments with NO governance plane
+        at all (no tenant records exist anywhere in the deployment) have no tenant
+        status to enforce — the rule is not applicable to them.
+        Non-mutating reservation reads (GET /v1/reservations, GET /v1/reservations/{id})
+        MUST NOT be rejected with TENANT_CLOSED: they remain available (subject to normal
+        auth) on reservations of a CLOSED tenant for post-close audit, mirroring Rule 2's
+        read-access rule.
       - Finalized reservations MUST return HTTP 409 with error=RESERVATION_FINALIZED.
       - Expired reservations MUST return HTTP 410 with error=RESERVATION_EXPIRED.
-        (commit/release: beyond expires_at_ms + grace_period_ms; extend: beyond expires_at_ms).
+        (commit/release: beyond expires_at_ms + grace_period_ms; extend: beyond expires_at_ms;
+        getReservation: any reservation whose status is EXPIRED — see that operation's
+        EXPIRY note. Clarified in revision 2026-07-03; previously the parenthetical
+        enumerated only the mutation endpoints, leaving the GET case ambiguous.)
       - Reservations that never existed MUST return HTTP 404 with error=NOT_FOUND.
       - HTTP 429 is reserved for server-side throttling/rate limiting (optional in v0), not deterministic budget exhaustion.
-      - Unit mismatch on commit (actual.unit ≠ reservation unit) or event (actual.unit not supported for the target scope) MUST return HTTP 400 with error=UNIT_MISMATCH.
+        429 responses carry error=LIMIT_EXCEEDED (added to the ErrorCode enum in revision 2026-07-04, mirroring the
+        governance spec's code of the same name) plus the Retry-After and X-RateLimit-Reset headers.
+      - Unit mismatch MUST return HTTP 400 with error=UNIT_MISMATCH in any of these cases:
+          (a) reserve — estimate.unit does not match any budget stored for the derived scopes,
+              but at least one of those scopes has a budget in a different unit;
+          (b) commit — actual.unit differs from the reservation's estimate.unit;
+          (c) event — actual.unit does not match the budget stored for the target scope;
+          (d) decide — estimate.unit does not match any budget stored for the derived scopes,
+              but at least one of those scopes has a budget in a different unit. This is an
+              exception to /decide's general "return decision=DENY (200) without 4xx" pattern,
+              which applies only to budget-state conditions (debt, overdraft, insufficient
+              remaining), not request-validity errors like a wrong unit.
+        When the cause is a wrong unit (rather than the absence of any budget at the scope),
+        servers SHOULD populate the error response's `details` object with:
+          - `scope` — the canonical scope identifier where the mismatch was detected
+          - `requested_unit` — the unit supplied by the client
+          - `expected_units` — array of units for which a budget does exist at that scope
+        so clients can self-correct without a separate lookup. HTTP 404 with error=NOT_FOUND
+        is reserved for the case where the target scope has no budget in ANY unit (the
+        runtime plane uses the single NOT_FOUND code for all resource-not-found conditions;
+        the message field carries the specific reason, e.g. "Budget not found for provided
+        scope: ...").
       - For expiry comparisons, “now” refers to server time (not client-provided time).
       - When is_over_limit=true, server MUST return 409 OVERDRAFT_LIMIT_EXCEEDED for new reservations. 
         This takes precedence over DEBT_OUTSTANDING even when debt > 0.
@@ -107,51 +213,191 @@ info:
           4. Monitor that is_over_limit returns to false
           5. Resume operations automatically
 
-    CHANGELOG:
-      v0.1.24 (2026-03-24):
-        - BREAKING: Changed default CommitOveragePolicy from REJECT to ALLOW_IF_AVAILABLE.
-          Clients relying on implicit REJECT must now set overage_policy explicitly.
-        - Changed ALLOW_IF_AVAILABLE commit behavior: when remaining budget cannot cover
-          the full overage delta, the commit now succeeds with a capped charge
-          (estimate + available remaining) instead of returning 409 BUDGET_EXCEEDED.
-          Scopes where the full delta could not be covered are marked is_over_limit=true,
-          blocking future reservations until reconciled.
-        - Extended is_over_limit semantics: now also set by ALLOW_IF_AVAILABLE when
-          overage delta is capped, in addition to ALLOW_WITH_OVERDRAFT debt scenarios.
-        - Updated CommitResponse.charged description: charged may be less than actual
-          when ALLOW_IF_AVAILABLE caps the overage delta.
-        - Added charged field to EventCreateResponse: optional Amount present when
-          ALLOW_IF_AVAILABLE caps the event charge to remaining budget.
-        - Added ErrorCode values: BUDGET_FROZEN, BUDGET_CLOSED, MAX_EXTENSIONS_EXCEEDED.
-          These were already used by the reference server but missing from the spec enum.
+    CORRELATION AND TRACING (NORMATIVE, cross-plane):
+      This section defines the cross-surface correlation contract for the entire Cycles
+      spec family. It is normative for every Cycles server operation on every plane
+      (runtime, governance-admin, action-kinds, and any extension that layers onto
+      these bases). Companion specs SHOULD carry a brief pointer to this section and
+      MUST NOT restate a conflicting contract.
 
-      v0.1.23 (2026-02-21):
-        - Renamed Subject.toolGroup → Subject.toolset across all endpoints, schemas,
-          and normative text for consistency with scope hierarchy naming conventions.
-        - Added ALLOW_WITH_OVERDRAFT semantics to EventCreateRequest.overage_policy
-          (finding: behavior was previously unspecified for events).
-        - Clarified DecisionResponse.decision description: DENY is a valid live-path
-          outcome on /decide; removed erroneous dry_run framing copied from
-          ReservationCreateResponse.
-        - Added ERROR SEMANTICS precedence rule: when is_over_limit=true, server MUST
-          return 409 OVERDRAFT_LIMIT_EXCEEDED for new reservations, taking precedence
-          over DEBT_OUTSTANDING even when debt > 0.
-        - Added DEBT/OVERDRAFT STATE normative block to /decide: server SHOULD return
-          decision=DENY under debt or over-limit conditions; MUST NOT return 409.
+      Three-tier correlation model:
+        * request_id — one HTTP request grain. Set by the server. Echoed on
+          X-Request-Id response header, on ErrorResponse, and on every event / audit
+          entry that is causally downstream of the request (including entries emitted
+          from queued or deferred work spawned by the request).
+        * trace_id — logical-operation grain. W3C Trace Context-compatible. Accepted
+          from inbound headers or generated by the server. Echoed on X-Cycles-Trace-Id
+          response header and propagated to events, audit entries, and outbound
+          webhook deliveries.
+        * correlation_id — event-stream cluster grain. Set by the server as a
+          deterministic hash over (tenant_id, scope, action_kind_or_risk_class,
+          window, window_key) to JOIN threshold-alert → trip → reset chains and
+          observed_denied ↔ reservation.denied pairs. Scoped to the event stream only.
 
-      v0.1.22 (2026-02-18):
-        - Added overdraft/debt model: ALLOW_WITH_OVERDRAFT overage policy, debt and
-          overdraft_limit fields on Balance, is_over_limit flag, OVERDRAFT_LIMIT_EXCEEDED
-          and DEBT_OUTSTANDING error codes.
-        - Added SignedAmount schema to support negative remaining in overdraft state.
-        - Added OVERDRAFT RECONCILIATION normative section and OVERDRAFT MONITORING
-          guidance section including recommended alerting thresholds and operator runbook.
-        - Added OVER-LIMIT BLOCKING normative block to createReservation.
+      Inbound header precedence (server extracts trace_id by the first matching rule):
+        1. `traceparent` header, if present AND parses as a valid W3C Trace Context
+           value (version 00, non-all-zero trace-id, non-all-zero span-id) → use its
+           trace-id (the leftmost 32-hex segment).
+        2. Else `X-Cycles-Trace-Id` header, if present AND matches `^[0-9a-f]{32}$`
+           AND is not all-zero → use its value directly.
+        3. Else server generates a new trace_id: 16 random bytes encoded as 32
+           lowercase hex characters. The all-zero value is invalid per W3C Trace
+           Context §3.2.2.3 and MUST be re-rolled.
 
-      v0.1.0 → v0.1.21:
-        - Initial protocol definition: reserve/commit/release lifecycle, idempotency,
-          scope derivation, /decide, /balances, /events, dry_run shadow mode,
-          reservation extend/list/get endpoints, soft enforcement via Caps.
+      Header validation and precedence rules:
+        * A malformed `traceparent` OR malformed `X-Cycles-Trace-Id` MUST be treated
+          as absent for that header; the server falls through to the next rule. The
+          server MUST NOT reject a request for a malformed correlation header.
+        * If both `traceparent` and `X-Cycles-Trace-Id` are present, both valid, but
+          their trace-ids DISAGREE, `traceparent` wins (OpenTelemetry interop takes
+          precedence over the flat convenience header). The server MAY log this
+          condition for diagnostics but MUST NOT reject the request.
+
+      Outbound response contract (every plane, every response):
+        * Servers MUST echo `X-Cycles-Trace-Id` on every response (2xx, 4xx, 5xx).
+          The header is declared as `X-Cycles-Trace-Id` in this document's
+          `components.headers` and re-declared in the companion spec's own
+          `components.headers` for OpenAPI tooling conformance.
+        * ErrorResponse bodies MUST carry `trace_id` on every conformant error.
+        * Events and audit-log entries causally downstream of the request MUST
+          carry `trace_id`. See each companion spec's Event / AuditLogEntry schema.
+
+      Propagation contract:
+        * The server propagates trace_id onto: the audit-log entry for the request
+          (one per authenticated request that hits the governance plane), every
+          event emitted as a side effect of the request (runtime or governance),
+          and every outbound webhook delivery. Propagation across thread, queue, or
+          process boundaries is REQUIRED; loss at the request-thread boundary is
+          non-compliant.
+        * Outbound webhook deliveries carry `X-Cycles-Trace-Id` AND `traceparent`
+          headers constructed as documented in the WEBHOOK EVENT GUIDANCE section
+          below (including the trace-flags preservation rule).
+
+      Format: `^[0-9a-f]{32}$` — 32 lowercase hex characters (128-bit trace ID).
+
+      Backward compatibility:
+        * `trace_id` is declared as an OPTIONAL property on ErrorResponse, Event,
+          and AuditLogEntry schemas (no wire-contract break). Servers conformant
+          with this section MUST populate it; clients MUST tolerate its absence on
+          entries emitted by older servers.
+        * Adding `X-Cycles-Trace-Id` as a response header is additive; clients that
+          do not read the header are unaffected.
+        * Accepting `traceparent` / `X-Cycles-Trace-Id` as inbound request headers
+          is additive; clients that do not send them are unaffected.
+
+    WEBHOOK EVENT GUIDANCE (GUIDANCE):
+      Implementations MAY emit webhook events when runtime operations produce observable state changes.
+      This enables operators and tenant applications to react to budget state transitions in real-time
+      without polling. The webhook delivery system is separate from the protocol endpoints — it does not
+      add new API paths to the runtime server.
+
+      Event types emitted by the runtime server:
+        * reservation.denied — Reserve or decide returned DENY (budget exceeded, overdraft limit, frozen, etc.)
+        * reservation.commit_overage — Commit actual amount exceeded estimated amount
+        * reservation.expired — Reservation TTL expired without commit or release (via background sweeper)
+        * budget.exhausted — Remaining budget reached 0 after a reservation or event
+        * budget.debt_incurred — Commit created new debt via ALLOW_WITH_OVERDRAFT policy
+        * budget.over_limit_entered — is_over_limit flipped to true (debt > overdraft_limit)
+        * budget.over_limit_exited — Debt repaid below overdraft_limit (via admin funding operations)
+        * budget.threshold_crossed — Utilization crossed a configured threshold (e.g., 80%, 95%)
+        * budget.burn_rate_anomaly — Spend rate exceeded baseline by configured multiplier
+
+      Event types emitted by the admin/operator server:
+        * tenant.created/updated/suspended/reactivated/closed — Tenant lifecycle
+        * budget.created/updated/funded/debited/reset/debt_repaid/frozen/unfrozen/closed — Budget lifecycle
+        * api_key.created/revoked/expired/permissions_changed/auth_failed — API key lifecycle
+        * policy.created/updated/deleted — Policy lifecycle
+        * system.store_connection_lost/restored, system.high_latency — System health
+        * system.webhook_delivery_failed — Meta-alert for persistent delivery failures
+
+      Standard event payload schema (JSON):
+        * event_id (string, required) — Globally unique (e.g., "evt_01abc..."). Use for deduplication.
+        * event_type (string, required) — Dotted format: "{category}.{action}" (e.g., "reservation.denied")
+        * category (string, required) — One of: budget, reservation, tenant, api_key, policy, system
+        * timestamp (string, date-time, required) — ISO 8601 UTC
+        * tenant_id (string, required) — Tenant context. System events use "__system__".
+        * scope (string, optional) — Full scope path affected (e.g., "tenant:acme/agent:bot")
+        * actor (object, optional) — Who caused the event:
+          { type: admin|api_key|admin_on_behalf_of|system|scheduler, key_id?, source_ip? }
+          (admin_on_behalf_of: admin key exercising a tenant-scoped dual-auth
+          operation; added in revision 2026-07-04, mirroring the governance
+          spec's Event.actor.type enum)
+        * source (string, required) — Service that emitted: "cycles-server", "cycles-admin", "expiry-sweeper"
+        * data (object, optional) — Event-specific payload (varies by event_type)
+        * correlation_id (string, optional) — Links related events for chain reconstruction
+        * request_id (string, optional) — X-Request-Id from the originating HTTP request.
+          MUST be populated on every event causally downstream of an HTTP request,
+          including events emitted from queued, deferred, or otherwise-async work spawned
+          by that request. MAY be absent on internal sweeper/expiry-generated events that
+          have no originating HTTP request. See CORRELATION AND TRACING section below.
+        * trace_id (string, optional, pattern ^[0-9a-f]{32}$) — W3C Trace Context trace-id
+          for the logical operation. Populated on every event produced by a server that
+          conforms to the CORRELATION AND TRACING contract below.
+        * metadata (object, optional) — Operator-defined key-value pairs
+
+      Webhook delivery protocol:
+        * Delivery method: HTTP POST to subscriber's URL with JSON event payload as body
+        * Delivery semantics: At-least-once. Consumers MUST deduplicate using event_id.
+        * Ordering: Events for the same tenant are INITIALLY DISPATCHED in
+          order; cross-tenant ordering NOT guaranteed. Clarified in revision
+          2026-07-04: the ordering guarantee applies to first delivery
+          attempts only. A failed delivery re-enters the queue after its
+          retry backoff, so retried deliveries MAY arrive after later events
+          for the same tenant — an unavoidable consequence of combining
+          per-delivery retry with non-blocking dispatch. Consumers MUST NOT
+          assume strict arrival ordering across retry boundaries; reconstruct
+          order from the event envelope's `timestamp` (and `correlation_id`
+          chains) rather than arrival order.
+        * Non-blocking: Webhook delivery MUST NOT block the operation that produced the event.
+
+      Required HTTP headers on webhook delivery:
+        * Content-Type: application/json
+        * X-Cycles-Event-Id: {event_id} — For deduplication
+        * X-Cycles-Event-Type: {event_type} — For routing
+        * X-Cycles-Signature: sha256={hex} — HMAC-SHA256 of raw request body using subscription's signing secret
+        * X-Cycles-Trace-Id: {trace_id} — W3C Trace Context trace-id (32-hex) for the
+          logical operation that produced this event. Always required; the server always
+          has a trace_id per the CORRELATION AND TRACING fallback-generate rule.
+        * traceparent: 00-{trace_id}-{fresh-span-id-16-hex}-{trace-flags} — W3C Trace
+          Context version 00 header. Always required. trace_id MUST equal the value in
+          X-Cycles-Trace-Id. span-id MUST be freshly generated for the outbound delivery
+          (NOT reused from inbound). trace-flags rules:
+            - If the inbound request to Cycles carried a valid `traceparent`, the server
+              MUST preserve the inbound trace-flags byte on the outbound `traceparent`
+              (so a `sampled=0` upstream is not silently flipped to `sampled=1`).
+            - If the trace was derived from `X-Cycles-Trace-Id` (no inbound W3C
+              `traceparent`) OR generated fresh by the server, the server uses a default
+              trace-flags value of `01` (sampled).
+          The `trace_id` field also appears in the event envelope body so subscribers
+          unfamiliar with W3C Trace Context can still correlate via the JSON payload.
+        * User-Agent: {service-name}/{version}
+        * Custom headers from subscription configuration (e.g., Authorization)
+
+      Signature verification (X-Cycles-Signature):
+        * Algorithm: HMAC-SHA256
+        * Input: Raw JSON request body (bytes, not parsed)
+        * Key: Subscription's signing_secret (UTF-8 encoded)
+        * Format: "sha256=" + lowercase hex encoding of HMAC digest
+        * Consumers SHOULD verify the signature before processing the event.
+        * Use constant-time comparison (e.g., hmac.compare_digest) to prevent timing attacks.
+
+      Retry and failure handling:
+        * On non-2xx response: exponential backoff retry (default: 5 retries, 1s/2s/4s/8s/16s, max 60s)
+        * After all retries exhausted: delivery marked FAILED, system.webhook_delivery_failed event emitted
+        * After N consecutive failures (default 10): subscription auto-disabled (status → DISABLED)
+        * Disabled subscriptions can be re-enabled via admin API (resets failure counter)
+
+      Retention:
+        * Event records: 90 days hot storage (recommended). TTL enforced via Redis EXPIRE.
+        * Delivery records: 14 days (operational debugging data).
+        * ZSET index entries: Trimmed hourly by background cleanup job.
+        * Stale deliveries: Deliveries older than 24h (configurable) are auto-failed on pickup
+          to prevent delivering ancient webhooks after prolonged service outage.
+
+      Extensibility:
+        * New event types MAY be added in future versions without a breaking change.
+        * Consumers MUST ignore unrecognized event types gracefully.
+        * Custom event types MUST use a "custom." prefix (e.g., "custom.billing.invoice_sent").
 
 servers:
   - url: https://api.cycles.local
@@ -166,6 +412,8 @@ tags:
     description: Query balances for operator visibility
   - name: Events
     description: Optional post-only accounting for non-estimable actions
+  - name: Evidence
+    description: Public retrieval of signed CyclesEvidence envelopes by content id
 
 security:
   - ApiKeyAuth: []
@@ -176,18 +424,52 @@ components:
       type: apiKey
       in: header
       name: X-Cycles-API-Key
+    # Added 2026-04-13 for admin-on-behalf-of access on a small set of
+    # ops-critical reservation endpoints (list / get / release). Same
+    # header the governance-admin spec already uses, so admin operators
+    # can authenticate against the runtime plane with one key.
+    AdminKeyAuth:
+      type: apiKey
+      in: header
+      name: X-Admin-API-Key
 
   headers:
     X-Request-Id:
       description: Unique request identifier for debugging
       schema:
         type: string
+    X-Cycles-Trace-Id:
+      description: >-
+        W3C Trace Context-compatible correlation identifier echoed on every
+        response (2xx, 4xx, 5xx) on every plane. 32 lowercase hex characters
+        (128-bit trace ID, matching the W3C Trace Context trace-id field).
+        Links the request, its audit entry, all side-effect events, and any
+        outbound webhook deliveries produced by the request. See the
+        "CORRELATION AND TRACING" section of this document's `info.description`
+        for inbound-header precedence, fallback-generation rules, and
+        cross-surface propagation contract.
+      schema:
+        type: string
+        pattern: ^[0-9a-f]{32}$
     X-RateLimit-Remaining:
       description: Number of requests remaining in current window (optional in v0)
       schema:
         type: integer
     X-RateLimit-Reset:
       description: Unix timestamp (seconds) when rate limit resets (optional in v0)
+      schema:
+        type: integer
+        format: int64
+    Cache-Control:
+      description: >-
+        Caching directive. For content-addressed responses (e.g. getEvidence)
+        the server SHOULD return `public, immutable` — the body never changes.
+      schema:
+        type: string
+    Retry-After:
+      description: >-
+        On 429, the number of seconds a client SHOULD wait before retrying
+        (optional in v0).
       schema:
         type: integer
         format: int64
@@ -218,6 +500,15 @@ components:
         minLength: 1
         maxLength: 128
 
+    EvidenceId:
+      name: evidence_id
+      in: path
+      required: true
+      description: sha256 content hash of the CyclesEvidence envelope (64 lowercase hex chars).
+      schema:
+        type: string
+        pattern: '^[0-9a-f]{64}$'
+
     Limit:
       name: limit
       in: query
@@ -243,12 +534,192 @@ components:
       headers:
         X-Request-Id:
           $ref: '#/components/headers/X-Request-Id'
+        X-Cycles-Trace-Id:
+          $ref: '#/components/headers/X-Cycles-Trace-Id'
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
 
   schemas:
+    CyclesEvidenceEnvelope:
+      type: object
+      additionalProperties: true
+      description: >-
+        A signed CyclesEvidence envelope returned by `getEvidence`. The
+        NORMATIVE definition — field semantics and the JCS content-hash +
+        Ed25519 signature derivation — lives in
+        `cycles-evidence-v0.2.yaml`; this schema mirrors its required
+        shape for the serving endpoint. The envelope is content-addressed
+        (`evidence_id` = sha256 of the JCS-canonical bytes with `evidence_id`
+        and `signature` emptied) and self-verifying, so a consumer can check
+        it offline without trusting this server.
+      required:
+        - schema_version
+        - artifact_type
+        - server_id
+        - signer_did
+        - issued_at_ms
+        - payload
+        - evidence_id
+        - signature
+      properties:
+        schema_version:
+          type: string
+          const: cycles-evidence/v0.1
+        artifact_type:
+          type: string
+          enum: [decide, reserve, commit, release, error]
+        server_id:
+          type: string
+          description: Stable URI of the issuing Cycles server.
+        signer_did:
+          type: string
+          description: Ed25519 public key (v0.1 hex) the signature verifies against.
+        issued_at_ms:
+          type: integer
+          format: int64
+        trace_id:
+          type: string
+        payload:
+          type: object
+          description: One key matching artifact_type (decide/reserve/commit/release/error).
+        evidence_id:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        signature:
+          type: string
+          pattern: '^[0-9a-f]{128}$'
+
+    CyclesEvidenceJwks:
+      type: object
+      additionalProperties: true
+      description: >-
+        The issuing server's signer key set, returned by `getEvidenceJwks`. An
+        RFC 7517 JWK Set (extra top-level members allowed and ignored). The
+        NORMATIVE resolution algorithm — `did:cycles` binding, the
+        validity-window key selection (pick the key whose
+        `[cycles_nbf_ms, cycles_exp_ms)` covers the envelope's `issued_at_ms`,
+        never "the current key"), the deterministic-selection rules, and the
+        verification dispositions — lives in `cycles-evidence-v0.2.yaml`;
+        this schema mirrors its required shape for the serving endpoint.
+      required: [keys]
+      properties:
+        keys:
+          type: array
+          items: {$ref: '#/components/schemas/CyclesEvidenceJwk'}
+
+    CyclesEvidenceJwk:
+      type: object
+      additionalProperties: true
+      description: >-
+        One Ed25519 signing key with a Cycles validity window. RFC 7517 /
+        RFC 8037 (OKP/Ed25519) JWK plus the `cycles_*` members. A retired key
+        MUST remain in the set so envelopes signed before a rotation still
+        verify. See `cycles-evidence-v0.2.yaml` for full semantics.
+      required: [kty, crv, x, kid, cycles_nbf_ms]
+      properties:
+        kty:
+          type: string
+          const: OKP
+        crv:
+          type: string
+          const: Ed25519
+        alg:
+          type: string
+          const: EdDSA
+          description: >-
+            Optional (RFC 7517 §4.4); if present MUST be `EdDSA`. A
+            present-but-different `alg` makes the JWK invalid (excluded).
+        x:
+          type: string
+          description: >-
+            base64url (unpadded) of the raw 32-byte Ed25519 public key. Equals
+            `base64url(hex-decode(signer_did))` for a raw-hex `signer_did`.
+        kid:
+          type: string
+          description: >-
+            Stable key id; equals the `#<kid>` fragment of a `did:cycles`
+            `signer_did`.
+        cycles_nbf_ms:
+          type: integer
+          format: int64
+          description: Valid-from, epoch ms, INCLUSIVE.
+        cycles_exp_ms:
+          type: [integer, "null"]
+          format: int64
+          description: Valid-until, epoch ms, EXCLUSIVE. Absent/null ⇒ active (open-ended).
+        status:
+          type: string
+          enum: [active, retired]
+          description: >-
+            Advisory only. Selection is by validity WINDOW, never by `status`.
+
+    CyclesEvidenceRef:
+      type: object
+      additionalProperties: false
+      description: >-
+        Reference to the CyclesEvidence envelope emitted for an operation. The
+        `evidence_id` is the sha256 content hash of the JCS-canonical envelope
+        and is computed SYNCHRONOUSLY at decision time, so it is returned on the
+        operation response even though the envelope is Ed25519-signed and stored
+        ASYNCHRONOUSLY. A caller (e.g. an APS gateway) binds its own signed
+        receipt to this evidence by recording `evidence_id`, then fetches the
+        envelope at `cycles_evidence_url` (see `getEvidence`) to verify it
+        offline. Because signing/storage is async, the envelope MAY be served
+        shortly after this response — consumers SHOULD treat a transient `404`
+        from `getEvidence` as not-yet-available and retry.
+
+
+        TRANSPORT METADATA, NOT ATTESTED: `cycles_evidence` is added to the
+        response for the caller's convenience and is NOT part of the evidence
+        the envelope attests. The `evidence_id` is computed over the operation
+        response WITHOUT this field — the envelope's `payload.<artifact>.response`
+        mirror (`cycles-evidence-v0.2.yaml`) keeps `additionalProperties:
+        false` and omits `cycles_evidence` precisely so the content hash is
+        never self-referential. Implementations MUST compute `evidence_id`
+        before stamping `cycles_evidence` onto the response, and MUST NOT
+        include `cycles_evidence` in the attested payload.
+      required: [evidence_id, cycles_evidence_url]
+      properties:
+        evidence_id:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: sha256 content id of the emitted envelope; resolve via getEvidence.
+        cycles_evidence_url:
+          type: string
+          format: uri
+          description: >-
+            Absolute URL of the signed envelope, formed as
+            `{server_id}/evidence/{evidence_id}`. Note `server_id` is already the
+            canonical deployment base INCLUDING the `/v1` prefix (e.g.
+            `https://cycles.example.com/v1`), so the join adds only
+            `/evidence/{evidence_id}` — it MUST NOT re-add `/v1`.
+
+    ReservationEvidence:
+      type: object
+      additionalProperties: false
+      description: >-
+        Map of artifact type to the CyclesEvidence reference emitted for that
+        operation on a reservation. Lets a consumer jump from a reservation
+        straight to its signed envelope(s) via `getEvidence` without having
+        captured the `evidence_id` off the original reserve / commit / release
+        response. Keys are the reservation-applicable artifact types: a
+        reservation has at most a `reserve` entry plus one terminal entry
+        (`commit` XOR `release`). TRANSPORT METADATA, NOT ATTESTED (see
+        `CyclesEvidenceRef`) — each entry is recorded after its artifact's
+        `evidence_id` was computed and is not part of any attested payload.
+      properties:
+        reserve:
+          $ref: '#/components/schemas/CyclesEvidenceRef'
+          description: Evidence emitted for the reserve operation, if any.
+        commit:
+          $ref: '#/components/schemas/CyclesEvidenceRef'
+          description: Evidence emitted for the commit operation (COMMITTED reservations).
+        release:
+          $ref: '#/components/schemas/CyclesEvidenceRef'
+          description: Evidence emitted for the release operation (RELEASED reservations).
+
     IdempotencyKey:
       type: string
       minLength: 1
@@ -271,12 +742,19 @@ components:
         - OVERDRAFT_LIMIT_EXCEEDED
         - DEBT_OUTSTANDING
         - MAX_EXTENSIONS_EXCEEDED
+        - LIMIT_EXCEEDED
+        - TENANT_CLOSED
         - INTERNAL_ERROR
 
     ErrorResponse:
       type: object
       required: [error, message, request_id]
       additionalProperties: false
+      example:
+        error: BUDGET_EXCEEDED
+        message: Insufficient remaining budget for scope tenant:acme-corp
+        request_id: req_abc123def456
+        trace_id: 4bf92f3577b34da6a3ce929d0e0e4736
       properties:
         error:
           $ref: '#/components/schemas/ErrorCode'
@@ -284,13 +762,110 @@ components:
           type: string
         request_id:
           type: string
+        trace_id:
+          type: string
+          pattern: ^[0-9a-f]{32}$
+          description: >-
+            W3C Trace Context-compatible correlation identifier. 32 lowercase
+            hex characters (128-bit trace ID, matching the W3C Trace Context
+            trace-id field in the `traceparent` header). Links this error
+            response to the request that triggered it and to any events /
+            audit entries emitted before the error was returned. Optional on
+            the wire for forward compatibility with historical responses
+            emitted by servers older than the first release that populated
+            this field, but servers conformant with the CORRELATION AND
+            TRACING contract MUST populate it on every error response. See
+            the "CORRELATION AND TRACING" section of this document's
+            `info.description` for header formats and propagation rules.
         details:
           type: object
           additionalProperties: true
+        cycles_evidence:
+          $ref: '#/components/schemas/CyclesEvidenceRef'
+          description: >-
+            Reference to the CyclesEvidence envelope emitted for this error
+            (artifact_type `error`). Present when the server emitted an `error`
+            CyclesEvidence record for this response — most importantly the
+            non-dry reserve denials that surface as HTTP 409 `BUDGET_EXCEEDED`
+            (and the other live denial codes), which are the highest-signal
+            evidence an APS receipt can bind to. A denied caller reads
+            `evidence_id` to bind its own signed receipt to this denial, then
+            fetches the envelope at `cycles_evidence_url` (see `getEvidence`).
+            Absent when evidence emission is disabled on the server, or for
+            errors raised before evidence could be emitted (e.g. request
+            validation / auth failures). TRANSPORT METADATA, NOT ATTESTED — as
+            with the success responses, `evidence_id` is computed over the
+            `ErrorResponse` body WITHOUT this field (the `error` artifact's
+            `payload.error.response` mirror omits it); see `CyclesEvidenceRef`.
 
     DecisionEnum:
       type: string
       enum: [ALLOW, ALLOW_WITH_CAPS, DENY]
+
+    DecisionReasonCode:
+      type: string
+      maxLength: 128
+      description: >-
+        Stable machine-readable reason for why a /decide call or a reservation
+        returned decision=DENY. Populated on DecisionResponse.reason_code and on
+        ReservationCreateResponse.reason_code. The human-readable `message` field
+        on the parent response (when present) may carry additional context.
+
+        EXTENSIBILITY (NORMATIVE):
+          DecisionReasonCode is intentionally an OPEN string (not a closed enum)
+          so that:
+            (a) future minor versions of this base spec can add new values without
+                a breaking change, and
+            (b) companion extension specs (e.g., cycles-protocol-extensions-v0.1.26.yaml)
+                can define additional reason codes without modifying the base schema.
+          Clients MUST gracefully handle unknown values — log them and map to
+          generic DENY handling (i.e., "the request was denied; treat as a terminal
+          failure even if we don't recognize the specific reason").
+
+        KNOWN VALUES (v0.1.25 base):
+          - BUDGET_EXCEEDED — remaining amount insufficient on at least one derived scope
+            (evaluated against the requested estimate.amount).
+          - BUDGET_FROZEN — a derived scope has a budget in FROZEN status
+            (operator-set, no mutations allowed).
+          - BUDGET_CLOSED — a derived scope has a budget in CLOSED status
+            (permanently closed).
+          - BUDGET_NOT_FOUND — no budget exists at any derived scope in the requested unit.
+            On non-dry reserve and /v1/events paths this same condition surfaces as HTTP
+            404 with error=NOT_FOUND instead.
+          - OVERDRAFT_LIMIT_EXCEEDED — either (a) debt + delta > overdraft_limit on commit,
+            or (b) the scope is in over-limit state (is_over_limit=true) and no new
+            reservations are permitted until reconciled.
+          - DEBT_OUTSTANDING — a derived scope has debt > 0 and overdraft_limit == 0
+            (no policy permits further debt accrual).
+          - TENANT_CLOSED — the owning tenant's status is CLOSED (deployments with a
+            governance plane; added in revision 2026-07-10). Populated on /decide and
+            dry_run=true evaluations; the persisting mutation surface reports the same
+            condition as HTTP 409 error=TENANT_CLOSED instead (see the closed-tenant
+            binding in ERROR SEMANTICS).
+
+        KNOWN VALUES (v0.1.26 runtime extension):
+          - ACTION_QUOTA_EXCEEDED — a per-kind or risk-class action quota rule was
+            exceeded for the target scope and window.
+          - ACTION_KIND_DENIED — the action kind is in the matching policy's
+            denied_action_kinds list.
+          - ACTION_KIND_NOT_ALLOWED — the matching policy has a non-empty
+            allowed_action_kinds list and the action kind is not in it.
+          See cycles-protocol-extensions-v0.1.26.yaml for full semantics,
+          evaluation order, and DenyDetail structure (populated alongside
+          reason_code for v0.1.26 denials).
+
+        Distinct from the `ErrorCode` enum: reason codes appear only on 200 OK
+        responses with decision=DENY; ErrorCodes appear only on 4xx/5xx responses
+        with an `error` field. Some labels overlap (e.g. BUDGET_EXCEEDED appears
+        in both sets) because the same underlying condition is reported two ways
+        depending on the endpoint: /decide and dry_run surface it as a non-4xx
+        DENY decision, while non-dry reserve surfaces it as a 409 error.
+
+        SDK GENERATION GUIDANCE:
+          Codegen tools SHOULD generate a string type (not a strict enum) and
+          expose the known values above as constants or string literal union
+          members for ergonomic use. SDK code MUST NOT reject unknown values
+          at the deserialization boundary.
 
     UnitEnum:
       type: string
@@ -306,10 +881,28 @@ components:
         CREDITS/RISK_POINTS are generic integer units (optional in v0 implementations).
       enum: [USD_MICROCENTS, TOKENS, CREDITS, RISK_POINTS]
 
+    SortDirection:
+      type: string
+      enum: [asc, desc]
+      default: desc
+      description: >-
+        Sort direction for list endpoints. Used with per-endpoint
+        `sort_by` parameters (introduced in revision 2026-04-16 on
+        listReservations). When `sort_by` is provided but `sort_dir`
+        is omitted, servers MUST default to "desc". Servers that do
+        not recognize the parameter MUST ignore it without error
+        (additive-parameter guarantee). This schema is carried
+        inline in each spec of the family (protocol + governance);
+        the companion-specs publication model does not use cross-spec
+        $ref.
+
     Amount:
       type: object
       required: [unit, amount]
       additionalProperties: false
+      example:
+        unit: USD_MICROCENTS
+        amount: 500000
       properties:
         unit:
           $ref: '#/components/schemas/UnitEnum'
@@ -324,6 +917,9 @@ components:
       additionalProperties: false
       description: >-
         Like Amount, but allows negative values. Used for Balance.remaining which can be negative in overdraft scenarios.
+      example:
+        unit: USD_MICROCENTS
+        amount: -120000
       properties:
         unit:
           $ref: '#/components/schemas/UnitEnum'
@@ -340,6 +936,16 @@ components:
         Dimension bag for hierarchical budgets. At least one standard field (tenant, workspace, app, workflow, agent, or toolset) MUST be provided.
         A subject containing only `dimensions` is invalid; server MUST return 400 INVALID_REQUEST. 
         Hierarchy: tenant → workspace → app → workflow → agent → toolset.
+
+        CHARSET (NORMATIVE, revision 2026-07-03):
+        - Standard-field values (tenant/workspace/app/workflow/agent/toolset)
+          SHOULD match ^[a-zA-Z0-9_.-]+$. Canonical scope identifiers and scope
+          paths use ":" and "/" as structural delimiters, so delimiter,
+          whitespace, and control characters have no stable canonical encoding.
+        - Servers MAY reject standard-field values outside this pattern with
+          400 INVALID_REQUEST (the reference implementation does). Clients
+          MUST NOT rely on out-of-pattern values being accepted, and portable
+          clients SHOULD restrict themselves to the pattern above.
 
         EXTENSIBILITY (v0):
         - dimensions is an optional, user-defined map for alternative taxonomies
@@ -461,6 +1067,11 @@ components:
       type: object
       required: [decision]
       additionalProperties: false
+      example:
+        decision: ALLOW
+        affected_scopes:
+          - "tenant:acme-corp"
+          - "tenant:acme-corp/workspace:prod"
       properties:
         decision:
           $ref: '#/components/schemas/DecisionEnum'
@@ -473,9 +1084,7 @@ components:
           $ref: '#/components/schemas/Caps'
           description: Present only when decision=ALLOW_WITH_CAPS; MUST be absent otherwise.
         reason_code:
-          type: string
-          maxLength: 128
-          description: Stable machine-readable reason (extensible).
+          $ref: '#/components/schemas/DecisionReasonCode'
         retry_after_ms:
           type: integer
           minimum: 0
@@ -484,6 +1093,12 @@ components:
           items:
             type: string
           description: Canonical scope identifiers impacted by this decision, in canonical order.
+        cycles_evidence:
+          $ref: '#/components/schemas/CyclesEvidenceRef'
+          description: >-
+            Reference to the CyclesEvidence envelope emitted for this decision
+            (artifact_type `decide`, present on ALLOW / ALLOW_WITH_CAPS / DENY).
+            Absent only when evidence emission is disabled on the server.
 
     # ---- Reservations (core) ----
     CommitOveragePolicy:
@@ -526,6 +1141,19 @@ components:
       type: object
       required: [idempotency_key, subject, action, estimate]
       additionalProperties: false
+      example:
+        idempotency_key: "idem_20260412_run42_step1"
+        subject:
+          tenant: acme-corp
+          workspace: prod
+          agent: summarizer
+        action:
+          kind: llm.completion
+          name: summarize-document
+        estimate:
+          unit: USD_MICROCENTS
+          amount: 500000
+        ttl_ms: 30000
       properties:
         idempotency_key:
           $ref: '#/components/schemas/IdempotencyKey'
@@ -576,6 +1204,21 @@ components:
       type: object
       required: [scope, scope_path, remaining]
       additionalProperties: false
+      example:
+        scope: "tenant:acme-corp/workspace:prod"
+        scope_path: "tenant:acme-corp/workspace:prod"
+        remaining:
+          unit: USD_MICROCENTS
+          amount: 4577000
+        reserved:
+          unit: USD_MICROCENTS
+          amount: 500000
+        spent:
+          unit: USD_MICROCENTS
+          amount: 423000
+        allocated:
+          unit: USD_MICROCENTS
+          amount: 5500000
       description: >-
         Ledger state for a single (scope, unit) balance.
 
@@ -655,6 +1298,18 @@ components:
       type: object
       required: [decision, affected_scopes]
       additionalProperties: false
+      example:
+        decision: ALLOW
+        reservation_id: "rsv_a1b2c3d4"
+        reserved:
+          unit: USD_MICROCENTS
+          amount: 500000
+        expires_at_ms: 1712956830000
+        scope_path: "tenant:acme-corp/workspace:prod/agent:summarizer"
+        affected_scopes:
+          - "tenant:acme-corp"
+          - "tenant:acme-corp/workspace:prod"
+          - "tenant:acme-corp/workspace:prod/agent:summarizer"
       properties:
         decision:
           $ref: '#/components/schemas/DecisionEnum'
@@ -684,11 +1339,16 @@ components:
           items:
             $ref: '#/components/schemas/Balance'
         reason_code:
-          type: string
-          maxLength: 128
+          $ref: '#/components/schemas/DecisionReasonCode'
         retry_after_ms:
           type: integer
           minimum: 0
+        cycles_evidence:
+          $ref: '#/components/schemas/CyclesEvidenceRef'
+          description: >-
+            Reference to the CyclesEvidence envelope emitted for this reserve
+            (present on both ALLOW and DENY outcomes). Absent only when evidence
+            emission is disabled on the server.
 
     StandardMetrics:
       type: object
@@ -722,6 +1382,16 @@ components:
       type: object
       required: [idempotency_key, actual]
       additionalProperties: false
+      example:
+        idempotency_key: "idem_20260412_run42_step1_commit"
+        actual:
+          unit: USD_MICROCENTS
+          amount: 423000
+        metrics:
+          tokens_input: 1500
+          tokens_output: 800
+          latency_ms: 2340
+          model_version: claude-sonnet-4-20250514
       properties:
         idempotency_key:
           $ref: '#/components/schemas/IdempotencyKey'
@@ -754,6 +1424,12 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/Balance'
+        cycles_evidence:
+          $ref: '#/components/schemas/CyclesEvidenceRef'
+          description: >-
+            Reference to the CyclesEvidence envelope emitted for this commit
+            (artifact_type `commit`). Absent only when evidence emission is
+            disabled on the server.
 
     ReleaseRequest:
       type: object
@@ -780,6 +1456,12 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/Balance'
+        cycles_evidence:
+          $ref: '#/components/schemas/CyclesEvidenceRef'
+          description: >-
+            Reference to the CyclesEvidence envelope emitted for this release
+            (artifact_type `release`). Absent only when evidence emission is
+            disabled on the server.
 
     ReservationDetail:
       type: object
@@ -821,6 +1503,13 @@ components:
         finalized_at_ms:
           type: integer
           format: int64
+          description: >-
+            Wall-clock time at which the reservation reached a terminal
+            state. Populated on COMMITTED and RELEASED rows only;
+            absent on ACTIVE and EXPIRED rows. The `finalized_from` /
+            `finalized_to` window filter on `listReservations`
+            (revision 2026-05-22) operates against this same field
+            with the same population semantics.
         scope_path:
           type: string
           description: Canonical scope path (server-derived)
@@ -832,6 +1521,28 @@ components:
         metadata:
           type: object
           additionalProperties: true
+          description: >-
+            Metadata supplied at RESERVE time (on the create-reservation
+            request), if any. For metadata attached at COMMIT time see
+            `committed_metadata`.
+        committed_metadata:
+          type: object
+          additionalProperties: true
+          description: >-
+            Metadata supplied on the COMMIT request (`CommitRequest.metadata`),
+            preserved on the reservation record. Present on COMMITTED rows whose
+            commit carried metadata; absent otherwise. Distinct from `metadata`,
+            which is captured at reserve time.
+        evidence:
+          $ref: '#/components/schemas/ReservationEvidence'
+          description: >-
+            CyclesEvidence references for this reservation's operations
+            (reserve / commit / release), keyed by artifact type, so a consumer
+            can resolve the signed envelope(s) via `getEvidence` without having
+            captured the `evidence_id` off the original response. Present when
+            the reservation has recorded evidence; absent when evidence emission
+            is disabled on the server or the reservation predates evidence
+            support. Added in revision 2026-06-22.
 
     BalanceResponse:
       type: object
@@ -950,12 +1661,74 @@ components:
           type: integer
           format: int64
           minimum: 0
+        finalized_at_ms:
+          type: integer
+          format: int64
+          minimum: 0
+          description: >-
+            Wall-clock time at which the reservation reached a terminal
+            state. Populated on COMMITTED and RELEASED rows only;
+            absent on ACTIVE and EXPIRED rows. OPTIONAL per the
+            `additionalProperties: false` invariant — older summaries
+            sent without this field remain valid. Mirrors the same field
+            on `ReservationDetail`. Added in revision 2026-05-22 to
+            support the `finalized_from` / `finalized_to` window filter
+            on `listReservations`.
         scope_path:
           type: string
         affected_scopes:
           type: array
           items:
             type: string
+        committed:
+          $ref: '#/components/schemas/Amount'
+          description: >-
+            The amount charged at COMMIT, mirrored from
+            `ReservationDetail.committed`. Present on COMMITTED rows only;
+            absent on ACTIVE, EXPIRED, and RELEASED rows. Returned
+            UNCONDITIONALLY on list rows (no `include` opt-in required) —
+            it is a small scalar core to a reservation listing, on the
+            same footing as `finalized_at_ms`. OPTIONAL per the
+            `additionalProperties: false` invariant — older summaries
+            sent without this field remain valid. Added in revision
+            2026-06-19.
+        metadata:
+          type: object
+          additionalProperties: true
+          description: >-
+            RESERVE-time metadata (see `ReservationDetail.metadata`). On
+            `listReservations` responses this is OMITTED BY DEFAULT and
+            populated ONLY when the caller opts in with `include=metadata`
+            — the map is arbitrary-size and may carry application PII, so
+            it is not projected onto every list row unconditionally.
+            Always present (when the reservation carried reserve-time
+            metadata) on the single-row `ReservationDetail`. OPTIONAL;
+            absent when not requested or when there was no reserve-time
+            metadata. Added in revision 2026-06-19.
+        committed_metadata:
+          type: object
+          additionalProperties: true
+          description: >-
+            COMMIT-time metadata (see `ReservationDetail.committed_metadata`).
+            On `listReservations` responses this is OMITTED BY DEFAULT and
+            populated ONLY when the caller opts in with
+            `include=committed_metadata` — same payload-size / PII
+            rationale as `metadata`. Always present (on COMMITTED rows
+            whose commit carried metadata) on the single-row
+            `ReservationDetail`. OPTIONAL; absent when not requested, on
+            non-COMMITTED rows, or when the commit carried no metadata.
+            Added in revision 2026-06-19.
+        evidence:
+          $ref: '#/components/schemas/ReservationEvidence'
+          description: >-
+            CyclesEvidence references for the operations performed on this
+            reservation (reserve / commit / release), keyed by artifact type.
+            On `listReservations` this is OMITTED BY DEFAULT and populated ONLY
+            when the caller opts in with `include=evidence`. Always present
+            (when the reservation has recorded evidence) on the single-row
+            `ReservationDetail`. OPTIONAL; absent when not requested, when
+            evidence emission is disabled, or for reservations that predate
+            evidence support. Added in revision 2026-06-22.
 
     ReservationListResponse:
       type: object
@@ -1018,6 +1791,7 @@ paths:
     post:
       tags: [Decisions]
       operationId: decide
+      x-conformance: normative
       summary: Optional preflight policy decision (no reservation created)
       description: >-
         Returns ALLOW / DENY, optionally with Caps for soft landing. This endpoint does not reserve budget. Clients that require
@@ -1030,9 +1804,19 @@ paths:
         - subject.tenant MUST match the effective tenant derived from auth; otherwise the server MUST return 403 FORBIDDEN.
         
         DEBT/OVERDRAFT STATE (NORMATIVE):
-        - If the subject scope has debt > 0 or is_over_limit=true, server SHOULD return 
-        decision=DENY with reason_code=DEBT_OUTSTANDING or reason_code=OVERDRAFT_LIMIT_EXCEEDED 
+        - If the subject scope has debt > 0 or is_over_limit=true, server SHOULD return
+        decision=DENY with reason_code=DEBT_OUTSTANDING or reason_code=OVERDRAFT_LIMIT_EXCEEDED
         respectively. Server MUST NOT return 409 for these conditions on /decide.
+
+        CLOSED TENANT (NORMATIVE):
+        - If the owning tenant's status is CLOSED (deployments with a governance plane),
+          a fresh (non-replay) evaluation MUST return decision=DENY with
+          reason_code=TENANT_CLOSED, reflecting as-if-live the 409 TENANT_CLOSED the
+          persisting mutation surface returns (same-key replays of pre-close decisions
+          follow the IDEMPOTENCY rule above and the replayed-decision caveat below).
+          Server MUST NOT return 409 for this condition on /decide. A tenant record whose
+          status cannot be determined (malformed record) MUST fail closed with 500
+          INTERNAL_ERROR — see the closed-tenant binding in ERROR SEMANTICS.
 
         Idempotency on /decide is for request deduplication only. A replayed ALLOW response reflects budget state at the time of 
         the original call; clients MUST NOT treat a replayed decision as current budget authorization.
@@ -1048,6 +1832,7 @@ paths:
           description: Decision result
           headers:
             X-Request-Id: {$ref: '#/components/headers/X-Request-Id'}
+            X-Cycles-Trace-Id: {$ref: '#/components/headers/X-Cycles-Trace-Id'}
             X-Cycles-Tenant: {$ref: '#/components/headers/X-Cycles-Tenant'}
             X-RateLimit-Remaining: {$ref: '#/components/headers/X-RateLimit-Remaining'}
             X-RateLimit-Reset: {$ref: '#/components/headers/X-RateLimit-Reset'}
@@ -1064,6 +1849,7 @@ paths:
     post:
       tags: [Reservations]
       operationId: createReservation
+      x-conformance: normative
       summary: Reserve budget for a planned action (concurrency-safe)
       description: >-
         Atomically reserves the estimated amount across server-derived scopes and returns a reservation_id. Reservations expire
@@ -1077,6 +1863,13 @@ paths:
         - affected_scopes MUST be populated regardless of decision outcome (ALLOW / ALLOW_WITH_CAPS / DENY).
         - If decision=ALLOW_WITH_CAPS, caps MUST be present; otherwise caps MUST be absent.
         - If decision=DENY, reason_code SHOULD be populated; it is the primary diagnostic signal for why the dry_run was denied.
+        - If the owning tenant's status is CLOSED (deployments with a governance plane),
+          dry_run MUST NOT return 409 TENANT_CLOSED; a fresh (non-replay) evaluation MUST
+          return decision=DENY with reason_code=TENANT_CLOSED, reflecting as-if-live the
+          409 the persisting create returns (same-key replays of pre-close evaluations
+          follow the IDEMPOTENCY rule below). A tenant record whose status cannot be determined (malformed record)
+          MUST fail closed with 500 INTERNAL_ERROR even on dry_run — see the closed-tenant
+          binding in ERROR SEMANTICS.
         - balances MAY be populated (recommended for operator visibility), but MUST reflect a non-mutating evaluation.
 
         OVER-LIMIT BLOCKING (NORMATIVE):
@@ -1102,6 +1895,7 @@ paths:
           description: Reservation decision (ALLOW/DENY with optional caps)
           headers:
             X-Request-Id: {$ref: '#/components/headers/X-Request-Id'}
+            X-Cycles-Trace-Id: {$ref: '#/components/headers/X-Cycles-Trace-Id'}
             X-Cycles-Tenant: {$ref: '#/components/headers/X-Cycles-Tenant'}
           content:
             application/json:
@@ -1109,11 +1903,24 @@ paths:
         "400": {$ref: '#/components/responses/ErrorResponse'}
         "401": {$ref: '#/components/responses/ErrorResponse'}
         "403": {$ref: '#/components/responses/ErrorResponse'}
+        "404":
+          description: >-
+            NOT_FOUND — no budget exists at any of the reservation's derived scopes in any unit.
+            The message field carries the specific "Budget not found for provided scope: ..." detail.
+            Distinct from 400 UNIT_MISMATCH (a budget exists at the scope but in a different unit).
+          headers:
+            X-Request-Id: {$ref: '#/components/headers/X-Request-Id'}
+            X-Cycles-Trace-Id: {$ref: '#/components/headers/X-Cycles-Trace-Id'}
+            X-Cycles-Tenant: {$ref: '#/components/headers/X-Cycles-Tenant'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
         "409": {$ref: '#/components/responses/ErrorResponse'}
         "500": {$ref: '#/components/responses/ErrorResponse'}
     get:
       tags: [Reservations]
       operationId: listReservations
+      x-conformance: normative
       summary: List reservations (optional recovery/debug endpoint)
       description: >-
         Lists reservations visible to the effective tenant. This endpoint is OPTIONAL in v0 deployments.
@@ -1128,10 +1935,84 @@ paths:
           - Query parameters tenant/workspace/app/workflow/agent/toolset filter on the canonical Subject fields.
           - Filtering on Subject.dimensions is out of scope for v0 unless explicitly implemented by the server.
 
+        TIME-RANGE FILTERS (NORMATIVE, ADDITIVE):
+          Three independent inclusive time-window filters are available,
+          each bound to a specific timestamp field on the reservation
+          entity. All bounds are ISO 8601 date-time strings. All are
+          additive parameters: servers that don't recognize them MUST
+          ignore without error.
+
+          - `from` / `to` (revision 2026-05-21) — bound on
+            `created_at_ms`. The original window filter; matches
+            the family-wide convention on `listAuditLogs`,
+            `listEvents`, and `listWebhookDeliveries`. Always binds
+            to `created_at_ms` regardless of `sort_by`.
+
+          - `expires_from` / `expires_to` — bound on `expires_at_ms`.
+            Primary use case: locate reservations that have expired
+            (or will expire) within a window — e.g. cleanup sweepers
+            that need to discover abandoned ACTIVE reservations. The
+            field is required on every `ReservationSummary` /
+            `ReservationDetail`, so this filter applies to every
+            row regardless of `status`.
+
+          - `finalized_from` / `finalized_to` — bound on
+            `finalized_at_ms`. The `finalized_at_ms` field is OPTIONAL
+            on `ReservationSummary` / `ReservationDetail` and is
+            populated ONLY on COMMITTED and RELEASED rows (absent on
+            ACTIVE and EXPIRED). Rows where the field is absent MUST
+            be excluded from results when either `finalized_from` or
+            `finalized_to` is supplied — the predicate naturally fails
+            on field-absent rows. Callers who want a window over
+            EXPIRED rows should use `expires_from` / `expires_to`
+            against `expires_at_ms`, which is required on every row.
+
+          Validation (applies to all three pairs):
+          - For each pair, `from > to` MUST return 400 INVALID_REQUEST
+            (e.g., `expires_from > expires_to`).
+          - Either side may be supplied alone (open interval).
+          - Blank-string values for any window bound MUST be treated
+            as unset (NORMATIVE). A client sending
+            `?expires_from=&finalized_to=` MUST be handled identically
+            to one omitting both parameters entirely. This applies to
+            all six bounds (`from`, `to`, `expires_from`, `expires_to`,
+            `finalized_from`, `finalized_to`). Servers MUST NOT 400 on
+            empty-string values despite the `format: date-time`
+            declaration. Rationale: clients commonly emit unconditional
+            query strings whose values come from possibly-unset
+            variables (e.g., `?from=${maybeUnset}&to=${maybeUnset}`),
+            and an unset variable rendering as `""` is the common
+            failure mode; rejecting these as malformed surfaces a
+            cryptic 400 that adds nothing over treating them as unset.
+          - The three pairs combine with AND semantics: a row must
+            satisfy every supplied window predicate to be returned.
+
+          Cursor invalidation: sorted-path cursors fold the supplied
+          window bounds into the canonical filter hash. Reusing a
+          sorted cursor under a different `(from, to, expires_from,
+          expires_to, finalized_from, finalized_to)` tuple returns
+          400 INVALID_REQUEST. Legacy SCAN cursors do not carry filter
+          state; callers paginating without `sort_by` must keep all
+          window bounds stable across pages, matching the legacy
+          path's treatment of every other filter.
+
         TENANCY (NORMATIVE):
-          - The server MUST scope results to the effective tenant derived from auth.
-          - If the tenant query parameter is provided, it is validation-only and MUST match the effective tenant; otherwise the server MUST return 403 FORBIDDEN.
-          - If tenant is omitted, the effective tenant is used.
+          - Under ApiKeyAuth: the server MUST scope results to the effective
+            tenant derived from auth. If the tenant query parameter is
+            provided, it is validation-only and MUST match the effective
+            tenant; otherwise the server MUST return 403 FORBIDDEN. If
+            tenant is omitted, the effective tenant is used.
+          - Under AdminKeyAuth (added 2026-04-13): the admin caller has
+            no effective tenant, so the tenant query parameter is REQUIRED
+            and used as a FILTER (not validation). Omitting it MUST return
+            400 INVALID_REQUEST with message "tenant query parameter is
+            required when using admin key authentication". This matches
+            the existing dual-auth pattern on listBudgets / listPolicies
+            in the governance-admin spec — same single param, semantics
+            keyed on auth type.
+      security:
+        - ApiKeyAuth: []
+        - AdminKeyAuth: []
       parameters:
         - name: idempotency_key
           in: query
@@ -1169,6 +2050,200 @@ paths:
           in: query
           required: false
           schema: {type: string}
+        - name: from
+          in: query
+          required: false
+          description: >-
+            Inclusive lower bound on reservation creation time. ISO 8601
+            date-time. When set, the server MUST return only reservations
+            whose `created_at_ms` is greater than or equal to this
+            timestamp. The filter ALWAYS binds to `created_at_ms`,
+            independent of `sort_by`. May be supplied alone (no upper
+            bound) or paired with `to`. Servers MUST reject `from > to`
+            with HTTP 400 INVALID_REQUEST.
+
+            Additive parameter — servers that don't recognize it MUST
+            ignore without error (additive-parameter guarantee). Matches
+            the `from` / `to` convention on `listAuditLogs`,
+            `listEvents`, and `listWebhookDeliveries` in the governance
+            spec family.
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          required: false
+          description: >-
+            Inclusive upper bound on reservation creation time. ISO 8601
+            date-time. When set, the server MUST return only reservations
+            whose `created_at_ms` is less than or equal to this
+            timestamp. The filter ALWAYS binds to `created_at_ms`,
+            independent of `sort_by`. May be supplied alone (no lower
+            bound) or paired with `from`. Servers MUST reject `from > to`
+            with HTTP 400 INVALID_REQUEST.
+
+            Additive parameter — servers that don't recognize it MUST
+            ignore without error.
+          schema:
+            type: string
+            format: date-time
+        - name: expires_from
+          in: query
+          required: false
+          description: >-
+            Inclusive lower bound on reservation expiry time. ISO 8601
+            date-time. When set, the server MUST return only reservations
+            whose `expires_at_ms` is greater than or equal to this
+            timestamp. The filter ALWAYS binds to `expires_at_ms`,
+            independent of `sort_by` and independent of the `from`/`to`
+            window on `created_at_ms`. May be supplied alone (no upper
+            bound) or paired with `expires_to`. Servers MUST reject
+            `expires_from > expires_to` with HTTP 400 INVALID_REQUEST.
+
+            Use case: cleanup sweepers locating reservations that have
+            expired or will expire within a window. Applies to all rows
+            regardless of `status` since `expires_at_ms` is required.
+
+            Additive parameter — servers that don't recognize it MUST
+            ignore without error.
+          schema:
+            type: string
+            format: date-time
+        - name: expires_to
+          in: query
+          required: false
+          description: >-
+            Inclusive upper bound on reservation expiry time. ISO 8601
+            date-time. When set, the server MUST return only reservations
+            whose `expires_at_ms` is less than or equal to this
+            timestamp. Same binding and open-interval rules as
+            `expires_from`. Servers MUST reject `expires_from >
+            expires_to` with HTTP 400 INVALID_REQUEST.
+
+            Additive parameter — servers that don't recognize it MUST
+            ignore without error.
+          schema:
+            type: string
+            format: date-time
+        - name: finalized_from
+          in: query
+          required: false
+          description: >-
+            Inclusive lower bound on reservation finalization time.
+            ISO 8601 date-time. When set, the server MUST return only
+            reservations whose `finalized_at_ms` is greater than or
+            equal to this timestamp. The filter ALWAYS binds to
+            `finalized_at_ms`, independent of `sort_by`. May be supplied
+            alone (no upper bound) or paired with `finalized_to`.
+            Servers MUST reject `finalized_from > finalized_to` with
+            HTTP 400 INVALID_REQUEST.
+
+            Behavior on rows without `finalized_at_ms` (NORMATIVE):
+            the field is OPTIONAL on reservation responses and is
+            populated ONLY on COMMITTED and RELEASED rows (absent on
+            ACTIVE and EXPIRED). Rows where the field is absent MUST
+            be excluded from results when either `finalized_from` or
+            `finalized_to` is supplied. Callers who want a window over
+            EXPIRED rows should use `expires_from` / `expires_to`
+            against `expires_at_ms`.
+
+            Additive parameter — servers that don't recognize it MUST
+            ignore without error.
+          schema:
+            type: string
+            format: date-time
+        - name: finalized_to
+          in: query
+          required: false
+          description: >-
+            Inclusive upper bound on reservation finalization time.
+            ISO 8601 date-time. When set, the server MUST return only
+            reservations whose `finalized_at_ms` is less than or equal
+            to this timestamp. Same binding, open-interval, and
+            ACTIVE-row-exclusion rules as `finalized_from`. Servers MUST
+            reject `finalized_from > finalized_to` with HTTP 400
+            INVALID_REQUEST.
+
+            Additive parameter — servers that don't recognize it MUST
+            ignore without error.
+          schema:
+            type: string
+            format: date-time
+        - name: sort_by
+          in: query
+          required: false
+          description: >-
+            Sort key. When provided, results are returned in the
+            requested order and the returned cursor encodes the sort
+            key so subsequent pages continue in sort order. When
+            omitted, servers use their default ordering (unchanged
+            pre-revision behavior). The `reserved` key sorts by the
+            integer `amount` within each row; the single-unit-per-
+            reservation invariant makes this comparison well-defined.
+            The `scope_path` key sorts lexicographically over the
+            server-derived canonical scope path string (e.g.
+            "tenant:acme/workspace:prod/agent:x"); the `tenant` key
+            sorts over the Subject.tenant field. Servers that don't
+            recognize the parameter MUST ignore it without error.
+          schema:
+            type: string
+            enum: [reservation_id, tenant, scope_path, status, reserved, created_at_ms, expires_at_ms]
+            default: created_at_ms
+        - name: sort_dir
+          in: query
+          required: false
+          description: Sort direction. Default descending.
+          schema:
+            $ref: '#/components/schemas/SortDirection'
+        - name: include
+          in: query
+          required: false
+          description: >-
+            FIELD PROJECTION (NORMATIVE, ADDITIVE). Comma-separated list
+            of OPTIONAL heavy fields to project onto each
+            `ReservationSummary` in the response. By default the list
+            projection omits the arbitrary-size, possibly-PII metadata
+            maps to keep list payloads lean; a caller that needs them
+            (e.g. an aggregate audit / export view) opts in explicitly.
+            Added in revision 2026-06-19.
+
+            Recognized tokens:
+              - `metadata` — populate `ReservationSummary.metadata`
+                (RESERVE-time metadata) on rows that carry it.
+              - `committed_metadata` — populate
+                `ReservationSummary.committed_metadata` (COMMIT-time
+                metadata) on COMMITTED rows whose commit carried metadata.
+              - `evidence` — populate `ReservationSummary.evidence` (the
+                CyclesEvidence references emitted for this reservation's
+                reserve / commit / release operations) on rows that have
+                recorded evidence. Added in revision 2026-06-22.
+
+            Semantics (NORMATIVE):
+              - Unrecognized tokens MUST be ignored without error
+                (forward/backward compatible — a client MAY request a
+                field a given server version does not know, and an
+                additive-parameter-unaware server simply never populates
+                these maps).
+              - Tokens are comma-separated; surrounding whitespace and
+                empty tokens (e.g. a trailing comma, or `include=`) MUST
+                be ignored, never 400.
+              - PROJECTION-ONLY: `include` selects which fields are
+                serialized; it does NOT affect which rows match, their
+                ordering, or pagination. It therefore MUST NOT participate
+                in cursor / canonical-filter-hash binding — a cursor
+                minted under one `include` value remains valid when the
+                next page is fetched under a different (or absent)
+                `include`, and changing `include` mid-pagination MUST NOT
+                return 400. (Contrast the window filters above, which DO
+                bind the cursor.)
+              - `committed` is NOT gated by `include`; it is always
+                projected (see `ReservationSummary.committed`).
+          style: form
+          explode: false
+          schema:
+            type: array
+            items:
+              type: string
         - $ref: '#/components/parameters/Limit'
         - $ref: '#/components/parameters/Cursor'
       responses:
@@ -1176,6 +2251,7 @@ paths:
           description: Reservations list
           headers:
             X-Request-Id: {$ref: '#/components/headers/X-Request-Id'}
+            X-Cycles-Trace-Id: {$ref: '#/components/headers/X-Cycles-Trace-Id'}
             X-Cycles-Tenant: {$ref: '#/components/headers/X-Cycles-Tenant'}
           content:
             application/json:
@@ -1189,12 +2265,30 @@ paths:
     get:
       tags: [Reservations]
       operationId: getReservation
+      x-conformance: normative
       summary: Get reservation details (optional, for debugging)
       description: >-
         Retrieve current status and details of a reservation by ID. Useful for debugging and monitoring long-running operations.
 
-        TENANCY (NORMATIVE): 
-        - If the reservation exists but is owned by a different effective tenant, the server MUST return 403 FORBIDDEN.
+        EXPIRY (NORMATIVE, revision 2026-07-03):
+          - If the reservation exists but its status is EXPIRED, the server MUST
+            return 410 with error=RESERVATION_EXPIRED (this operation's declared
+            410 response). A reservation that never existed returns 404 NOT_FOUND.
+          - EXPIRED reservations remain discoverable via listReservations, which
+            returns them as normal 200 rows with status=EXPIRED — the 410 applies
+            only to this single-resource GET. This codifies the reference
+            implementation's settled behavior; the pre-revision text enumerated
+            only commit/release/extend in the 410 rule, leaving GET ambiguous.
+
+        TENANCY (NORMATIVE):
+          - Under ApiKeyAuth: if the reservation exists but is owned by a
+            different effective tenant, the server MUST return 403 FORBIDDEN.
+          - Under AdminKeyAuth (added 2026-04-13): admin operators can
+            read any reservation regardless of owning tenant; reservation_id
+            already pins the owner so no extra parameter is needed.
+      security:
+        - ApiKeyAuth: []
+        - AdminKeyAuth: []
       parameters:
         - $ref: '#/components/parameters/ReservationId'
       responses:
@@ -1202,20 +2296,35 @@ paths:
           description: Reservation details
           headers:
             X-Request-Id: {$ref: '#/components/headers/X-Request-Id'}
+            X-Cycles-Trace-Id: {$ref: '#/components/headers/X-Cycles-Trace-Id'}
             X-Cycles-Tenant: {$ref: '#/components/headers/X-Cycles-Tenant'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ReservationDetail'}
+        "400": {$ref: '#/components/responses/ErrorResponse'}
         "401": {$ref: '#/components/responses/ErrorResponse'}
         "403": {$ref: '#/components/responses/ErrorResponse'}
         "404": {$ref: '#/components/responses/ErrorResponse'}
-        "410": {$ref: '#/components/responses/ErrorResponse'}
+        "410":
+          description: >-
+            RESERVATION_EXPIRED — the reservation exists but its status is
+            EXPIRED. See the EXPIRY note in this operation's description
+            (revision 2026-07-03); EXPIRED rows remain visible via
+            listReservations.
+          headers:
+            X-Request-Id: {$ref: '#/components/headers/X-Request-Id'}
+            X-Cycles-Trace-Id: {$ref: '#/components/headers/X-Cycles-Trace-Id'}
+            X-Cycles-Tenant: {$ref: '#/components/headers/X-Cycles-Tenant'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
         "500": {$ref: '#/components/responses/ErrorResponse'}
 
   /v1/reservations/{reservation_id}/commit:
     post:
       tags: [Reservations]
       operationId: commitReservation
+      x-conformance: normative
       summary: Commit actual spend for a reservation (auto-releases delta)
       description: >-
         Commits actual spend. If actual < reserved, delta is released automatically. If actual > reserved, behavior is controlled
@@ -1239,6 +2348,7 @@ paths:
           description: Commit succeeded
           headers:
             X-Request-Id: {$ref: '#/components/headers/X-Request-Id'}
+            X-Cycles-Trace-Id: {$ref: '#/components/headers/X-Cycles-Trace-Id'}
             X-Cycles-Tenant: {$ref: '#/components/headers/X-Cycles-Tenant'}
           content:
             application/json:
@@ -1255,6 +2365,7 @@ paths:
     post:
       tags: [Reservations]
       operationId: releaseReservation
+      x-conformance: normative
       summary: Release an unused reservation
       description: >-
         Releases reserved amount back to remaining budget.
@@ -1262,8 +2373,37 @@ paths:
         IDEMPOTENCY (NORMATIVE): 
         - On replay with the same idempotency_key, the server MUST return the original successful response payload.
 
-        TENANCY (NORMATIVE): 
-        - If the reservation exists but is owned by a different effective tenant, the server MUST return 403 FORBIDDEN.
+        TENANCY (NORMATIVE):
+          - Under ApiKeyAuth: if the reservation exists but is owned by
+            a different effective tenant, the server MUST return 403 FORBIDDEN.
+          - Under AdminKeyAuth (added 2026-04-13): admin operators can
+            release any reservation regardless of owning tenant — the
+            ops use case is "force-expire a hung reservation" during
+            incident response. reservation_id pins the owner so no
+            extra parameter is needed.
+
+        AUDIT (NORMATIVE, AdminKeyAuth path):
+          - The audit-log entry for an admin-driven release MUST record
+            actor_type=admin_on_behalf_of (existing audit field, value
+            already used on createBudget / createPolicy / updatePolicy
+            in the governance-admin spec). This lets security review
+            distinguish admin-driven releases from tenant self-service
+            without joining to the keys table.
+          - The entry MUST be discoverable via the governance plane's
+            audit-query surface (GET /v1/admin/audit/logs in the
+            governance-admin spec). Writing the entry to a store the
+            governance audit-query endpoint cannot read from does not
+            satisfy this requirement — the operational intent is that
+            admin-driven release actions surface in the same admin-
+            facing audit view that shows governance-plane audit
+            entries. How servers achieve this is an implementation
+            concern and out of scope for the spec.
+          - Callers SHOULD populate the optional `reason` body field
+            with a structured tag (e.g. "[INCIDENT_FORCE_RELEASE]")
+            for grep-ability in the audit log.
+      security:
+        - ApiKeyAuth: []
+        - AdminKeyAuth: []
       parameters:
         - $ref: '#/components/parameters/ReservationId'
         - $ref: '#/components/parameters/IdempotencyKeyHeader'
@@ -1277,10 +2417,12 @@ paths:
           description: Release succeeded
           headers:
             X-Request-Id: {$ref: '#/components/headers/X-Request-Id'}
+            X-Cycles-Trace-Id: {$ref: '#/components/headers/X-Cycles-Trace-Id'}
             X-Cycles-Tenant: {$ref: '#/components/headers/X-Cycles-Tenant'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ReleaseResponse'}
+        "400": {$ref: '#/components/responses/ErrorResponse'}
         "401": {$ref: '#/components/responses/ErrorResponse'}
         "403": {$ref: '#/components/responses/ErrorResponse'}
         "404": {$ref: '#/components/responses/ErrorResponse'}
@@ -1292,6 +2434,7 @@ paths:
     post:
       tags: [Reservations]
       operationId: extendReservation
+      x-conformance: normative
       summary: Extend reservation TTL (lease refresh / heartbeat)
       description: >-
         Extends the expiry of an ACTIVE reservation to support long-running agent workflows.
@@ -1309,6 +2452,10 @@ paths:
         - If the reservation exists but is owned by a different effective tenant, the server MUST return 403 FORBIDDEN.
 
         ERROR SEMANTICS (NORMATIVE):
+        - If the owning tenant's status is CLOSED (deployments with a governance plane),
+          server MUST return 409 with error=TENANT_CLOSED, taking precedence over the
+          reservation-state errors below for non-replay requests — see the closed-tenant
+          binding in this document's top-level ERROR SEMANTICS.
         - If the reservation is COMMITTED or RELEASED, server MUST return 409 with error=RESERVATION_FINALIZED.
         - If the reservation is expired (server time > expires_at_ms), server MUST return 410 with error=RESERVATION_EXPIRED.
         - If the reservation never existed, server MUST return 404 with error=NOT_FOUND.
@@ -1326,6 +2473,7 @@ paths:
           description: Reservation expiry extended
           headers:
             X-Request-Id: {$ref: '#/components/headers/X-Request-Id'}
+            X-Cycles-Trace-Id: {$ref: '#/components/headers/X-Cycles-Trace-Id'}
             X-Cycles-Tenant: {$ref: '#/components/headers/X-Cycles-Tenant'}
           content:
             application/json:
@@ -1339,10 +2487,124 @@ paths:
         "410": {$ref: '#/components/responses/ErrorResponse'}
         "500": {$ref: '#/components/responses/ErrorResponse'}
 
+  /v1/evidence/{evidence_id}:
+    get:
+      tags: [Evidence]
+      operationId: getEvidence
+      x-conformance: normative
+      summary: Fetch a signed CyclesEvidence envelope by content id
+      description: >-
+        Retrieve the signed CyclesEvidence envelope identified by `evidence_id`
+        (the sha256 content hash carried on a receipt's `cycles_evidence`
+        reference). Returns the envelope exactly as emitted — JCS-canonicalizable
+        and Ed25519-signed per cycles-evidence-v0.2 — so any holder can verify it
+        offline without trusting this server.
+
+        AUTH (NORMATIVE): this endpoint is PUBLIC (no ApiKeyAuth). The
+        `evidence_id` is an unguessable sha256 content hash that acts as a
+        capability — only a party already holding the receipt (which carries the
+        id) can fetch the envelope. Because the envelope is content-addressed and
+        signature-verifiable, public read cannot forge or alter it. Servers
+        SHOULD rate-limit this endpoint and SHOULD serve it with
+        `Cache-Control: public, immutable` (the content never changes).
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/EvidenceId'
+      responses:
+        "200":
+          description: The signed CyclesEvidence envelope.
+          headers:
+            X-Request-Id: {$ref: '#/components/headers/X-Request-Id'}
+            X-Cycles-Trace-Id: {$ref: '#/components/headers/X-Cycles-Trace-Id'}
+            Cache-Control: {$ref: '#/components/headers/Cache-Control'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CyclesEvidenceEnvelope'}
+        "400": {$ref: '#/components/responses/ErrorResponse'}
+        "404": {$ref: '#/components/responses/ErrorResponse'}
+        "429":
+          description: >-
+            Rate limited. Public endpoints SHOULD be throttled; clients retry
+            after the indicated delay.
+          headers:
+            Retry-After: {$ref: '#/components/headers/Retry-After'}
+            X-RateLimit-Reset: {$ref: '#/components/headers/X-RateLimit-Reset'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
+        "500": {$ref: '#/components/responses/ErrorResponse'}
+
+  /v1/.well-known/cycles-jwks.json:
+    get:
+      tags: [Evidence]
+      operationId: getEvidenceJwks
+      x-conformance: normative
+      summary: Fetch the signer's CyclesEvidence JWK Set (signer-key resolution)
+      description: >-
+        Return the issuing server's Ed25519 verification keys as a JWK Set, so a
+        consumer can resolve a `did:cycles` `signer_did` (or confirm a raw-hex
+        one) to a public key and establish signer AUTHORITY — not merely
+        signature validity. This is the publication half of the ADDITIVE
+        signer-key-resolution layer (cycles-evidence v0.2); the resolvable
+        `signer_did` form, the NORMATIVE key-selection + validity-window rules,
+        and the verification dispositions live in `cycles-evidence-v0.2.yaml`
+        (`CyclesEvidenceJwks`).
+
+        Located API-base-relative: the spec path is
+        `{server_id}/.well-known/cycles-jwks.json`, and `server_id` already
+        includes `/v1` (e.g. `https://cycles.example.com/v1`), so it resolves to
+        `…/v1/.well-known/cycles-jwks.json` — deliberately NOT origin-rooted, so
+        key authority stays anchored to the exact base the `did:cycles` hash
+        commits to. The literal `.well-known` segment marks this as metadata, not
+        a routed API resource.
+
+        OPTIONAL TO PUBLISH: a server that does not participate in signer-key
+        resolution need not serve this (it returns 404, and consumers fall back
+        to raw-hex `signer_did` + `expected_signer` pinning — the `binding_only`
+        posture). A server that DOES publish MUST serve it at this path with this
+        shape and the selection/window semantics in `cycles-evidence-v0.2.yaml`.
+
+        AUTH (NORMATIVE): PUBLIC (no ApiKeyAuth). A JWK Set is public keys only —
+        the standard posture for a verification key set — and is itself the trust
+        anchor consumers resolve, so it must be reachable without credentials.
+        The private signing key is NEVER served by this or any endpoint. Servers
+        SHOULD rate-limit and SHOULD serve with a short `Cache-Control: public`
+        max-age (the set changes only on key rotation), NOT `immutable`.
+      security: []
+      responses:
+        "200":
+          description: The signer's JWK Set.
+          headers:
+            X-Request-Id: {$ref: '#/components/headers/X-Request-Id'}
+            X-Cycles-Trace-Id: {$ref: '#/components/headers/X-Cycles-Trace-Id'}
+            Cache-Control: {$ref: '#/components/headers/Cache-Control'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CyclesEvidenceJwks'}
+        "404":
+          description: >-
+            This server does not publish a JWK Set (signer-key resolution not
+            enabled, or the evidence signing identity is unconfigured).
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
+        "429":
+          description: >-
+            Rate limited. Public endpoints SHOULD be throttled; clients retry
+            after the indicated delay.
+          headers:
+            Retry-After: {$ref: '#/components/headers/Retry-After'}
+            X-RateLimit-Reset: {$ref: '#/components/headers/X-RateLimit-Reset'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
+        "500": {$ref: '#/components/responses/ErrorResponse'}
+
   /v1/balances:
     get:
       tags: [Balances]
       operationId: getBalances
+      x-conformance: normative
       summary: Query current budget balances across scopes (nice-to-have)
       description: >
         Returns balances for scopes matching the provided subject filter.
@@ -1386,6 +2648,7 @@ paths:
           description: Balance response
           headers:
             X-Request-Id: {$ref: '#/components/headers/X-Request-Id'}
+            X-Cycles-Trace-Id: {$ref: '#/components/headers/X-Cycles-Trace-Id'}
             X-Cycles-Tenant: {$ref: '#/components/headers/X-Cycles-Tenant'}
           content:
             application/json:
@@ -1399,6 +2662,7 @@ paths:
     post:
       tags: [Events]
       operationId: createEvent
+      x-conformance: normative
       summary: Optional post-only accounting when pre-estimation is not available
       description: >-
         Records an accounting event without a reservation. This endpoint is optional in v0 deployments. 
@@ -1421,6 +2685,7 @@ paths:
           description: Event created and atomically applied to balances
           headers:
             X-Request-Id: {$ref: '#/components/headers/X-Request-Id'}
+            X-Cycles-Trace-Id: {$ref: '#/components/headers/X-Cycles-Trace-Id'}
             X-Cycles-Tenant: {$ref: '#/components/headers/X-Cycles-Tenant'}
           content:
             application/json:
@@ -1428,5 +2693,34 @@ paths:
         "400": {$ref: '#/components/responses/ErrorResponse'}
         "401": {$ref: '#/components/responses/ErrorResponse'}
         "403": {$ref: '#/components/responses/ErrorResponse'}
-        "409": {$ref: '#/components/responses/ErrorResponse'}
+        "404":
+          description: >-
+            NOT_FOUND — no budget exists at any of the event's derived scopes in any unit.
+            The message field carries the specific "Budget not found for provided scope: ..." detail.
+            Distinct from 400 UNIT_MISMATCH (a budget exists at the scope but in a different unit).
+          headers:
+            X-Request-Id: {$ref: '#/components/headers/X-Request-Id'}
+            X-Cycles-Trace-Id: {$ref: '#/components/headers/X-Cycles-Trace-Id'}
+            X-Cycles-Tenant: {$ref: '#/components/headers/X-Cycles-Tenant'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
+        "409":
+          description: >-
+            Persisting-debit denial. error=TENANT_CLOSED when the owning tenant's status is
+            CLOSED (createEvent is a persisting budget debit on the same runtime-plane surface
+            as commit; see ERROR SEMANTICS — there is no dry_run/decide mode on /v1/events, so
+            on a fresh (non-replay) request the closed-tenant outcome is this 409, never a
+            decision=DENY; a same-key replay of a pre-close event still returns its original
+            stored 201 per IDEMPOTENCY). Plus the two 409 codes explicitly specified by
+            EventCreateRequest.overage_policy: error=BUDGET_EXCEEDED under
+            overage_policy=REJECT, and error=OVERDRAFT_LIMIT_EXCEEDED under
+            overage_policy=ALLOW_WITH_OVERDRAFT.
+          headers:
+            X-Request-Id: {$ref: '#/components/headers/X-Request-Id'}
+            X-Cycles-Trace-Id: {$ref: '#/components/headers/X-Cycles-Trace-Id'}
+            X-Cycles-Tenant: {$ref: '#/components/headers/X-Cycles-Tenant'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
         "500": {$ref: '#/components/responses/ErrorResponse'}
