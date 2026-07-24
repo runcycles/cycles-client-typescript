@@ -133,6 +133,8 @@ describe("OpenAPI contract tests", () => {
       "OVERDRAFT_LIMIT_EXCEEDED",
       "DEBT_OUTSTANDING",
       "MAX_EXTENSIONS_EXCEEDED",
+      "LIMIT_EXCEEDED",
+      "TENANT_CLOSED",
       "INTERNAL_ERROR",
     ];
 

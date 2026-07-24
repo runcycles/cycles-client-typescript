@@ -1,22 +1,25 @@
 # Cycles Protocol v0.1.25 — Client (TypeScript) Audit
 
-**Date:** 2026-07-10 (unreleased — `TENANT_CLOSED` error-code support per runtime spec v0.1.25.13 (`cycles-protocol-v0.yaml`, runcycles/cycles-protocol#125): `ErrorCode.TENANT_CLOSED` enum member, `TenantClosedError` class wired into `buildProtocolException` (invoked on the reservation-time paths of `withCycles`, lifecycle, and `reserveForStream`; commit-time client errors are handled/released internally and `StreamReservation.commit()` throws generic `CyclesError`, so typed protocol exceptions are reservation-time only), `CyclesProtocolError.isTenantClosed()` helper; exported from the package root. Purely additive; previously the unrecognized code produced a generic `CyclesProtocolError` with the raw `errorCode` string preserved and `isRetryable()` already false, while `errorCodeFromString` fell back to `ErrorCode.UNKNOWN` (which `isRetryableErrorCode` treats as retryable) — now typed and non-retryable on both paths. Vendored spec fixture intentionally untouched until the spec PR merges; the contract suite validates the fixture, not the client enum. Also `LIMIT_EXCEEDED` per runtime spec v0.1.25.12 (revision 2026-07-04, HTTP 429 rate limiting on the public evidence/JWKS endpoints): enum-only member matching the `BUDGET_FROZEN`/`BUDGET_CLOSED` pattern, added in spec declaration order (`TENANT_CLOSED` relocated after it to mirror the spec exactly), classified retryable at both the `isRetryableErrorCode` and `CyclesProtocolError.isRetryable()` layers — 429 is transient and the status-based rule only covers ≥500; this preserves the prior `UNKNOWN → retryable` fallback semantics, now typed. Codex round-2 findings applied: lifecycle/streaming TENANT_CLOSED create-failure tests, a true future-code fallback test (`NEW_SERVER_CODE`), TENANT_CLOSED deserialization tests in mappers/response suites, README enum example updated, and typed-throwing claims scoped to reservation time. New tests in `exceptions.test.ts`, `errors.test.ts`, `models.test.ts`, `lifecycle.test.ts`, `streaming.test.ts`, `mappers.test.ts`, `response.test.ts`. Codex round-3: `Retry-After` header now captured (`retry-after` added to `RESPONSE_HEADERS`), exposed as `CyclesResponse.retryAfterMsHeader` (seconds → ms, non-integer forms ignored), with `buildProtocolException` falling back to it when the body `retry_after_ms` is absent (body wins) — no auto-retry behavior change, the delay is surfaced only; README `isRetryableErrorCode` doc updated to include `LIMIT_EXCEEDED`; `TEST_COVERAGE_ANALYSIS.md` switch-case count corrected to six. 337 tests pass at 98.61% statement / 99.81% line coverage (gate ≥95% lines); eslint + typecheck clean.),
-2026-07-04 (v0.3.4 pending — fixes the `EventCreateResponse.charged` mapper drop found by the fleet audit (#134 item 1): the field was declared on the interface but `eventCreateResponseFromWire` never mapped it, so the effective charge on ALLOW_IF_AVAILABLE-capped events was silently lost. Two regression tests pin presence + absence. 319 tests pass at 98.4% statement / 99.62% line coverage. Remaining audit findings tracked in #134.),
+**Date:** 2026-07-24 (v0.3.4 release prep — package and changelog aligned; vendored contract fixture refreshed from runtime protocol v0.1.24 to v0.1.25.15 at `cycles-protocol@99f1391`; exact `ErrorCode` contract assertion updated for `LIMIT_EXCEEDED` and `TENANT_CLOSED`; test-only `fast-uri` updated to 3.1.4. Clean install and audit pass with zero vulnerabilities; 339 tests pass at 98.61% statement / 99.81% line coverage; lint, typecheck, build, and package dry-run are clean.),
+2026-07-10 (v0.3.4 — `TENANT_CLOSED` support from runtime spec v0.1.25.13: `ErrorCode.TENANT_CLOSED`, exported `TenantClosedError`, `CyclesProtocolError.isTenantClosed()`, and reservation-time typed exception mapping. Also `LIMIT_EXCEEDED` support from v0.1.25.12, retry classification, and `Retry-After` header exposure through `CyclesResponse.retryAfterMsHeader`.),
+2026-07-04 (v0.3.4 — fixes the `EventCreateResponse.charged` mapper drop found by fleet audit #134 item 1: the field was declared on the interface but `eventCreateResponseFromWire` never mapped it, so the effective charge on `ALLOW_IF_AVAILABLE`-capped events was silently lost. Two regression tests pin presence and absence. Remaining audit findings stay tracked in #134.),
 2026-07-03 (integration-test-only, no version bump — the live-server "health check" test now probes the public `/actuator/health/readiness` endpoint instead of aggregate `/actuator/health`, which requires `X-Admin-API-Key` since cycles-server v0.1.25.45 and fails closed with 500 when the server has no admin key configured. Would have failed the org nightly Full-Stack Integration once the Python step ahead of it was fixed. No library code change.),
-2026-05-22 (v0.3.3 — `expires_from`/`expires_to` and `finalized_from`/`finalized_to` ISO-8601 window-filter passthrough on `listReservations` per `cycles-protocol-v0.yaml` revision 2026-05-22; closes the TypeScript-client side of runcycles/cycles-server#162. No code change — `params?: Record<string, string>` already forwards arbitrary keys; added a regression test that pins all four new params URL-encoded on the wire. 317 tests pass at 98.4% statement / 99.62% line coverage.),
-2026-05-21 (v0.3.2 — `from` / `to` ISO-8601 window-filter passthrough on `listReservations` per `cycles-protocol-v0.yaml` revision 2026-05-21; closes the TypeScript-client side of runcycles/cycles-server#159. No code change — `params?: Record<string, string>` already forwards arbitrary keys; added a regression test that pins the URL-encoded passthrough. 316 tests pass at 98.4% statement / 99.62% line coverage.),
+2026-05-22 (included in v0.3.4; 0.3.3 was not separately published — regression coverage for `expires_from`/`expires_to` and `finalized_from`/`finalized_to` ISO-8601 window-filter passthrough on `listReservations`.),
+2026-05-21 (included in v0.3.4; 0.3.2 was not separately published — regression coverage for `from` / `to` ISO-8601 window-filter passthrough on `listReservations`.),
 2026-03-19 (updated), 2026-03-14 (initial)
 **Spec:** `cycles-protocol-v0.yaml` (OpenAPI 3.1.0, v0.1.25)
-**Client:** `runcycles` (Node 20+ / native fetch / TypeScript 5)
+**Client:** `runcycles` (Node 20+ / native fetch / TypeScript 6)
 **Server audit:** See `cycles-server/AUDIT.md` (all passing)
 
 ---
 
 ## Summary
 
+The table covers the SDK surface implemented in this repository. The v0.1.25.15 evidence/JWKS endpoints and remaining additive response fields are not yet modeled; those known gaps remain explicitly deferred to [#134](https://github.com/runcycles/cycles-client-typescript/issues/134) and are not claimed as part of v0.3.4.
+
 | Category | Pass | Issues |
 |----------|------|--------|
-| Endpoints & HTTP Methods | 9/9 | 0 |
+| Implemented Endpoints & HTTP Methods | 9/9 | Evidence/JWKS deferred to #134 |
 | Request Schemas (field names & JSON keys) | 6/6 | 0 |
 | Response Schemas (field names & JSON keys) | 10/10 | 0 |
 | Nested Object Schemas | 8/8 | 0 |
@@ -192,12 +195,12 @@ All spec constraints are validated via explicit validation functions in `validat
 
 ### OpenAPI Contract Tests (added 2026-03-28)
 
-Added `tests/contract.test.ts` — 90 automated tests that load the OpenAPI spec YAML and validate request/response fixtures against the actual JSON Schema definitions using Ajv:
+Added `tests/contract.test.ts` — 92 automated tests that load the OpenAPI spec YAML and validate request/response fixtures against the actual JSON Schema definitions using Ajv:
 
 - **Request schemas validated:** `DecisionRequest`, `ReservationCreateRequest`, `CommitRequest`, `EventCreateRequest` — valid bodies pass, missing required fields and additional properties are rejected
 - **Response schemas validated:** `DecisionResponse`, `ReservationCreateResponse`, `CommitResponse`, `EventCreateResponse`, `ErrorResponse` — valid bodies pass, missing required fields and invalid enum values are rejected
 - **Leaf object schemas validated:** `Amount`, `Subject`, `Action` — constraints (required fields, additionalProperties, minimum values, anyOf) enforced
-- **Enum completeness verified:** `UnitEnum` has exactly `[USD_MICROCENTS, TOKENS, CREDITS, RISK_POINTS]`; `ErrorCode` has all 15 expected values
+- **Enum completeness verified:** `UnitEnum` has exactly `[USD_MICROCENTS, TOKENS, CREDITS, RISK_POINTS]`; `ErrorCode` has all 17 expected values
 - Spec fixture stored at `tests/fixtures/cycles-protocol-v0.yaml`
 - Dev dependencies added: `ajv`, `ajv-formats`, `yaml`
 

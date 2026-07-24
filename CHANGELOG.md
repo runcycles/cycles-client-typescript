@@ -6,55 +6,39 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-07-24
+
+Protocol error handling, response-mapping correctness, and release-pipeline hardening. This is the first published release after 0.3.1; the changes previously documented as 0.3.2 and 0.3.3 are included here because those versions were never tagged or published.
+
 ### Added
 
-- `TENANT_CLOSED` error-code support per runtime spec v0.1.25.13 of `cycles-protocol-v0.yaml` ([runcycles/cycles-protocol#125](https://github.com/runcycles/cycles-protocol/pull/125)): servers return HTTP 409 `error=TENANT_CLOSED` on reservation create/commit/release/extend when the owning tenant is CLOSED (mirrors governance spec Rule 2). New `ErrorCode.TENANT_CLOSED` enum member, `TenantClosedError` class (thrown **at reservation time** by `withCycles` / lifecycle / `reserveForStream` via `buildProtocolException`; commit-time client errors are handled/released internally by `withCycles`, and `StreamReservation.commit()` throws generic `CyclesError` — neither commit path throws typed protocol exceptions), and `CyclesProtocolError.isTenantClosed()` helper. Purely additive — before this change the unrecognized code produced a generic `CyclesProtocolError` with the raw `errorCode: "TENANT_CLOSED"` preserved and `isRetryable()` already `false` (409 < 500); `errorCodeFromString` mapped it to `ErrorCode.UNKNOWN`, which `isRetryableErrorCode` reports as retryable — now it maps to the typed, non-retryable member. The vendored spec fixture (pinned pre-v0.1.25.13) is intentionally untouched until the spec PR merges.
+- `TENANT_CLOSED` error-code support introduced in runtime spec v0.1.25.13 ([runcycles/cycles-protocol#125](https://github.com/runcycles/cycles-protocol/pull/125)): new `ErrorCode.TENANT_CLOSED` enum member, `TenantClosedError` class (thrown **at reservation time** by `withCycles` / lifecycle / `reserveForStream` via `buildProtocolException`; commit-time client errors are handled/released internally by `withCycles`, and `StreamReservation.commit()` throws generic `CyclesError`), and `CyclesProtocolError.isTenantClosed()` helper. The code is non-retryable and remains backward compatible with servers that return unknown future error codes.
 - `LIMIT_EXCEEDED` error-code support per runtime spec v0.1.25.12 (revision 2026-07-04): HTTP 429 rate-limit responses (public evidence/JWKS endpoints) carry `error=LIMIT_EXCEEDED` plus `Retry-After` / `X-RateLimit-Reset` headers. New `ErrorCode.LIMIT_EXCEEDED` enum member in spec declaration order (after `MAX_EXTENSIONS_EXCEEDED`; `TENANT_CLOSED` relocated after it so the enum mirrors the spec exactly). Classified **retryable** by both `isRetryableErrorCode` and `CyclesProtocolError.isRetryable()` — 429 is transient and the spec instructs retry after the indicated delay; the status-based rule only covers ≥500, so the code-based classification carries it (this also preserves the prior `errorCodeFromString → UNKNOWN → retryable` fallback behavior). Enum-only by design, matching the `BUDGET_FROZEN`/`BUDGET_CLOSED` pattern: not a reservation-lifecycle denial, so no exception class or `buildProtocolException` mapping.
 - `Retry-After` header exposure: the client now captures the HTTP `Retry-After` header (how 429 rate-limit responses carry the delay per the spec) and exposes it as `CyclesResponse.retryAfterMsHeader` (seconds → ms; non-integer forms ignored gracefully). `buildProtocolException` falls back to it for `retryAfterMs` when the body carries no `retry_after_ms` field (body wins when both are present). No auto-retry behavior change — the delay is surfaced, not consumed.
+- Regression coverage confirms `listReservations` forwards and URL-encodes the additive `from` / `to`, `expires_from` / `expires_to`, and `finalized_from` / `finalized_to` ISO-8601 query parameters. The existing `params?: Record<string, string>` API already accepted them.
 
 ### Changed
 
 - npm publish now uses npm Trusted Publishing (OIDC) instead of the long-lived `NPM_TOKEN` secret (`NODE_AUTH_TOKEN` removed from the publish job; the job already had `id-token: write` and upgrades npm, which OIDC requires at >= 11.5.1). The trusted publisher must be configured for the `runcycles` package on npmjs.com before the next tagged release. Mirrors the same change in `cycles-mcp-server`, whose v0.3.0 release initially failed on an expired token.
 - `package.json` `repository.url` normalized to `git+https://...` per `npm pkg fix`, which also makes it match the exact form npm's trusted-publisher repository check expects.
+- Refreshed the vendored `cycles-protocol-v0.yaml` contract fixture from v0.1.24 to the current v0.1.25.15 and aligned the exact `ErrorCode` contract assertion with `LIMIT_EXCEEDED` and `TENANT_CLOSED`.
 
 ### Security
 
 - Forced transitive `esbuild` to >= 0.28.1 via npm `overrides`, resolving Dependabot alert #9 (low severity, dev-only: arbitrary file read via the esbuild development server on Windows; `tsup` pins `esbuild ^0.27.0` so no direct range reaches the patched version). Remove the override once `tsup` allows esbuild >= 0.28.
+- Updated test-only transitive `fast-uri` from 3.1.2 to 3.1.4, resolving the high-severity host-confusion advisories reported through the Ajv contract-test toolchain. The dependency is not included in the published package.
 
 ### Fixed
 
+- `eventCreateResponseFromWire` now maps the declared `EventCreateResponse.charged` field. Previously, the effective charge on `ALLOW_IF_AVAILABLE`-capped events was silently lost and always appeared as `undefined`.
 - README error-handling docs no longer describe `CyclesTransportError` as thrown on network failure — the SDK never constructs it. Reservation-time transport failures surface as `CyclesProtocolError` with `status: -1` (`withCycles` / `reserveForStream`) or as `CyclesResponse` with `isTransportError` / `status: -1` (programmatic client); commit-time failures are retried in the background by `withCycles`, while `StreamReservation.commit()` throws and resets `finalized` for caller retry or release. The class remains exported for use in user code; a new "Transport failures (status -1)" README subsection documents the actual behavior.
 - `examples/vercel-ai-sdk` chat route no longer mixes AI SDK v4 and v5 APIs (it compiled under neither while `package.json` pins `"ai": "^4.0.0"`): now pure v4 — `Message` type and `convertToCoreMessages` replace v5's `UIMessage` / `convertToModelMessages`. `runcycles` usage unchanged.
 
 ### Notes
 
-- The Fixed items are docs + example only; the Added item is a small additive library change (no wire-format change).
-
-## [0.3.3] - 2026-05-22
-
-Wire-passthrough verification for `expires_from`/`expires_to` and `finalized_from`/`finalized_to` query params on `listReservations`. Implements `cycles-protocol-v0.yaml` revision 2026-05-22 ([runcycles/cycles-protocol#98](https://github.com/runcycles/cycles-protocol/pull/98)) on the client side; runcycles/cycles-server#163 ships the server impl. Closes the TypeScript-client side of runcycles/cycles-server#162.
-
-### Added
-
-- Regression test on `client.listReservations` confirming the four new ISO-8601 window params are URL-encoded and forwarded to the query string. The existing `params?: Record<string, string>` signature already accepted them — the test locks the contract so future tightening cannot drop them silently. Colons URL-encoded to `%3A` per native fetch + URLSearchParams behavior.
-
-### Notes
-
-- No protocol or wire-format change. Servers older than v0.1.25.21 silently ignore the new params per the additive-parameter guarantee in `cycles-protocol-v0.yaml`.
-- 317 tests pass; coverage 98.4% statements / 99.62% lines (gate ≥95% per `CLAUDE.md`).
-
-## [0.3.2] - 2026-05-21
-
-Wire-passthrough verification for the new `from` / `to` query params on `listReservations`. Implements `cycles-protocol-v0.yaml` revision 2026-05-21 ([runcycles/cycles-protocol#97](https://github.com/runcycles/cycles-protocol/pull/97)) on the client side; runcycles/cycles-server#160 ships the server impl.
-
-### Added
-
-- Regression test on `client.listReservations` confirming that `from` / `to` ISO-8601 date-time params are URL-encoded and forwarded to the query string. The client's `params?: Record<string, string>` signature already accepted these — the test locks the contract so future tightening cannot drop them silently. Both colons are URL-encoded (`from=2026-05-21T00%3A00%3A00Z`).
-
-### Notes
-
-- No protocol or wire-format change. Servers older than v0.1.25.20 silently ignore the new params per the additive-parameter guarantee in `cycles-protocol-v0.yaml`.
-- 316 tests pass; coverage 98.4% statements / 99.62% lines (gate ≥95% per `CLAUDE.md`).
+- Library changes are additive or bug fixes; there is no breaking API or wire-format change.
+- Evidence/JWKS endpoints and the remaining additive response-mapping work are outside this release and remain tracked in [#134](https://github.com/runcycles/cycles-client-typescript/issues/134).
+- 339 tests pass; coverage is 98.61% statements and 99.81% lines. Lint, typecheck, build, dependency audit, and package dry-run are clean.
 
 ## [0.3.1] - 2026-05-07
 
