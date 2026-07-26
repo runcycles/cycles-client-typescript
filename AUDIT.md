@@ -15,13 +15,13 @@
 
 ## 2026-07-26 — development and security-workflow maintenance
 
-Dependabot PRs #165–#169 update the SHA-pinned CodeQL SARIF uploader to
-4.37.3 and checkout to 7.0.1, plus the resolved development toolchain to
-ESLint 10.8.0 and TypeScript ESLint parser/plugin 8.65.0. These updates affect
-CI, linting, and the lockfile only; published client code, package dependencies,
-public types, wire mappers, and protocol behavior are unchanged. Node 20/22
-tests, 95%+ coverage, typecheck, lint, build, package, CodeQL, and audit checks
-passed on the reviewed and rebased heads.
+Dependabot PRs #164–#169 update OSSF Scorecard to 2.4.4, the SHA-pinned CodeQL
+SARIF uploader to 4.37.3 and checkout to 7.0.1, plus the resolved development
+toolchain to ESLint 10.8.0 and TypeScript ESLint parser/plugin 8.65.0. These
+updates affect CI, linting, and the lockfile only; published client code,
+package dependencies, public types, wire mappers, and protocol behavior are
+unchanged. Node 20/22 tests, 95%+ coverage, typecheck, lint, build, package,
+CodeQL, and audit checks passed on all six heads.
 
 ## Summary
 
