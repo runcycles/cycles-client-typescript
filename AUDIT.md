@@ -13,6 +13,16 @@
 
 ---
 
+## 2026-07-26 — development and security-workflow maintenance
+
+Dependabot PRs #165–#169 update the SHA-pinned CodeQL SARIF uploader to
+4.37.3 and checkout to 7.0.1, plus the resolved development toolchain to
+ESLint 10.8.0 and TypeScript ESLint parser/plugin 8.65.0. These updates affect
+CI, linting, and the lockfile only; published client code, package dependencies,
+public types, wire mappers, and protocol behavior are unchanged. Node 20/22
+tests, 95%+ coverage, typecheck, lint, build, package, CodeQL, and audit checks
+passed on the reviewed and rebased heads.
+
 ## Summary
 
 The table covers the SDK surface implemented in this repository. The v0.1.25.15 evidence/JWKS endpoints and remaining additive response fields are not yet modeled; those known gaps remain explicitly deferred to [#134](https://github.com/runcycles/cycles-client-typescript/issues/134) and are not claimed as part of v0.3.4.
