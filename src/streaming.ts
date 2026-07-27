@@ -319,12 +319,25 @@ export async function reserveForStream(
               // max_extensions in seconds. A grant is treated as
               // lead-clamped when it is non-positive (no lease movement)
               // or both well below the requested ttl AND explainable as
-              // elapsed time (<= 1.25x the time since the last applied
-              // extend). Only a REAL per-extend grant may tighten the
-              // cadence.
+              // elapsed time: within the 0.75x-1.25x BAND of the time
+              // since the last applied extend. The band must be two-sided
+              // (Rust-port finding, adopted fleet-wide): after a leadMin
+              // skip the next grant arrives across a doubled gap, so a
+              // genuine grant-clamped server (grant/2 cadence) also shows
+              // grant ~ elapsed exactly once — an upper bound alone would
+              // classify it as lead-clamped and the hold would
+              // self-sustain (at the held cadence grant stays <= elapsed
+              // forever, decaying the lease to a lapse). With the band, a
+              // real maximum-lead clamp tracks ANY gap with ratio ~ 1 and
+              // stays held, while the post-skip real grant lands in the
+              // hold once: at the held cadence its ratio falls to ~ 0.5,
+              // exits the band, and the cadence re-tightens. Only a REAL
+              // per-extend grant may tighten the cadence.
               if (
                 grant <= 0 ||
-                (grant < 0.9 * ttlMs && grant <= 1.25 * elapsedSinceSuccess)
+                (grant < 0.9 * ttlMs &&
+                  grant >= 0.75 * elapsedSinceSuccess &&
+                  grant <= 1.25 * elapsedSinceSuccess)
               ) {
                 // Hold the cadence — never tighten it — and keep
                 // extending every beat: lastGrant ~ elapsed keeps leadMin

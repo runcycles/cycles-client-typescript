@@ -883,8 +883,9 @@ describe("reserveForStream", () => {
     // fire ~60 beats; it fires exactly one, at the held 30s.
     await vi.advanceTimersByTimeAsync(30000);
     expect(client.extendReservation).toHaveBeenCalledTimes(2);
-    // grant = 30000 = elapsed (<= 1.25x) -> still lead-clamped: held
-    // cadence, extends every beat (leadMin stays ~0 < 1.5x lastGrant).
+    // grant = 30000 = elapsed (ratio 1, inside the 0.75x-1.25x band) ->
+    // still lead-clamped: held cadence, extends every beat (leadMin
+    // stays ~0 < 1.5x lastGrant).
     await vi.advanceTimersByTimeAsync(30000);
     expect(client.extendReservation).toHaveBeenCalledTimes(3);
     await vi.advanceTimersByTimeAsync(30000);
@@ -896,6 +897,76 @@ describe("reserveForStream", () => {
     );
     expect(clampWarns).toHaveLength(1);
     expect(String(clampWarns[0][0])).toContain("max_extensions");
+
+    await handle.commit(500);
+    vi.useRealTimers();
+  });
+
+  it("heartbeat grant-clamp after a skip: holds once across the doubled gap, then re-tightens (no sticky lead-clamp)", async () => {
+    vi.useFakeTimers();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const client = makeMockClient();
+    const e0 = 1_000_000_000;
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-hb-postskip",
+        affected_scopes: [],
+        expires_at_ms: e0,
+      }),
+    );
+    // Genuine GRANT clamp: every extend grants exactly ttl/4 = 15000.
+    let expiry = e0;
+    client.extendReservation.mockImplementation(async () => {
+      expiry += 15000;
+      return CyclesResponse.success(200, { status: "ACTIVE", expires_at_ms: expiry });
+    });
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+      ttlMs: 60000,
+    });
+
+    // Beats 1-3 extend at the grant-derived 7.5s cadence (elapsed 0 then
+    // 7500; grant 15000 misses the 0.75x-1.25x band -> normal regime).
+    await vi.advanceTimersByTimeAsync(0);
+    expect(client.extendReservation).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(7500);
+    expect(client.extendReservation).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(7500);
+    expect(client.extendReservation).toHaveBeenCalledTimes(3);
+    // Beat 4 at 22500: leadMin 45000-22500=22500 >= 1.5*15000 -> skip.
+    await vi.advanceTimersByTimeAsync(7500);
+    expect(client.extendReservation).toHaveBeenCalledTimes(3);
+    // Beat 5 at 30000 extends ACROSS THE DOUBLED GAP: elapsed since the
+    // last applied extend (b3@15000) is 15000 = grant, ratio 1 — inside
+    // the band -> lands in the hold ONCE (interval becomes the held 30s).
+    await vi.advanceTimersByTimeAsync(7500);
+    expect(client.extendReservation).toHaveBeenCalledTimes(4);
+    // The hold must NOT self-sustain: nothing fires before the held 30s
+    // wait elapses...
+    await vi.advanceTimersByTimeAsync(29_999);
+    expect(client.extendReservation).toHaveBeenCalledTimes(4);
+    // ...then beat 6 at 60000 extends (leadMin 60000-60000=0): grant
+    // 15000 vs elapsed 30000 gives ratio 0.5 — EXITS the band, so the
+    // cadence re-tightens to the grant-derived 7500ms.
+    await vi.advanceTimersByTimeAsync(1);
+    expect(client.extendReservation).toHaveBeenCalledTimes(5);
+    // Beat 7 at 67500: leadMin 75000-67500=7500 < 22500 -> extend.
+    await vi.advanceTimersByTimeAsync(7500);
+    expect(client.extendReservation).toHaveBeenCalledTimes(6);
+
+    // The transient hold triggers the clamp warn (once per heartbeat).
+    const clampWarns = warnSpy.mock.calls.filter((c) =>
+      String(c[0]).includes("clamp lease lead"),
+    );
+    expect(clampWarns).toHaveLength(1);
+    warnSpy.mockRestore();
 
     await handle.commit(500);
     vi.useRealTimers();

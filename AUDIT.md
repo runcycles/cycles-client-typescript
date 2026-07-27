@@ -1,6 +1,6 @@
 # Cycles Protocol v0.1.25 — Client (TypeScript) Audit
 
-**Date:** 2026-07-27 (v0.4.1 — heartbeat measured-grant lead accounting (v2.3) fixes expiry drift and halves `max_extensions` consumption; spec review round 4: first beat fires immediately (delay 0 — any bounded delay can outlive a small capped lease) and cadence is regime-split (real per-extend grants tighten to `clamp(grant/2, 500 ms, ttl/2)`; lead-clamped grants — non-positive, or `< 0.9×ttl` and `≤ 1.25×` elapsed — hold at `min(ttl/2, 30 s)` with a once-per-heartbeat warn); the HTTP `Date` header is fully out of the heartbeat (`computeEffectiveTtlMs` deleted; `serverDateMs` stays as a general accessor); `extend_by_ms` always the requested ttl; permanent extend rejections (incl. `TENANT_CLOSED`, `NOT_FOUND`) stop the heartbeat; extend retries reuse the idempotency key; estimate-fallback commits marked `metadata.actual_source="estimate"`. 433 tests pass at 99.0% line coverage.),
+**Date:** 2026-07-27 (v0.4.1 — heartbeat measured-grant lead accounting (v2.3) fixes expiry drift and halves `max_extensions` consumption; spec review round 4: first beat fires immediately (delay 0 — any bounded delay can outlive a small capped lease) and cadence is regime-split (real per-extend grants tighten to `clamp(grant/2, 500 ms, ttl/2)`; lead-clamped grants — non-positive, or `< 0.9×ttl` and within the two-sided `0.75–1.25×`-elapsed band (Rust-port finding: an upper bound alone made the post-skip hold sticky) — hold at `min(ttl/2, 30 s)` with a once-per-heartbeat warn); the HTTP `Date` header is fully out of the heartbeat (`computeEffectiveTtlMs` deleted; `serverDateMs` stays as a general accessor); `extend_by_ms` always the requested ttl; permanent extend rejections (incl. `TENANT_CLOSED`, `NOT_FOUND`) stop the heartbeat; extend retries reuse the idempotency key; estimate-fallback commits marked `metadata.actual_source="estimate"`. 435 tests pass at 99.0% line coverage.),
 2026-07-27 (v0.4.0 — durable commit retries: on-disk pending-commit journal with next-run replay and POST /v1/events recovery; first-attempt 429/401/403 never release; Retry-After persisted; streaming commit() resolves on transient failures. Review round 2 adds `flushPendingCommits()`, unclassifiable-4xx retention, 410-by-status expiry, delay clamps, and journal-parse strictness. See the dated entries below. 407 tests pass at 99.0% line coverage.),
 2026-07-24 (v0.3.4 release prep — package and changelog aligned; vendored contract fixture refreshed from runtime protocol v0.1.24 to v0.1.25.15 at `cycles-protocol@99f1391`; exact `ErrorCode` contract assertion updated for `LIMIT_EXCEEDED` and `TENANT_CLOSED`; test-only `fast-uri` updated to 3.1.4. Clean install and audit pass with zero vulnerabilities; 339 tests pass at 98.61% statement / 99.81% line coverage; lint, typecheck, build, and package dry-run are clean.),
 2026-07-10 (v0.3.4 — `TENANT_CLOSED` support from runtime spec v0.1.25.13: `ErrorCode.TENANT_CLOSED`, exported `TenantClosedError`, `CyclesProtocolError.isTenantClosed()`, and reservation-time typed exception mapping. Also `LIMIT_EXCEEDED` support from v0.1.25.12, retry classification, and `Retry-After` header exposure through `CyclesResponse.retryAfterMsHeader`.),
@@ -40,14 +40,24 @@ maximum-LEAD clamp (server holds `expires_at_ms ≈ now + L`) successive
 `expires_at_ms` differences measure elapsed time, not lease — deriving
 cadence from them would collapse to the 500 ms floor and burn
 `max_extensions` in seconds — so a grant that is non-positive, or both
-`< 0.9×ttl` and `≤ 1.25×` the elapsed time since the last applied
-extend, HOLDS the cadence at `min(ttl/2, 30 s)`, warns once per
-heartbeat that the server appears to clamp lease lead and the extension
-budget will deplete, and keeps extending every beat (`lastGrant ≈
-elapsed` keeps `leadMin` under the skip threshold — desired liveness). A
-real grant re-derives `clamp(grant/2, 500 ms, ttl/2)` — a grant-size
-clamp (24 h request granted 1 h) tightens the beats to 30 min
-automatically. Failed extends retry next beat at the current cadence
+`< 0.9×ttl` and within the two-sided `0.75–1.25×` band of the elapsed
+time since the last applied extend, HOLDS the cadence at
+`min(ttl/2, 30 s)`, warns once per heartbeat that the server appears to
+clamp lease lead and the extension budget will deplete, and keeps
+extending every beat (`lastGrant ≈ elapsed` keeps `leadMin` under the
+skip threshold — desired liveness). The band is two-sided (Rust-port
+finding, adopted fleet-wide): after a `leadMin` skip the next grant
+arrives across a doubled gap, so a genuine grant-clamped server
+(cadence `grant/2`) also shows `grant ≈ elapsed` exactly once — an
+upper bound alone classified it as lead-clamped and the hold
+self-sustained (at the held cadence grant stays `≤` elapsed forever;
+a 15 s-per-extend lease banks +15 s per 30 s and decays to a lapse).
+With the band, a real lead clamp tracks any gap at ratio ≈ 1 and stays
+held; the post-skip real grant lands in the hold once, then at the held
+cadence its ratio falls to ≈ 0.5, exits the band, and the cadence
+re-tightens. A real grant re-derives `clamp(grant/2, 500 ms, ttl/2)` —
+a grant-size clamp (24 h request granted 1 h) tightens the beats to
+30 min automatically. Failed extends retry next beat at the current cadence
 with the SAME idempotency key (lost responses cannot double-extend);
 410 / `RESERVATION_EXPIRED` / `RESERVATION_FINALIZED` /
 `MAX_EXTENSIONS_EXCEEDED` / `TENANT_CLOSED` / `NOT_FOUND` stop the
@@ -65,7 +75,7 @@ left, so `computeEffectiveTtlMs` is deleted (`CyclesResponse.serverDateMs`
 remains a general accessor). Also, estimate-fallback commits (`actual`
 not configured) carry `metadata.actual_source = "estimate"`, which flows
 into the `/v1/events` fallback body; streaming commits always take an
-explicit actual and are unmarked. 433 tests pass; line coverage 99.0%,
+explicit actual and are unmarked. 435 tests pass; line coverage 99.0%,
 branch 94.2% (gates 95/85); lint and typecheck clean.
 
 ## 2026-07-27 — Durable-retry review fixes (PR #172 round 2)
