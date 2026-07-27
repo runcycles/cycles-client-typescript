@@ -1,6 +1,6 @@
 # Cycles Protocol v0.1.25 — Client (TypeScript) Audit
 
-**Date:** 2026-07-27 (v0.4.0 — durable commit retries: on-disk pending-commit journal with next-run replay and POST /v1/events recovery; first-attempt 429/401/403 never release; Retry-After persisted; streaming commit() resolves on transient failures. See the dated entry below. 384 tests pass at 98.83% line coverage.),
+**Date:** 2026-07-27 (v0.4.0 — durable commit retries: on-disk pending-commit journal with next-run replay and POST /v1/events recovery; first-attempt 429/401/403 never release; Retry-After persisted; streaming commit() resolves on transient failures. Review round 2 adds `flushPendingCommits()`, unclassifiable-4xx retention, 410-by-status expiry, delay clamps, and journal-parse strictness. See the dated entries below. 407 tests pass at 99.0% line coverage.),
 2026-07-24 (v0.3.4 release prep — package and changelog aligned; vendored contract fixture refreshed from runtime protocol v0.1.24 to v0.1.25.15 at `cycles-protocol@99f1391`; exact `ErrorCode` contract assertion updated for `LIMIT_EXCEEDED` and `TENANT_CLOSED`; test-only `fast-uri` updated to 3.1.4. Clean install and audit pass with zero vulnerabilities; 339 tests pass at 98.61% statement / 99.81% line coverage; lint, typecheck, build, and package dry-run are clean.),
 2026-07-10 (v0.3.4 — `TENANT_CLOSED` support from runtime spec v0.1.25.13: `ErrorCode.TENANT_CLOSED`, exported `TenantClosedError`, `CyclesProtocolError.isTenantClosed()`, and reservation-time typed exception mapping. Also `LIMIT_EXCEEDED` support from v0.1.25.12, retry classification, and `Retry-After` header exposure through `CyclesResponse.retryAfterMsHeader`.),
 2026-07-04 (v0.3.4 — fixes the `EventCreateResponse.charged` mapper drop found by fleet audit #134 item 1: the field was declared on the interface but `eventCreateResponseFromWire` never mapped it, so the effective charge on `ALLOW_IF_AVAILABLE`-capped events was silently lost. Two regression tests pin presence and absence. Remaining audit findings stay tracked in #134.),
@@ -13,6 +13,20 @@
 **Server audit:** See `cycles-server/AUDIT.md` (all passing)
 
 ---
+
+## 2026-07-27 — Durable-retry review fixes (PR #172 round 2)
+
+Adversarial-review fixes on the durability feature: public
+`flushPendingCommits(timeoutMs?)` flushes every engine in the process
+(engines self-register; serverless handlers flush before returning);
+unclassifiable 4xx (codeless or unrecognized error code) now retains the
+journal instead of releasing/discarding, and bodyless HTTP 410 is
+classified as expired; honored `Retry-After`/restored floors clamped to
+1 h; flush race timer cleared; base journal dir chmod 0700 and stale
+`*.tmp` GC; journal parse rejects `mode: null` and array bodies; empty
+event fallback treated as absent; whitespace-only tenant falls back to
+the API-key principal. 407 tests pass; line coverage 99.0%, branch 93.9%
+(gates 95/85); lint and typecheck clean. v0.4.0.
 
 ## 2026-07-27 — Durable commit retries (journal + /v1/events fallback)
 

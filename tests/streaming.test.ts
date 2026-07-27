@@ -759,6 +759,104 @@ describe("reserveForStream", () => {
     expect(client.releaseReservation).toHaveBeenCalledOnce();
   });
 
+  it("commit treats a bodyless 410 as expired and uses the event fallback", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const client = makeMockClient({ retryEnabled: false });
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-410",
+        affected_scopes: [],
+      }),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.httpError(410, "Gone"), // no JSON body at all
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+    });
+
+    await handle.commit(500);
+    expect(handle.finalized).toBe(true);
+
+    const files = journalFiles();
+    expect(files).toHaveLength(1);
+    const record = JSON.parse(
+      fs.readFileSync(
+        path.join(defaultJournalDir(), authFingerprint("http://localhost", "key"), files[0]),
+        "utf-8",
+      ),
+    );
+    expect(record.mode).toBe("event");
+    expect(record.event_fallback_body.metadata.recovered_reservation_id).toBe("r-410");
+    warnSpy.mockRestore();
+  });
+
+  it("commit journals instead of throwing on an unrecognized 4xx code", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const client = makeMockClient({ retryEnabled: false });
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-future",
+        affected_scopes: [],
+      }),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.httpError(400, "weird", {
+        error: "SOME_FUTURE_CODE",
+        message: "m",
+        request_id: "r",
+      }),
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+    });
+
+    // Unclassifiable: the spend already happened — resolve, journal, retain.
+    await handle.commit(500);
+    expect(handle.finalized).toBe(true);
+    expect(journalFiles()).toHaveLength(1);
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("unclassifiable"));
+    errorSpy.mockRestore();
+    warnSpy.mockRestore();
+  });
+
+  it("commit journals instead of throwing on a codeless 4xx", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const client = makeMockClient({ retryEnabled: false });
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-codeless",
+        affected_scopes: [],
+      }),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.httpError(400, "Bad request"),
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+    });
+
+    await handle.commit(500);
+    expect(handle.finalized).toBe(true);
+    expect(journalFiles()).toHaveLength(1);
+    errorSpy.mockRestore();
+    warnSpy.mockRestore();
+  });
+
   it("commit journals with the Retry-After floor on a rate-limited response", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const client = makeMockClient({ retryEnabled: false });

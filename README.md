@@ -720,8 +720,9 @@ A commit records spend that has already happened, so the SDK never lets one exis
 - **Backoff formula:** `min(initialDelay * multiplier^attempt, maxDelay)` — defaults to 500ms, 1s, 2s, 4s, 8s
 - **Rate limiting:** 429 / `LIMIT_EXCEEDED` is transient everywhere — a rate-limited first commit is scheduled for retry (never released, which would return budget for spend that already happened), and the next attempt waits at least the server's `Retry-After`. The floor is persisted as an absolute timestamp, so a restart mid-wait still honors it.
 - **Authentication failures:** 401/403 on any commit attempt journals the spend (never releases it) and stops the current run's attempts, so spend recorded during a key misconfiguration or rotation window replays once credentials are fixed.
-- **Expired reservations:** a commit answered `RESERVATION_EXPIRED` — where the server has already returned the reserved budget to the pool — is recovered via `POST /v1/events` (the protocol's post-hoc direct-debit endpoint), reusing the commit's idempotency key and tagging `metadata.recovered_reservation_id` for reconciliation.
-- **Genuine rejections** (e.g. `UNIT_MISMATCH`) stop retries and discard the journal entry — retrying cannot fix a malformed commit.
+- **Expired reservations:** a commit answered `RESERVATION_EXPIRED` (or a bodyless HTTP 410) — where the server has already returned the reserved budget to the pool — is recovered via `POST /v1/events` (the protocol's post-hoc direct-debit endpoint), reusing the commit's idempotency key and tagging `metadata.recovered_reservation_id` for reconciliation.
+- **Genuine rejections** — 4xx responses carrying a **recognized** protocol error code (e.g. `UNIT_MISMATCH`) — stop retries and discard the journal entry — retrying cannot fix a malformed commit. Codeless, mangled, or unknown (forward-compat) error codes are *not* treated as rejections: the spend record is journaled and retained for replay instead of being released or discarded.
+- **Delay clamp:** any server-requested wait (`Retry-After`, persisted floors) is honored for at most 1 hour.
 - Applies to `withCycles` **and** the streaming adapter's `handle.commit()`; the programmatic client (`client.commitReservation`) stays manual.
 - Retry timers are ref'd, so a naturally-draining Node process waits for in-flight retries; `process.exit()`, crashes, and signals are covered by journal replay on the next run. Set `journalEnabled: false` (or `CYCLES_JOURNAL_ENABLED=false`) to opt out.
 
@@ -735,6 +736,23 @@ new CyclesConfig({
   retryInitialDelay: 1000,    // start slower
 });
 ```
+
+### Serverless: flush before the handler returns
+
+Background retries run on timers, and serverless platforms (Lambda, Vercel, Cloud Functions) may freeze or kill the process as soon as your handler resolves. Call `flushPendingCommits()` to wait — bounded — for all in-flight commit retries across the process (including the engines `withCycles` and `reserveForStream` create internally) before returning the response:
+
+```typescript
+import { flushPendingCommits } from "runcycles";
+
+export async function handler(event: unknown) {
+  const result = await guardedWork(event);
+  // Bounded wait; defaults to the max retryFlushTimeout (10 s) among engines.
+  await flushPendingCommits();       // or flushPendingCommits(2_000)
+  return result;
+}
+```
+
+Anything still pending when the deadline elapses stays journaled and replays on the next warm start.
 
 ## Heartbeat
 

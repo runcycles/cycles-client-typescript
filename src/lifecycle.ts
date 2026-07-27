@@ -11,6 +11,8 @@ import {
   reservationCreateResponseFromWire,
 } from "./mappers.js";
 import {
+  ErrorCode,
+  errorCodeFromString,
   isMetricsEmpty,
   type CyclesMetrics,
   type Decision,
@@ -419,9 +421,10 @@ export class AsyncCyclesLifecycle {
         this._retryEngine.schedule(reservationId, commitBody, eventFallbackBody);
         return;
       }
-      if (errorCode === "RESERVATION_EXPIRED") {
+      if (response.status === 410 || errorCode === "RESERVATION_EXPIRED") {
         // The server has already returned the reserved budget to the pool;
-        // recover the spend via the post-hoc direct-debit endpoint.
+        // recover the spend via the post-hoc direct-debit endpoint. The
+        // status check catches bodyless 410 Gone responses.
         console.warn(
           `[runcycles] Reservation expired before commit; recovering spend via POST /v1/events: ${reservationId}`,
         );
@@ -435,10 +438,25 @@ export class AsyncCyclesLifecycle {
         return;
       }
       if (response.isClientError) {
-        await this._handleRelease(
-          reservationId,
-          `commit_rejected_${errorCode ?? "unknown"}`,
+        if (
+          errorCode !== undefined &&
+          errorCodeFromString(errorCode) !== ErrorCode.UNKNOWN
+        ) {
+          // Recognized protocol code — a genuine rejection the retry
+          // engine cannot fix. Releasing returns the reserved budget.
+          await this._handleRelease(
+            reservationId,
+            `commit_rejected_${errorCode}`,
+          );
+          return;
+        }
+        // Codeless, mangled, or forward-compat unknown 4xx: unclassifiable.
+        // Never release or discard real spend on a response we cannot
+        // interpret — journal it for background retry / next-run replay.
+        console.error(
+          `[runcycles] Commit got unclassifiable client error (status=${response.status}, error=${String(errorCode)}); journaling for replay: ${reservationId}`,
         );
+        this._retryEngine.schedule(reservationId, commitBody, eventFallbackBody);
         return;
       }
     } catch {

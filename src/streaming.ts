@@ -39,7 +39,7 @@ import {
 import type { CyclesResponse } from "./response.js";
 import { CommitRetryEngine } from "./retry.js";
 import type { Caps, CyclesMetrics, Decision, Subject } from "./models.js";
-import { isMetricsEmpty } from "./models.js";
+import { ErrorCode, errorCodeFromString, isMetricsEmpty } from "./models.js";
 import {
   validateExtendByMs,
   validateGracePeriodMs,
@@ -83,10 +83,12 @@ export interface StreamReservation {
    * Throws `CyclesError` if the handle is already finalized.
    *
    * Durability: transient failures (transport/5xx/429), authentication
-   * failures, and post-expiry commits are handled internally — journaled
-   * and retried in the background (with a `POST /v1/events` fallback once
-   * the reservation has expired) — and resolve normally. Only genuine
-   * rejections (e.g. UNIT_MISMATCH) reset `finalized` and throw.
+   * failures, post-expiry commits, and unclassifiable client errors
+   * (codeless or unrecognized error codes) are handled internally —
+   * journaled and retried in the background (with a `POST /v1/events`
+   * fallback once the reservation has expired) — and resolve normally.
+   * Only genuine rejections carrying a recognized protocol error code
+   * (e.g. UNIT_MISMATCH) reset `finalized` and throw.
    */
   commit(
     actual: number,
@@ -311,7 +313,8 @@ export async function reserveForStream(
         retryEngine.schedule(reservationId, commitBody, eventFallback);
         return;
       }
-      if (errorCode === "RESERVATION_EXPIRED") {
+      if (response.status === 410 || errorCode === "RESERVATION_EXPIRED") {
+        // The status check catches bodyless 410 Gone responses.
         console.warn(
           `[runcycles] Reservation expired before commit; recovering spend via POST /v1/events: ${reservationId}`,
         );
@@ -328,16 +331,31 @@ export async function reserveForStream(
         return;
       }
 
-      // Genuine rejection (e.g. UNIT_MISMATCH): reset finalized so the
-      // caller can correct and retry commit or fall back to release. The
-      // heartbeat is NOT restarted to avoid spawning duplicate heartbeat
-      // chains (an old in-flight extend's .finally→tick could race with a
-      // new startHeartbeat call). The reservation's remaining TTL should
-      // give the caller enough time to retry or release.
-      finalized = false;
-      throw new CyclesError(
-        `Commit failed with status ${response.status}: ${response.errorMessage ?? "unknown error"}`,
+      if (
+        response.isClientError &&
+        errorCode !== undefined &&
+        errorCodeFromString(errorCode) !== ErrorCode.UNKNOWN
+      ) {
+        // Genuine rejection (e.g. UNIT_MISMATCH — a recognized protocol
+        // code): reset finalized so the caller can correct and retry
+        // commit or fall back to release. The heartbeat is NOT restarted
+        // to avoid spawning duplicate heartbeat chains (an old in-flight
+        // extend's .finally→tick could race with a new startHeartbeat
+        // call). The reservation's remaining TTL should give the caller
+        // enough time to retry or release.
+        finalized = false;
+        throw new CyclesError(
+          `Commit failed with status ${response.status}: ${response.errorMessage ?? "unknown error"}`,
+        );
+      }
+
+      // Codeless, mangled, or forward-compat unknown client error:
+      // unclassifiable. Never throw away real spend on a response we
+      // cannot interpret — journal it for background retry / replay.
+      console.error(
+        `[runcycles] Stream commit got unclassifiable client error (status=${response.status}, error=${String(errorCode)}); journaling for replay: ${reservationId}`,
       );
+      retryEngine.schedule(reservationId, commitBody, eventFallback);
     },
 
     async release(reason?: string): Promise<void> {

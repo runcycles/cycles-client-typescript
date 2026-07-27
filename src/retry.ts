@@ -25,9 +25,26 @@ import {
   defaultJournalDir,
   type PendingCommitRecord,
 } from "./journal.js";
+import { ErrorCode, errorCodeFromString } from "./models.js";
+
+/**
+ * Upper bound on any honored server-requested or restored delay (1 hour).
+ * A mangled Retry-After or a corrupted journal floor must not park a spend
+ * record for days, and Node's setTimeout silently overflows past 2^31-1 ms.
+ */
+const MAX_HONORED_DELAY_MS = 3_600_000;
+
+function clampDelay(ms: number): number {
+  return Math.min(ms, MAX_HONORED_DELAY_MS);
+}
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** True when the response carries a recognized protocol error code. */
+function hasRecognizedErrorCode(code: string | undefined): boolean {
+  return code !== undefined && errorCodeFromString(code) !== ErrorCode.UNKNOWN;
 }
 
 interface PendingCommit {
@@ -61,9 +78,41 @@ function extractErrorCode(response: CyclesResponse): string | undefined {
 // from replaying.
 const claimedDirs = new Set<string>();
 
+// Every constructed engine self-registers so `flushPendingCommits()` can
+// reach engines that live only inside closures (withCycles lifecycles and
+// stream handles). Engines are few and long-lived — one per client
+// identity in practice — so holding them strongly is fine.
+const engineRegistry = new Set<CommitRetryEngine>();
+
 /** @internal — test use only. */
 export function _resetReplayStateForTests(): void {
   claimedDirs.clear();
+  engineRegistry.clear();
+}
+
+/**
+ * Flush every registered retry engine under one shared deadline.
+ *
+ * Waits (bounded) for all in-flight background commit retries across the
+ * whole process — including engines created internally by `withCycles`
+ * and `reserveForStream`. Anything still pending when the deadline
+ * elapses stays journaled and replays on the next run.
+ *
+ * Call this before returning a response in serverless environments,
+ * where the platform may freeze or kill the process as soon as the
+ * handler resolves.
+ *
+ * @param timeoutMs Shared deadline in ms. Defaults to the maximum
+ *   `retryFlushTimeout` among registered engines.
+ */
+export async function flushPendingCommits(timeoutMs?: number): Promise<void> {
+  const engines = [...engineRegistry];
+  if (engines.length === 0) return;
+  const timeout =
+    timeoutMs ?? Math.max(...engines.map((e) => e._flushTimeoutMs));
+  // Each flush races against the same duration, started together — one
+  // shared deadline for the whole set. flush() never rejects.
+  await Promise.all(engines.map((engine) => engine.flush(timeout)));
 }
 
 export class CommitRetryEngine {
@@ -96,6 +145,12 @@ export class CommitRetryEngine {
         path.join(base, authFingerprint(config.baseUrl, config.apiKey, config.tenant)),
       );
     }
+    engineRegistry.add(this);
+  }
+
+  /** @internal — flushPendingCommits() deadline derivation. */
+  get _flushTimeoutMs(): number {
+    return this._flushTimeout;
   }
 
   setClient(client: CyclesClient): void {
@@ -119,7 +174,7 @@ export class CommitRetryEngine {
     if (retryAfterMs !== undefined) {
       // A rate-limited first attempt passes its Retry-After along so the
       // first background retry honors the server's delay.
-      pending.retryAfterMs = retryAfterMs;
+      pending.retryAfterMs = clampDelay(retryAfterMs);
     }
     this._submit(pending);
   }
@@ -143,7 +198,16 @@ export class CommitRetryEngine {
     if (timeout <= 0) return;
     const pending = [...this._inFlight];
     if (pending.length === 0) return;
-    await Promise.race([Promise.allSettled(pending), delay(timeout)]);
+    // Cancellable timeout: when the pending work settles first, the timer
+    // must not linger and hold the event loop open for the full duration.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      Promise.allSettled(pending),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, timeout);
+      }),
+    ]);
+    clearTimeout(timer);
   }
 
   private _submit(pending: PendingCommit): void {
@@ -192,9 +256,10 @@ export class CommitRetryEngine {
         attempt: 0,
       };
       // Restore a persisted Retry-After floor as a relative delay; a floor
-      // already in the past falls back to normal backoff.
+      // already in the past falls back to normal backoff. Clamped so a
+      // corrupted timestamp cannot park the replay for days.
       if (entry.notBeforeMs !== undefined && entry.notBeforeMs > nowMs) {
-        pending.retryAfterMs = entry.notBeforeMs - nowMs;
+        pending.retryAfterMs = clampDelay(entry.notBeforeMs - nowMs);
       }
       this._spawn(pending);
     }
@@ -241,7 +306,7 @@ export class CommitRetryEngine {
     }
     const retryAfterMs = response.retryAfterMsHeader;
     if (retryAfterMs !== undefined) {
-      pending.retryAfterMs = retryAfterMs;
+      pending.retryAfterMs = clampDelay(retryAfterMs);
       // Persist the floor: a restart during a long Retry-After wait must
       // not replay into the window the server told us to avoid.
       this._journalRecord(pending);
@@ -324,8 +389,13 @@ export class CommitRetryEngine {
     }
     if (response.isClientError) {
       const code = extractErrorCode(response);
-      if (code === "RESERVATION_EXPIRED") {
-        if (pending.eventFallbackBody) {
+      // The status check catches bodyless 410s — expiry sweeps may answer
+      // 410 Gone with no JSON body.
+      if (response.status === 410 || code === "RESERVATION_EXPIRED") {
+        if (
+          pending.eventFallbackBody &&
+          Object.keys(pending.eventFallbackBody).length > 0
+        ) {
           console.warn(
             `[runcycles] Reservation expired before commit landed; falling back to POST /v1/events: ${pending.reservationId}`,
           );
@@ -339,10 +409,21 @@ export class CommitRetryEngine {
         );
         return true;
       }
-      console.warn(
-        `[runcycles] Commit retry got non-retryable error: ${pending.reservationId}, status=${response.status}, error=${String(code)}`,
+      if (hasRecognizedErrorCode(code)) {
+        // A recognized protocol code is a genuine rejection — retrying
+        // cannot fix a malformed commit, so the journal entry is dropped.
+        console.warn(
+          `[runcycles] Commit retry got non-retryable error: ${pending.reservationId}, status=${response.status}, error=${String(code)}`,
+        );
+        this._journalDiscard(pending.reservationId);
+        return true;
+      }
+      // Codeless, mangled, or forward-compat unknown 4xx: unclassifiable.
+      // Terminal for this run, but the spend record is retained — a proxy
+      // error page or a future error code must not discard real spend.
+      console.error(
+        `[runcycles] Commit retry got unclassifiable client error (status=${response.status}, error=${String(code)}); journal entry retained for replay on next run: ${pending.reservationId}`,
       );
-      this._journalDiscard(pending.reservationId);
       return true;
     }
     return false;
@@ -367,10 +448,19 @@ export class CommitRetryEngine {
       return true;
     }
     if (response.isClientError) {
+      const code = extractErrorCode(response);
+      if (hasRecognizedErrorCode(code)) {
+        console.error(
+          `[runcycles] Event fallback rejected (${String(code)}); spend recovery failed: ${pending.reservationId}, status=${response.status}`,
+        );
+        this._journalDiscard(pending.reservationId);
+        return true;
+      }
+      // Unclassifiable 4xx (codeless or unknown code): terminal for this
+      // run, but the spend record is retained for replay.
       console.error(
-        `[runcycles] Event fallback rejected (${String(extractErrorCode(response))}); spend recovery failed: ${pending.reservationId}, status=${response.status}`,
+        `[runcycles] Event fallback got unclassifiable client error (status=${response.status}, error=${String(code)}); journal entry retained for replay on next run: ${pending.reservationId}`,
       );
-      this._journalDiscard(pending.reservationId);
       return true;
     }
     return false;

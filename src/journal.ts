@@ -29,6 +29,8 @@ import * as path from "node:path";
 
 const RECORD_VERSION = 1;
 const SUFFIX = ".json";
+/** Temp files from crashed writers older than this are garbage-collected. */
+const STALE_TMP_MAX_AGE_MS = 3_600_000;
 
 /** Test seam: overrides the default journal location. */
 let _defaultDirOverride: string | undefined;
@@ -67,7 +69,13 @@ export function authFingerprint(
   apiKey: string,
   tenant?: string,
 ): string {
-  const principal = tenant ? `tenant\n${tenant}` : `key\n${apiKey}`;
+  // Presence check trims (a whitespace-only tenant is absent), but the
+  // principal uses the raw untrimmed value — byte-compatible with the
+  // Python and Java SDK derivations.
+  const principal =
+    tenant !== undefined && tenant.trim() !== ""
+      ? `tenant\n${tenant}`
+      : `key\n${apiKey}`;
   const cacheKey = `${baseUrl}\n${principal}`;
   const cached = digestCache.get(cacheKey);
   if (cached !== undefined) return cached;
@@ -131,7 +139,9 @@ function recordToJson(record: PendingCommitRecord): string {
 function recordFromJson(raw: string): PendingCommitRecord {
   const data = JSON.parse(raw) as Record<string, unknown>;
   const reservationId = data.reservation_id;
-  const mode = data.mode ?? "commit";
+  // An absent mode defaults to "commit"; an explicit null is rejected
+  // below like any other invalid mode (parity with the Python/Java SDKs).
+  const mode = data.mode === undefined ? "commit" : data.mode;
   if (typeof reservationId !== "string" || reservationId === "") {
     throw new Error("journal record missing reservation_id");
   }
@@ -140,6 +150,10 @@ function recordFromJson(raw: string): PendingCommitRecord {
   }
   const commitBody = data.commit_body;
   const eventFallbackBody = data.event_fallback_body;
+  // Arrays satisfy typeof === "object" but are not valid request bodies.
+  if (Array.isArray(commitBody) || Array.isArray(eventFallbackBody)) {
+    throw new Error("journal record has array-valued body");
+  }
   if (mode === "commit" && (commitBody === null || typeof commitBody !== "object")) {
     throw new Error("commit-mode journal record missing commit_body");
   }
@@ -183,6 +197,9 @@ export class CommitJournal {
   record(entry: PendingCommitRecord): void {
     try {
       fs.mkdirSync(this.directory, { recursive: true });
+      // Tighten the base (parent) directory too — mkdirSync recursive may
+      // have just created it with default (looser) permissions.
+      restrictPermissions(path.dirname(this.directory), 0o700);
       restrictPermissions(this.directory, 0o700);
       const target = path.join(this.directory, safeFilename(entry.reservationId));
       // Unique temp name per writer: concurrent processes may settle the
@@ -236,10 +253,23 @@ export class CommitJournal {
       if (!fs.existsSync(this.directory)) {
         return entries;
       }
-      const names = fs
-        .readdirSync(this.directory)
-        .filter((n) => n.endsWith(SUFFIX))
-        .sort();
+      const allNames = fs.readdirSync(this.directory);
+      // Best-effort GC: temp files from crashed writers older than an hour
+      // can never be renamed into place — delete them so the directory does
+      // not accumulate garbage forever.
+      const staleBefore = Date.now() - STALE_TMP_MAX_AGE_MS;
+      for (const name of allNames) {
+        if (!name.endsWith(".tmp")) continue;
+        const tmpPath = path.join(this.directory, name);
+        try {
+          if (fs.statSync(tmpPath).mtimeMs < staleBefore) {
+            fs.rmSync(tmpPath, { force: true });
+          }
+        } catch {
+          // best-effort cleanup
+        }
+      }
+      const names = allNames.filter((n) => n.endsWith(SUFFIX)).sort();
       for (const name of names) {
         const filePath = path.join(this.directory, name);
         let entry: PendingCommitRecord;
