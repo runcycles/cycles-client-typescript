@@ -236,35 +236,6 @@ export const PERMANENT_EXTEND_ERROR_CODES: ReadonlySet<string> = new Set([
   "NOT_FOUND", // a 404'd reservation never comes back
 ]);
 
-/**
- * Estimate the first granted TTL from the create response — a first-beat
- * cadence HINT only, never a correctness input.
- *
- * Tenant policy `max_reservation_ttl_ms` silently CAPS the granted TTL at
- * reserve time (governance default: 1 hour) and the create response has no
- * effective-TTL field. `expires_at_ms - HTTP Date header` recovers a rough
- * estimate of the grant, but the two are NOT a safe same-clock pair: per
- * RFC 9110 the `Date` header is a whole-second, best-effort origination
- * timestamp that intermediaries may replace, and in the reference server
- * `expires_at_ms` comes from Redis `TIME` while `Date` comes from the
- * servlet container. The heartbeat therefore uses this value only to
- * TIGHTEN the first-beat delay (which is already capped at 30 s); all
- * lead accounting uses measured server-frame grants instead. Returns the
- * raw derived value floored at 0, or undefined when either timestamp is
- * missing — no upward clamp: fabricating lease the server never granted
- * is worse than a pessimistic hint.
- */
-export function computeEffectiveTtlMs(
-  requestedTtlMs: number,
-  expiresAtMs: number | undefined,
-  serverDateMs: number | undefined,
-): number | undefined {
-  if (expiresAtMs === undefined || serverDateMs === undefined) {
-    return undefined;
-  }
-  return Math.max(expiresAtMs - serverDateMs, 0);
-}
-
 /** Extract the wire error code from a non-2xx response (body-tolerant). */
 export function extractExtendErrorCode(response: {
   getErrorResponse: () => { error?: string } | undefined;
@@ -366,20 +337,9 @@ export class AsyncCyclesLifecycle {
       balances: resResult.balances,
     };
 
-    // Start heartbeat. The Date-derived grant estimate is a first-beat
-    // cadence hint only (see computeEffectiveTtlMs); the requested ttl is
-    // what every extend asks for.
-    const estGrantMs = computeEffectiveTtlMs(
-      ttlMs,
-      resResult.expiresAtMs,
-      resResponse.serverDateMs,
-    );
-    const heartbeatRef = this._startHeartbeat(
-      reservationId,
-      ttlMs,
-      estGrantMs,
-      ctx,
-    );
+    // Start heartbeat. The requested ttl is what every extend asks for;
+    // the first beat fires immediately (see _startHeartbeat).
+    const heartbeatRef = this._startHeartbeat(reservationId, ttlMs, ctx);
 
     try {
       const result = await runWithContext(ctx, () => fn(...args));
@@ -550,32 +510,30 @@ export class AsyncCyclesLifecycle {
 
   /**
    * `ttlMs` is the REQUESTED ttl: it is what every `extend_by_ms` asks for
-   * and it bounds the beat cadence. `estGrantMs` is the Date-derived
-   * first-grant estimate (see {@link computeEffectiveTtlMs}) — a first-beat
-   * cadence HINT only, never a correctness input.
+   * and it bounds the beat cadence.
    */
   private _startHeartbeat(
     reservationId: string,
     ttlMs: number,
-    estGrantMs: number | undefined,
     ctx: CyclesContext,
   ): { stop: () => void } | undefined {
     if (ttlMs <= 0) return undefined;
     validateExtendByMs(ttlMs);
-    // First-beat delay: ttl/2 capped at 30 s. Tenant policy
+    // The FIRST beat fires IMMEDIATELY (delay 0). Tenant policy
     // max_reservation_ttl_ms may have silently capped the granted TTL far
-    // below the requested one (governance default: 1 hour) and the create
-    // response has no effective-TTL field, so the first beat must land
-    // early regardless of what was actually granted. The Date-derived
-    // estimate, when available and positive, can only TIGHTEN this delay.
-    // After the first applied grant the cadence re-derives from the
-    // MEASURED grant: clamp(lastGrant/2, 500, ttl/2). The 500 ms floor
-    // cannot starve liveness — it binds only when the server grants less
-    // than 1 s per extend, i.e. below the spec's own minimum ttl_ms.
-    let intervalMs = Math.min(ttlMs / 2, 30_000);
-    if (estGrantMs !== undefined && estGrantMs > 0) {
-      intervalMs = Math.min(intervalMs, estGrantMs / 2);
-    }
+    // below the requested one (governance default: 1 hour), the create
+    // response has no effective-TTL field, and spec review round 4
+    // confirmed that ANY bounded first-beat delay can outlive a small
+    // capped lease — so the first extend primes the lease with a real,
+    // measurable grant right away instead of gambling on an unknowable
+    // one. After each applied grant the cadence re-derives from the
+    // MEASURED grant: clamp(grant/2, 500, ttl/2), except under a lead
+    // clamp (see the regime split in the success handler), where it holds
+    // at min(ttl/2, 30 s). The 500 ms floor cannot starve liveness — it
+    // binds only when the server grants less than 1 s per extend, i.e.
+    // below the spec's own minimum ttl_ms.
+    const heldIntervalMs = Math.min(ttlMs / 2, 30_000);
+    let intervalMs = heldIntervalMs;
     let stopped = false;
     let currentTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -605,6 +563,10 @@ export class AsyncCyclesLifecycle {
     const anchor = performance.now();
     let grantsSum = 0;
     let lastGrant: number | undefined;
+    // Monotonic time of the last APPLIED extend (heartbeat start before
+    // the first one) — the baseline for the lead-clamp regime test.
+    let lastSuccessMono: number | undefined;
+    let leadClampWarned = false;
     // Idempotency key of an extend whose outcome we never saw. It is
     // reused on the retry so a lost response cannot double-extend.
     let pendingKey: string | undefined;
@@ -649,9 +611,40 @@ export class AsyncCyclesLifecycle {
                   : prevExpiry !== undefined
                     ? prevExpiry + ttlMs
                     : undefined;
-              grantsSum += grant;
-              lastGrant = grant;
-              intervalMs = Math.min(Math.max(grant / 2, 500), ttlMs / 2);
+              const now = performance.now();
+              const elapsedSinceSuccess = now - (lastSuccessMono ?? anchor);
+              lastSuccessMono = now;
+              // Regime split (spec review round 4). Under a maximum-LEAD
+              // clamp the server holds expires_at_ms ~ now + L, so the
+              // difference of successive expires_at_ms values measures
+              // ELAPSED TIME, not granted lease — deriving the cadence
+              // from it would collapse the interval to the floor and burn
+              // max_extensions in seconds. A grant is treated as
+              // lead-clamped when it is non-positive (no lease movement)
+              // or both well below the requested ttl AND explainable as
+              // elapsed time (<= 1.25x the time since the last applied
+              // extend). Only a REAL per-extend grant may tighten the
+              // cadence.
+              if (
+                grant <= 0 ||
+                (grant < 0.9 * ttlMs && grant <= 1.25 * elapsedSinceSuccess)
+              ) {
+                // Hold the cadence — never tighten it — and keep
+                // extending every beat: lastGrant ~ elapsed keeps leadMin
+                // below the skip threshold, which is exactly the desired
+                // behavior under a lead clamp.
+                intervalMs = heldIntervalMs;
+                if (!leadClampWarned) {
+                  leadClampWarned = true;
+                  console.warn(
+                    `[runcycles] Server appears to clamp lease lead (extend moved expires_at_ms by ${grant}ms in ${Math.round(elapsedSinceSuccess)}ms); holding heartbeat cadence at ${heldIntervalMs}ms — the extension budget (max_extensions) will deplete: ${reservationId}`,
+                  );
+                }
+              } else {
+                intervalMs = Math.min(Math.max(grant / 2, 500), ttlMs / 2);
+              }
+              grantsSum += Math.max(grant, 0);
+              lastGrant = Math.max(grant, 0);
               if (prevExpiry !== undefined) {
                 ctx.expiresAtMs = prevExpiry;
               }
@@ -687,7 +680,13 @@ export class AsyncCyclesLifecycle {
       }, delayMs);
     };
 
-    tick(intervalMs);
+    // Immediate first beat — see the comment above heldIntervalMs. The
+    // 0 delay applies to this first schedule ONLY: every reschedule (in
+    // .finally and on skip) passes intervalMs, which starts at
+    // heldIntervalMs and never becomes 0 — so a transient failure on the
+    // immediate first attempt waits a full held interval before the
+    // retry instead of hot-looping against a down server.
+    tick(0);
     return {
       stop: () => {
         stopped = true;

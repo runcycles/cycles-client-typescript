@@ -15,7 +15,14 @@ function makeMockClient(
     createReservation: vi.fn(),
     commitReservation: vi.fn(),
     releaseReservation: vi.fn(),
-    extendReservation: vi.fn(),
+    // Default: a benign applied extend (2xx, no expires_at_ms -> the
+    // heartbeat falls back to the requested-ttl grant). The first beat is
+    // immediate, so any test that lets a macrotask elapse would otherwise
+    // crash on an unmocked extend. Tests that exercise the heartbeat
+    // override this per-scenario.
+    extendReservation: vi
+      .fn()
+      .mockResolvedValue(CyclesResponse.success(200, { status: "ACTIVE" })),
     createEvent: vi.fn(),
   };
 }
@@ -524,7 +531,7 @@ describe("reserveForStream", () => {
     vi.useRealTimers();
   });
 
-  it("heartbeat leadMin: extends beats 1-4, skips beat 5", async () => {
+  it("heartbeat leadMin: immediate first beat, extends beats 1-3, skips beat 4", async () => {
     vi.useFakeTimers();
     const client = makeMockClient();
     const e0 = 1_000_000_000; // server-frame initial expiry
@@ -554,20 +561,20 @@ describe("reserveForStream", () => {
     });
 
     // leadMin = grantsSum - elapsed starts at 0 (initial grant never
-    // counted); each measured grant adds 60000, each 30s beat subtracts
-    // 30000. Beat 1 at 30s: lastGrant undefined -> extend.
-    await vi.advanceTimersByTimeAsync(30000);
+    // counted); each measured grant adds 60000, each 30s of elapsed
+    // subtracts 30000. Beat 1 fires IMMEDIATELY (delay 0).
+    await vi.advanceTimersByTimeAsync(0);
     expect(client.extendReservation).toHaveBeenCalledTimes(1);
-    // Beat 2 at 60s: leadMin 0 < 1.5*60000 -> extend
+    // Beat 2 at 30s: leadMin 60000-30000=30000 < 1.5*60000 -> extend
     await vi.advanceTimersByTimeAsync(30000);
     expect(client.extendReservation).toHaveBeenCalledTimes(2);
-    // Beat 3 at 90s: leadMin 30000 < 90000 -> extend
+    // Beat 3 at 60s: leadMin 120000-60000=60000 < 90000 -> extend
     await vi.advanceTimersByTimeAsync(30000);
     expect(client.extendReservation).toHaveBeenCalledTimes(3);
-    // Beat 4 at 120s: leadMin 60000 < 90000 -> extend
+    // Beat 4 at 90s: leadMin 180000-90000=90000 >= 90000 -> skip
     await vi.advanceTimersByTimeAsync(30000);
-    expect(client.extendReservation).toHaveBeenCalledTimes(4);
-    // Beat 5 at 150s: leadMin 90000 >= 90000 -> skip
+    expect(client.extendReservation).toHaveBeenCalledTimes(3);
+    // Beat 5 at 120s: leadMin 180000-120000=60000 < 90000 -> extend
     await vi.advanceTimersByTimeAsync(30000);
     expect(client.extendReservation).toHaveBeenCalledTimes(4);
 
@@ -615,13 +622,14 @@ describe("reserveForStream", () => {
       ttlMs: 60000,
     });
 
-    // Beat 1: attempt fails (non-2xx)
-    await vi.advanceTimersByTimeAsync(30000);
+    // Beat 1 (immediate): attempt fails (non-2xx)
+    await vi.advanceTimersByTimeAsync(0);
     expect(client.extendReservation).toHaveBeenCalledTimes(1);
-    // Beat 2: retried, succeeds
+    // Beat 2 at 30s: retried, succeeds
     await vi.advanceTimersByTimeAsync(30000);
     expect(client.extendReservation).toHaveBeenCalledTimes(2);
-    // Beat 3: lead still small (one grant applied) -> extends, fresh key
+    // Beat 3 at 60s: lead still small (one grant applied, leadMin =
+    // 60000 - 60000 = 0) -> extends, fresh key
     await vi.advanceTimersByTimeAsync(30000);
     expect(client.extendReservation).toHaveBeenCalledTimes(3);
 
@@ -630,6 +638,56 @@ describe("reserveForStream", () => {
     const keys = client.extendReservation.mock.calls.map((c: any[]) => c[1].idempotency_key);
     expect(keys[1]).toBe(keys[0]);
     expect(keys[2]).not.toBe(keys[0]);
+
+    await handle.commit(500);
+    vi.useRealTimers();
+  });
+
+  it("heartbeat first-beat 503 waits the held interval before retrying (no hot loop), same key", async () => {
+    vi.useFakeTimers();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const client = makeMockClient();
+    const e0 = 1_000_000_000;
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-hb-first503",
+        affected_scopes: [],
+        expires_at_ms: e0,
+      }),
+    );
+    let calls = 0;
+    client.extendReservation.mockImplementation(async () => {
+      calls += 1;
+      if (calls === 1) return CyclesResponse.httpError(503, "Service unavailable");
+      return CyclesResponse.success(200, { status: "ACTIVE", expires_at_ms: e0 + 60000 });
+    });
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+      ttlMs: 60000,
+    });
+
+    // Beat 1 (immediate, delay 0) fails transiently.
+    await vi.advanceTimersByTimeAsync(0);
+    expect(client.extendReservation).toHaveBeenCalledTimes(1);
+    // The retry must wait the HELD interval min(ttl/2, 30s) = 30s — the 0
+    // delay applies to the first schedule only; a 0-delay reschedule
+    // would hot-loop against a down server.
+    await vi.advanceTimersByTimeAsync(29_999);
+    expect(client.extendReservation).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(client.extendReservation).toHaveBeenCalledTimes(2);
+
+    // The retry reuses the SAME idempotency key as the unresolved attempt.
+    const keys = client.extendReservation.mock.calls.map((c: any[]) => c[1].idempotency_key);
+    expect(keys[1]).toBe(keys[0]);
+    warnSpy.mockRestore();
 
     await handle.commit(500);
     vi.useRealTimers();
@@ -662,11 +720,11 @@ describe("reserveForStream", () => {
       ttlMs: 60000,
     });
 
-    // Beat 1: extend rejected permanently -> heartbeat stops
-    await vi.advanceTimersByTimeAsync(30000);
+    // Beat 1 (immediate): extend rejected permanently -> heartbeat stops
+    await vi.advanceTimersByTimeAsync(0);
     expect(client.extendReservation).toHaveBeenCalledTimes(1);
-    // Beats 2-4: no further extend attempts
-    await vi.advanceTimersByTimeAsync(90000);
+    // Subsequent beats: no further extend attempts
+    await vi.advanceTimersByTimeAsync(120000);
     expect(client.extendReservation).toHaveBeenCalledTimes(1);
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining("permanently rejected"),
@@ -710,44 +768,41 @@ describe("reserveForStream", () => {
       ttlMs: 60000,
     });
 
-    // Grants of 60000 (fallback, then measured) with 30s beats:
-    // extends at beats 1-4, skip at beat 5.
-    await vi.advanceTimersByTimeAsync(30000);
+    // Grants of 60000 (fallback, then measured) with an immediate first
+    // beat and 30s cadence: extends at beats 1-3, skip at beat 4, extend
+    // at beat 5.
+    await vi.advanceTimersByTimeAsync(0);
     expect(client.extendReservation).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(30000);
     expect(client.extendReservation).toHaveBeenCalledTimes(2);
     await vi.advanceTimersByTimeAsync(30000);
     expect(client.extendReservation).toHaveBeenCalledTimes(3);
     await vi.advanceTimersByTimeAsync(30000);
-    expect(client.extendReservation).toHaveBeenCalledTimes(4);
+    expect(client.extendReservation).toHaveBeenCalledTimes(3); // skip
     await vi.advanceTimersByTimeAsync(30000);
-    expect(client.extendReservation).toHaveBeenCalledTimes(4); // skip
+    expect(client.extendReservation).toHaveBeenCalledTimes(4);
 
     await handle.commit(500);
     vi.useRealTimers();
   });
 
-  it("heartbeat capped grants: 30s first beat, cadence from the measured 1h grant, extend_by stays requested", async () => {
+  it("heartbeat capped grants: immediate first beat, cadence from the measured 1h grant, extend_by stays requested", async () => {
     vi.useFakeTimers();
     const client = makeMockClient();
-    // Requested 24h, but every grant is capped at 1h. The Date-derived
-    // estimate (1h) is a cadence HINT only: first-beat delay is
-    // min(requested/2 = 12h, 30s, est/2 = 30min) = 30s.
-    const d0 = Date.parse("Wed, 21 Oct 2026 07:28:00 GMT"); // server frame
+    // Requested 24h, but every grant is capped at 1h. The first beat
+    // fires IMMEDIATELY — no bounded delay can be proven safe against an
+    // unknowable capped lease — and primes a real measured grant.
+    const e0 = 5_000_000_000; // server-frame initial expiry
     const oneHour = 3_600_000;
     client.createReservation.mockResolvedValue(
-      CyclesResponse.success(
-        200,
-        {
-          decision: "ALLOW",
-          reservation_id: "r-hb-capped",
-          affected_scopes: [],
-          expires_at_ms: d0 + oneHour,
-        },
-        { date: new Date(d0).toUTCString() },
-      ),
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-hb-capped",
+        affected_scopes: [],
+        expires_at_ms: e0,
+      }),
     );
-    let expiry = d0 + oneHour;
+    let expiry = e0;
     client.extendReservation.mockImplementation(async () => {
       expiry += oneHour;
       return CyclesResponse.success(200, { status: "ACTIVE", expires_at_ms: expiry });
@@ -763,22 +818,84 @@ describe("reserveForStream", () => {
       ttlMs: 86_400_000,
     });
 
-    // First beat at 30s (the cap) — NOT requestedTtl/2 = 12h, which would
-    // be 11h past the capped expiry.
-    await vi.advanceTimersByTimeAsync(29_000);
+    // Beat 1 fires immediately (delay 0) — NOT at requestedTtl/2 = 12h
+    // and not even at 30s.
     expect(client.extendReservation).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(1000);
+    await vi.advanceTimersByTimeAsync(0);
     expect(client.extendReservation).toHaveBeenCalledTimes(1);
-    // Cadence re-derives from the MEASURED 1h grant -> 30min beats, and
-    // every beat extends while leadMin < 1.5h.
+    // The measured 1h grant is a REAL per-extend amount (1h >> 1.25x
+    // elapsed 0), so the cadence re-derives to 30min beats and every beat
+    // extends while leadMin < 1.5h.
     await vi.advanceTimersByTimeAsync(oneHour / 2);
     expect(client.extendReservation).toHaveBeenCalledTimes(2);
     await vi.advanceTimersByTimeAsync(oneHour / 2);
     expect(client.extendReservation).toHaveBeenCalledTimes(3);
-    // extend_by_ms always requests the REQUESTED 24h — never the estimate.
+    // extend_by_ms always requests the REQUESTED 24h — never an estimate.
     for (const call of client.extendReservation.mock.calls) {
       expect(call[1].extend_by_ms).toBe(86_400_000);
     }
+
+    await handle.commit(500);
+    vi.useRealTimers();
+  });
+
+  it("heartbeat lead clamp: cadence holds at min(ttl/2, 30s), extends every beat, warns once", async () => {
+    vi.useFakeTimers();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const client = makeMockClient();
+    // Maximum-LEAD clamp: the server holds expires_at_ms ~ now + L, so
+    // every extend response returns INITIAL + elapsed and successive
+    // differences measure ELAPSED time, not lease. The cadence must hold
+    // at min(ttl/2, 30s) instead of collapsing to the 500ms floor and
+    // burning max_extensions in seconds.
+    const e0 = 5_000_000_000;
+    const t0 = Date.now();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-hb-leadclamp",
+        affected_scopes: [],
+        expires_at_ms: e0,
+      }),
+    );
+    client.extendReservation.mockImplementation(async () =>
+      CyclesResponse.success(200, {
+        status: "ACTIVE",
+        expires_at_ms: e0 + (Date.now() - t0),
+      }),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+      ttlMs: 60000,
+    });
+
+    // Beat 1 (immediate): grant = 0 (expiry unmoved) -> lead-clamp
+    // regime: held cadence, warn.
+    await vi.advanceTimersByTimeAsync(0);
+    expect(client.extendReservation).toHaveBeenCalledTimes(1);
+    // Had the cadence collapsed to the 500ms floor this advance would
+    // fire ~60 beats; it fires exactly one, at the held 30s.
+    await vi.advanceTimersByTimeAsync(30000);
+    expect(client.extendReservation).toHaveBeenCalledTimes(2);
+    // grant = 30000 = elapsed (<= 1.25x) -> still lead-clamped: held
+    // cadence, extends every beat (leadMin stays ~0 < 1.5x lastGrant).
+    await vi.advanceTimersByTimeAsync(30000);
+    expect(client.extendReservation).toHaveBeenCalledTimes(3);
+    await vi.advanceTimersByTimeAsync(30000);
+    expect(client.extendReservation).toHaveBeenCalledTimes(4);
+
+    // The lead-clamp warning fires exactly once per heartbeat.
+    const clampWarns = warnSpy.mock.calls.filter((c) =>
+      String(c[0]).includes("clamp lease lead"),
+    );
+    expect(clampWarns).toHaveLength(1);
+    expect(String(clampWarns[0][0])).toContain("max_extensions");
 
     await handle.commit(500);
     vi.useRealTimers();
@@ -810,10 +927,11 @@ describe("reserveForStream", () => {
       ttlMs: 60000,
     });
 
-    await vi.advanceTimersByTimeAsync(30000);
+    // Beat 1 (immediate) is rejected with NOT_FOUND.
+    await vi.advanceTimersByTimeAsync(0);
     expect(client.extendReservation).toHaveBeenCalledTimes(1);
     // A 404'd reservation never comes back — no further attempts.
-    await vi.advanceTimersByTimeAsync(90000);
+    await vi.advanceTimersByTimeAsync(120000);
     expect(client.extendReservation).toHaveBeenCalledTimes(1);
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining("permanently rejected"),

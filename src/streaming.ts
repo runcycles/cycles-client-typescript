@@ -33,7 +33,6 @@ import { buildProtocolException } from "./errors.js";
 import { CyclesError, CyclesProtocolError } from "./exceptions.js";
 import {
   buildEventFallbackBody,
-  computeEffectiveTtlMs,
   extractExtendErrorCode,
   PERMANENT_EXTEND_ERROR_CODES,
 } from "./lifecycle.js";
@@ -220,26 +219,21 @@ export async function reserveForStream(
   const startHeartbeat = (): void => {
     if (ttlMs <= 0) return;
     validateExtendByMs(ttlMs);
-    // First-beat delay: ttl/2 capped at 30 s. Tenant policy
+    // The FIRST beat fires IMMEDIATELY (delay 0). Tenant policy
     // max_reservation_ttl_ms may have silently capped the granted TTL far
-    // below the requested one (governance default: 1 hour) and the create
-    // response has no effective-TTL field, so the first beat must land
-    // early regardless of what was actually granted. The Date-derived
-    // estimate (see computeEffectiveTtlMs — a HINT only, never a
-    // correctness input) can only TIGHTEN this delay. After the first
-    // applied grant the cadence re-derives from the MEASURED grant:
-    // clamp(lastGrant/2, 500, ttl/2). The 500 ms floor cannot starve
-    // liveness — it binds only when the server grants less than 1 s per
-    // extend, i.e. below the spec's own minimum ttl_ms.
-    const estGrantMs = computeEffectiveTtlMs(
-      ttlMs,
-      parsed.expiresAtMs,
-      response.serverDateMs,
-    );
-    let intervalMs = Math.min(ttlMs / 2, 30_000);
-    if (estGrantMs !== undefined && estGrantMs > 0) {
-      intervalMs = Math.min(intervalMs, estGrantMs / 2);
-    }
+    // below the requested one (governance default: 1 hour), the create
+    // response has no effective-TTL field, and spec review round 4
+    // confirmed that ANY bounded first-beat delay can outlive a small
+    // capped lease — so the first extend primes the lease with a real,
+    // measurable grant right away instead of gambling on an unknowable
+    // one. After each applied grant the cadence re-derives from the
+    // MEASURED grant: clamp(grant/2, 500, ttl/2), except under a lead
+    // clamp (see the regime split in the success handler), where it holds
+    // at min(ttl/2, 30 s). The 500 ms floor cannot starve liveness — it
+    // binds only when the server grants less than 1 s per extend, i.e.
+    // below the spec's own minimum ttl_ms.
+    const heldIntervalMs = Math.min(ttlMs / 2, 30_000);
+    let intervalMs = heldIntervalMs;
 
     // Lead lower-bound extension. `extend_by_ms` extends relative to the
     // CURRENT expires_at_ms (spec), so blindly extending by ttlMs on
@@ -266,6 +260,10 @@ export async function reserveForStream(
     const anchor = performance.now();
     let grantsSum = 0;
     let lastGrant: number | undefined;
+    // Monotonic time of the last APPLIED extend (heartbeat start before
+    // the first one) — the baseline for the lead-clamp regime test.
+    let lastSuccessMono: number | undefined;
+    let leadClampWarned = false;
     // Idempotency key of an extend whose outcome we never saw. It is
     // reused on the retry so a lost response cannot double-extend.
     let pendingKey: string | undefined;
@@ -310,9 +308,40 @@ export async function reserveForStream(
                   : prevExpiry !== undefined
                     ? prevExpiry + ttlMs
                     : undefined;
-              grantsSum += grant;
-              lastGrant = grant;
-              intervalMs = Math.min(Math.max(grant / 2, 500), ttlMs / 2);
+              const now = performance.now();
+              const elapsedSinceSuccess = now - (lastSuccessMono ?? anchor);
+              lastSuccessMono = now;
+              // Regime split (spec review round 4). Under a maximum-LEAD
+              // clamp the server holds expires_at_ms ~ now + L, so the
+              // difference of successive expires_at_ms values measures
+              // ELAPSED TIME, not granted lease — deriving the cadence
+              // from it would collapse the interval to the floor and burn
+              // max_extensions in seconds. A grant is treated as
+              // lead-clamped when it is non-positive (no lease movement)
+              // or both well below the requested ttl AND explainable as
+              // elapsed time (<= 1.25x the time since the last applied
+              // extend). Only a REAL per-extend grant may tighten the
+              // cadence.
+              if (
+                grant <= 0 ||
+                (grant < 0.9 * ttlMs && grant <= 1.25 * elapsedSinceSuccess)
+              ) {
+                // Hold the cadence — never tighten it — and keep
+                // extending every beat: lastGrant ~ elapsed keeps leadMin
+                // below the skip threshold, which is exactly the desired
+                // behavior under a lead clamp.
+                intervalMs = heldIntervalMs;
+                if (!leadClampWarned) {
+                  leadClampWarned = true;
+                  console.warn(
+                    `[runcycles] Server appears to clamp lease lead (extend moved expires_at_ms by ${grant}ms in ${Math.round(elapsedSinceSuccess)}ms); holding heartbeat cadence at ${heldIntervalMs}ms — the extension budget (max_extensions) will deplete: ${reservationId}`,
+                  );
+                }
+              } else {
+                intervalMs = Math.min(Math.max(grant / 2, 500), ttlMs / 2);
+              }
+              grantsSum += Math.max(grant, 0);
+              lastGrant = Math.max(grant, 0);
               return;
             }
             // Failure: KEEP pendingKey so the next beat retries with the
@@ -343,7 +372,13 @@ export async function reserveForStream(
       }, delayMs);
     };
 
-    tick(intervalMs);
+    // Immediate first beat — see the comment above heldIntervalMs. The
+    // 0 delay applies to this first schedule ONLY: every reschedule (in
+    // .finally and on skip) passes intervalMs, which starts at
+    // heldIntervalMs and never becomes 0 — so a transient failure on the
+    // immediate first attempt waits a full held interval before the
+    // retry instead of hot-looping against a down server.
+    tick(0);
   };
 
   startHeartbeat();
