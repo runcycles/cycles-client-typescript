@@ -16,6 +16,12 @@ export class CyclesConfig {
   readonly retryInitialDelay: number;
   readonly retryMultiplier: number;
   readonly retryMaxDelay: number;
+  /** Bounded wait (ms) for in-flight commit retries in `flush()`. 0 disables. */
+  readonly retryFlushTimeout: number;
+  /** Durable journal for pending commits (survives process restarts). */
+  readonly journalEnabled: boolean;
+  /** Journal location; undefined → ~/.runcycles/commit-journal. */
+  readonly journalDir?: string;
 
   constructor(options: {
     baseUrl: string;
@@ -33,6 +39,9 @@ export class CyclesConfig {
     retryInitialDelay?: number;
     retryMultiplier?: number;
     retryMaxDelay?: number;
+    retryFlushTimeout?: number;
+    journalEnabled?: boolean;
+    journalDir?: string;
   }) {
     this.baseUrl = options.baseUrl;
     this.apiKey = options.apiKey;
@@ -49,6 +58,9 @@ export class CyclesConfig {
     this.retryInitialDelay = options.retryInitialDelay ?? 500;
     this.retryMultiplier = options.retryMultiplier ?? 2.0;
     this.retryMaxDelay = options.retryMaxDelay ?? 30_000;
+    this.retryFlushTimeout = options.retryFlushTimeout ?? 10_000;
+    this.journalEnabled = options.journalEnabled ?? true;
+    this.journalDir = options.journalDir;
   }
 
   static fromEnv(prefix = "CYCLES_"): CyclesConfig {
@@ -78,6 +90,9 @@ export class CyclesConfig {
       retryInitialDelay: optionalFloat(process.env[`${prefix}RETRY_INITIAL_DELAY`], 500),
       retryMultiplier: optionalFloat(process.env[`${prefix}RETRY_MULTIPLIER`], 2.0),
       retryMaxDelay: optionalFloat(process.env[`${prefix}RETRY_MAX_DELAY`], 30_000),
+      retryFlushTimeout: optionalFloat(process.env[`${prefix}RETRY_FLUSH_TIMEOUT`], 10_000),
+      journalEnabled: process.env[`${prefix}JOURNAL_ENABLED`]?.toLowerCase() !== "false",
+      journalDir: process.env[`${prefix}JOURNAL_DIR`],
     });
   }
 }

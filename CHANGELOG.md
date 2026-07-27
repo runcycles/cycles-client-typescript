@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-27
+
+Durable commit retries. Previously a commit that failed transiently lived only in a floating in-memory promise: `process.exit()`, a crash, or a signal dropped it, and once the reservation's grace period elapsed the server's expiry sweep returned the reserved budget to the pool, permanently under-counting spend that had already happened. Ports the full design from `cycles-client-python` v0.5.0 (PR runcycles/cycles-client-python#89, three review rounds).
+
+### Added
+
+- `src/journal.ts`: file-per-commit `CommitJournal` (atomic unique-temp-file write, idempotent replay). Config: `journalEnabled` (default `true`), `journalDir` (default `~/.runcycles/commit-journal`), `retryFlushTimeout` (default 10 s); env `CYCLES_JOURNAL_ENABLED`, `CYCLES_JOURNAL_DIR`, `CYCLES_RETRY_FLUSH_TIMEOUT`. Records are partitioned into per-identity subdirectories (directories `0700`, files `0600` where supported) keyed by a non-secret PBKDF2-HMAC-SHA256 fingerprint of the server plus principal — the configured `tenant` when set (rotation-safe), else the API key. The derivation is byte-compatible with the Python SDK, so same-tenant clients in both languages share an identity directory and can settle each other's records. The first engine created per identity replays surviving entries; corrupt files are renamed `*.corrupt`; a persisted `not_before_ms` floor makes `Retry-After` waits survive restarts.
+- Event fallback: a commit answered `RESERVATION_EXPIRED` (budget already returned to the pool) is recovered via `POST /v1/events`, reusing the commit idempotency key with `metadata.recovered_reservation_id` / `recovery_reason` markers and no `overage_policy` (spec default `ALLOW_IF_AVAILABLE` never rejects). Applies to `withCycles` and the streaming adapter.
+- Rate-limit awareness end to end: 429 / `LIMIT_EXCEEDED` on the first commit attempt schedules a retry instead of releasing the reservation, passing the server's `Retry-After` into the engine; on retried attempts the journal entry is retained and the next attempt waits at least `Retry-After`.
+- Authentication failures (401/403) on any commit attempt or event fallback journal the spend instead of releasing or discarding it.
+- `CommitRetryEngine.scheduleEvent()` and `flush(timeoutMs?)`.
+
+### Changed
+
+- **`StreamReservation.commit()` no longer throws on transient failures.** Transport errors, 5xx, 429, 401/403, and post-expiry commits are journaled and retried in the background (with the `/v1/events` fallback once expired) and resolve normally with `finalized` remaining `true`. Only genuine rejections (e.g. `UNIT_MISMATCH`) still reset `finalized` and throw so the caller can correct and retry or release. Previously every failure threw and reset `finalized`, leaving spend recovery entirely to the caller.
+- Retry-engine promises are tracked (awaitable via `flush()`) instead of floating; retries that exhaust or fail non-retryably retain their journal entry (transient/auth) or discard it (genuine rejection) instead of silently dropping the spend record.
+- With `retryEnabled: false`, failed commits are journaled for next-run replay instead of silently dropped (the old drop behavior remains only when the journal is also disabled).
+
 ## [0.3.4] - 2026-07-24
 
 Protocol error handling, response-mapping correctness, and release-pipeline hardening. This is the first published release after 0.3.1; the changes previously documented as 0.3.2 and 0.3.3 are included here because those versions were never tagged or published.

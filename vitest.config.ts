@@ -6,6 +6,7 @@ export default defineConfig({
   test: {
     environment: "node",
     pool: "threads",
+    setupFiles: ["tests/setup.ts"],
     coverage: {
       thresholds: {
         lines: 95,

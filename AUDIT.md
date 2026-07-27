@@ -1,6 +1,7 @@
 # Cycles Protocol v0.1.25 — Client (TypeScript) Audit
 
-**Date:** 2026-07-24 (v0.3.4 release prep — package and changelog aligned; vendored contract fixture refreshed from runtime protocol v0.1.24 to v0.1.25.15 at `cycles-protocol@99f1391`; exact `ErrorCode` contract assertion updated for `LIMIT_EXCEEDED` and `TENANT_CLOSED`; test-only `fast-uri` updated to 3.1.4. Clean install and audit pass with zero vulnerabilities; 339 tests pass at 98.61% statement / 99.81% line coverage; lint, typecheck, build, and package dry-run are clean.),
+**Date:** 2026-07-27 (v0.4.0 — durable commit retries: on-disk pending-commit journal with next-run replay and POST /v1/events recovery; first-attempt 429/401/403 never release; Retry-After persisted; streaming commit() resolves on transient failures. See the dated entry below. 384 tests pass at 98.83% line coverage.),
+2026-07-24 (v0.3.4 release prep — package and changelog aligned; vendored contract fixture refreshed from runtime protocol v0.1.24 to v0.1.25.15 at `cycles-protocol@99f1391`; exact `ErrorCode` contract assertion updated for `LIMIT_EXCEEDED` and `TENANT_CLOSED`; test-only `fast-uri` updated to 3.1.4. Clean install and audit pass with zero vulnerabilities; 339 tests pass at 98.61% statement / 99.81% line coverage; lint, typecheck, build, and package dry-run are clean.),
 2026-07-10 (v0.3.4 — `TENANT_CLOSED` support from runtime spec v0.1.25.13: `ErrorCode.TENANT_CLOSED`, exported `TenantClosedError`, `CyclesProtocolError.isTenantClosed()`, and reservation-time typed exception mapping. Also `LIMIT_EXCEEDED` support from v0.1.25.12, retry classification, and `Retry-After` header exposure through `CyclesResponse.retryAfterMsHeader`.),
 2026-07-04 (v0.3.4 — fixes the `EventCreateResponse.charged` mapper drop found by fleet audit #134 item 1: the field was declared on the interface but `eventCreateResponseFromWire` never mapped it, so the effective charge on `ALLOW_IF_AVAILABLE`-capped events was silently lost. Two regression tests pin presence and absence. Remaining audit findings stay tracked in #134.),
 2026-07-03 (integration-test-only, no version bump — the live-server "health check" test now probes the public `/actuator/health/readiness` endpoint instead of aggregate `/actuator/health`, which requires `X-Admin-API-Key` since cycles-server v0.1.25.45 and fails closed with 500 when the server has no admin key configured. Would have failed the org nightly Full-Stack Integration once the Python step ahead of it was fixed. No library code change.),
@@ -12,6 +13,21 @@
 **Server audit:** See `cycles-server/AUDIT.md` (all passing)
 
 ---
+
+## 2026-07-27 — Durable commit retries (journal + /v1/events fallback)
+
+Ports the cycles-client-python v0.5.0 durability design (PR
+runcycles/cycles-client-python#89, all three review rounds): pending
+commits are journaled to a per-identity directory (tenant-keyed PBKDF2
+fingerprint, byte-compatible with the Python SDK; `0700`/`0600` modes;
+unique per-writer temp files) before background retry, replayed on the
+next run, and recovered via `POST /v1/events` when the reservation
+expired. First-attempt 429 and 401/403 schedule retries instead of
+releasing; `Retry-After` floors persist across restarts as
+`not_before_ms`. `StreamReservation.commit()` now resolves on transient
+failures (journaled) and throws only on genuine rejections. 384 tests
+pass; line coverage 98.83%, branch 93.3% (gates 95/85); lint, typecheck,
+and build clean. v0.4.0.
 
 ## 2026-07-26 — development and security-workflow maintenance
 

@@ -71,7 +71,7 @@ describe("CommitRetryEngine", () => {
   });
 
   it("warns when all retry attempts are exhausted", async () => {
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
     const config = new CyclesConfig({
       baseUrl: "http://localhost",

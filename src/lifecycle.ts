@@ -181,6 +181,40 @@ function buildCommitBody(
   return body;
 }
 
+/**
+ * Build a POST /v1/events body that records the spend of a commit whose
+ * reservation expired before the commit landed (the server has already
+ * returned the reserved budget to the pool at that point).
+ *
+ * Reuses the commit's idempotency key — the event idempotency namespace is
+ * separate, so replays across process restarts stay exactly-once. Omits
+ * overage_policy: the spec default ALLOW_IF_AVAILABLE never rejects, which
+ * is the right bias when the spend has already happened.
+ */
+export function buildEventFallbackBody(
+  reservationId: string,
+  subject: Record<string, unknown>,
+  action: Record<string, unknown>,
+  commitBody: Record<string, unknown>,
+): Record<string, unknown> {
+  const metadata: Record<string, unknown> = {
+    ...((commitBody.metadata as Record<string, unknown> | undefined) ?? {}),
+    recovered_reservation_id: reservationId,
+    recovery_reason: "commit_after_reservation_expired",
+  };
+  const body: Record<string, unknown> = {
+    idempotency_key: commitBody.idempotency_key,
+    subject,
+    action,
+    actual: commitBody.actual,
+    metadata,
+  };
+  if ("metrics" in commitBody) {
+    body.metrics = commitBody.metrics;
+  }
+  return body;
+}
+
 /** Build wire-format release request body. */
 function buildReleaseBody(reason: string): Record<string, unknown> {
   return { idempotency_key: randomUUID(), reason };
@@ -313,7 +347,13 @@ export class AsyncCyclesLifecycle {
         metrics,
         ctx.commitMetadata,
       );
-      await this._handleCommit(reservationId, commitBody);
+      const eventFallback = buildEventFallbackBody(
+        reservationId,
+        createBody.subject as Record<string, unknown>,
+        createBody.action as Record<string, unknown>,
+        commitBody,
+      );
+      await this._handleCommit(reservationId, commitBody, eventFallback);
 
       return result;
     } catch (err) {
@@ -329,6 +369,7 @@ export class AsyncCyclesLifecycle {
   private async _handleCommit(
     reservationId: string,
     commitBody: Record<string, unknown>,
+    eventFallbackBody: Record<string, unknown>,
   ): Promise<void> {
     try {
       const response = await this._client.commitReservation(
@@ -340,7 +381,7 @@ export class AsyncCyclesLifecycle {
       }
 
       if (response.isTransportError || response.isServerError) {
-        this._retryEngine.schedule(reservationId, commitBody);
+        this._retryEngine.schedule(reservationId, commitBody, eventFallbackBody);
         return;
       }
 
@@ -356,10 +397,38 @@ export class AsyncCyclesLifecycle {
         }
       }
 
-      if (
-        errorCode === "RESERVATION_FINALIZED" ||
-        errorCode === "RESERVATION_EXPIRED"
-      ) {
+      if (response.status === 429 || errorCode === "LIMIT_EXCEEDED") {
+        // Rate-limited, not rejected: releasing here would return budget
+        // for spend that already happened. Retry instead, honoring the
+        // server's Retry-After.
+        this._retryEngine.schedule(
+          reservationId,
+          commitBody,
+          eventFallbackBody,
+          response.retryAfterMsHeader,
+        );
+        return;
+      }
+      if (response.status === 401 || response.status === 403) {
+        // Credentials failed after the spend happened: journal the commit
+        // for replay once they're fixed. Never release — that would return
+        // budget for real spend.
+        console.error(
+          `[runcycles] Commit got authentication failure (status=${response.status}); journaling for replay: ${reservationId}`,
+        );
+        this._retryEngine.schedule(reservationId, commitBody, eventFallbackBody);
+        return;
+      }
+      if (errorCode === "RESERVATION_EXPIRED") {
+        // The server has already returned the reserved budget to the pool;
+        // recover the spend via the post-hoc direct-debit endpoint.
+        console.warn(
+          `[runcycles] Reservation expired before commit; recovering spend via POST /v1/events: ${reservationId}`,
+        );
+        this._retryEngine.scheduleEvent(reservationId, eventFallbackBody);
+        return;
+      }
+      if (errorCode === "RESERVATION_FINALIZED") {
         return;
       }
       if (errorCode === "IDEMPOTENCY_MISMATCH") {
@@ -373,7 +442,7 @@ export class AsyncCyclesLifecycle {
         return;
       }
     } catch {
-      this._retryEngine.schedule(reservationId, commitBody);
+      this._retryEngine.schedule(reservationId, commitBody, eventFallbackBody);
     }
   }
 
