@@ -29,6 +29,7 @@ const RESPONSE_HEADERS = [
   "x-ratelimit-reset",
   "x-cycles-tenant",
   "retry-after",
+  "date",
 ] as const;
 
 const BALANCE_FILTER_PARAMS = new Set([

@@ -86,6 +86,23 @@ export class CyclesResponse {
     return Number.isInteger(seconds) ? seconds * 1000 : undefined;
   }
 
+  /**
+   * The HTTP `Date` response header parsed to epoch milliseconds.
+   *
+   * This is a server-frame timestamp: differencing it against other
+   * server-provided times (e.g. `expires_at_ms`) is clock-skew-free.
+   * The heartbeat uses it to recover the EFFECTIVE granted TTL when a
+   * tenant policy (`max_reservation_ttl_ms`) silently caps the requested
+   * one. Returns `undefined` when the header is absent or unparseable.
+   * HTTP-date resolution is 1 s, which the heartbeat margins absorb.
+   */
+  get serverDateMs(): number | undefined {
+    const val = this.headers["date"];
+    if (val === undefined) return undefined;
+    const parsed = Date.parse(val);
+    return Number.isNaN(parsed) ? undefined : parsed;
+  }
+
   get isSuccess(): boolean {
     return this.status >= 200 && this.status < 300;
   }

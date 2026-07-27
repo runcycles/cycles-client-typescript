@@ -33,6 +33,7 @@ import { buildProtocolException } from "./errors.js";
 import { CyclesError, CyclesProtocolError } from "./exceptions.js";
 import {
   buildEventFallbackBody,
+  computeEffectiveTtlMs,
   extractExtendErrorCode,
   PERMANENT_EXTEND_ERROR_CODES,
 } from "./lifecycle.js";
@@ -218,12 +219,21 @@ export async function reserveForStream(
 
   const startHeartbeat = (): void => {
     if (ttlMs <= 0) return;
-    validateExtendByMs(ttlMs);
-    // Beat every ttl/2 — deliberately NO lower floor. The spec's minimum
+    // Seed the heartbeat from the EFFECTIVE granted TTL — a tenant policy
+    // (max_reservation_ttl_ms) may have silently capped the requested one
+    // at reserve time. Used for the interval, the lead estimate, the skip
+    // threshold, and extend_by_ms alike.
+    const effTtlMs = computeEffectiveTtlMs(
+      ttlMs,
+      parsed.expiresAtMs,
+      response.serverDateMs,
+    );
+    validateExtendByMs(effTtlMs);
+    // Beat every effTtl/2 — deliberately NO lower floor. The spec's minimum
     // ttl_ms is 1000, so the interval is at least 500ms; a floor could only
     // ever bind for ttl < 2000, where beating slower than ttl/2 guarantees
     // the reservation lapses between beats.
-    const intervalMs = ttlMs / 2;
+    const intervalMs = effTtlMs / 2;
 
     // Lead-estimate extension. `extend_by_ms` extends relative to the
     // CURRENT expires_at_ms (spec), so blindly extending by ttlMs on every
@@ -238,14 +248,14 @@ export async function reserveForStream(
     // monotonic timestamps from client monotonic timestamps — the client
     // wall clock is never compared to the server's expires_at_ms:
     //
-    //   lead = (knownExpiry - initialExpiry) + ttlMs - (now - anchor)
+    //   lead = (knownExpiry - initialExpiry) + effTtlMs - (now - anchor)
     //
     // `grantedMs` tracks the server-frame difference
     // (knownExpiry - initialExpiry); when no server-frame reference is
     // available (create or extend response without a numeric
-    // expires_at_ms) it accumulates ttlMs per applied grant instead. The
-    // estimate is optimistic by at most one response leg, which the ttl/2
-    // cadence and the 1.5*ttl skip threshold absorb.
+    // expires_at_ms) it accumulates effTtlMs per applied grant instead.
+    // The estimate is optimistic by at most one response leg, which the
+    // ttl/2 cadence and the 1.5*ttl skip threshold absorb.
     const initialExpiry = parsed.expiresAtMs;
     let knownExpiry = initialExpiry;
     const anchor = performance.now();
@@ -259,15 +269,15 @@ export async function reserveForStream(
       currentTimer = setTimeout(() => {
         if (heartbeatStopped) return;
         const elapsed = performance.now() - anchor;
-        const leadMs = grantedMs + ttlMs - elapsed;
-        if (leadMs >= 1.5 * ttlMs) {
+        const leadMs = grantedMs + effTtlMs - elapsed;
+        if (leadMs >= 1.5 * effTtlMs) {
           // Plenty of lead — skip this beat (no server call).
           tick();
           return;
         }
         const key = pendingKey ?? randomUUID();
         pendingKey = key;
-        const extendBody = { idempotency_key: key, extend_by_ms: ttlMs };
+        const extendBody = { idempotency_key: key, extend_by_ms: effTtlMs };
         void client
           .extendReservation(reservationId, extendBody)
           .then((response) => {
@@ -292,12 +302,12 @@ export async function reserveForStream(
                 knownExpiry = newExpires;
               } else {
                 // No server-frame diff available — count the applied grant
-                // optimistically as +ttlMs of lead.
-                grantedMs += ttlMs;
+                // optimistically as +effTtlMs of lead.
+                grantedMs += effTtlMs;
                 if (typeof newExpires === "number") {
                   knownExpiry = newExpires;
                 } else if (knownExpiry !== undefined) {
-                  knownExpiry += ttlMs;
+                  knownExpiry += effTtlMs;
                 }
               }
               return;

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { AsyncCyclesLifecycle } from "../src/lifecycle.js";
+import { AsyncCyclesLifecycle, computeEffectiveTtlMs } from "../src/lifecycle.js";
 import { CyclesResponse } from "../src/response.js";
 import { CommitRetryEngine } from "../src/retry.js";
 import { CyclesConfig } from "../src/config.js";
@@ -782,6 +782,168 @@ describe("AsyncCyclesLifecycle", () => {
     );
 
     vi.useRealTimers();
+  });
+
+  it("heartbeat seeds from the EFFECTIVE granted ttl when tenant policy caps it", async () => {
+    vi.useFakeTimers();
+    const client = makeMockClient();
+    // Requested 24h, but tenant policy max_reservation_ttl_ms caps the
+    // grant at 1h: expires_at_ms - Date header = 1h.
+    const d0 = Date.parse("Wed, 21 Oct 2026 07:28:00 GMT"); // server frame
+    const oneHour = 3_600_000;
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(
+        200,
+        {
+          decision: "ALLOW",
+          reservation_id: "r-hb-capped",
+          affected_scopes: [],
+          expires_at_ms: d0 + oneHour,
+        },
+        { date: new Date(d0).toUTCString() },
+      ),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+    let expiry = d0 + oneHour;
+    client.extendReservation.mockImplementation(async () => {
+      expiry += oneHour;
+      return CyclesResponse.success(200, { status: "ACTIVE", expires_at_ms: expiry });
+    });
+
+    const retryEngine = makeRetryEngine();
+    const lifecycle = new AsyncCyclesLifecycle(client as any, retryEngine, { tenant: "acme" });
+
+    const result = await lifecycle.execute(
+      async () => {
+        // First beat at effectiveTtl/2 = 30min — NOT requestedTtl/2 = 12h,
+        // which would be 11h past the capped expiry.
+        await vi.advanceTimersByTimeAsync(oneHour / 2 - 1000);
+        expect(client.extendReservation).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(client.extendReservation).toHaveBeenCalledTimes(1);
+        // Second beat at 1h extends again (lead = 1h < 1.5h threshold).
+        await vi.advanceTimersByTimeAsync(oneHour / 2);
+        expect(client.extendReservation).toHaveBeenCalledTimes(2);
+        return "ok";
+      },
+      [],
+      { estimate: 1000, ttlMs: 86_400_000 },
+    );
+    expect(result).toBe("ok");
+
+    // extend_by_ms requests the EFFECTIVE ttl, not the capped-away 24h.
+    const extendBody = client.extendReservation.mock.calls[0][1];
+    expect(extendBody.extend_by_ms).toBe(oneHour);
+
+    vi.useRealTimers();
+  });
+
+  it("heartbeat falls back to the requested ttl on a garbage Date header", async () => {
+    vi.useFakeTimers();
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(
+        200,
+        {
+          decision: "ALLOW",
+          reservation_id: "r-hb-baddate",
+          affected_scopes: [],
+          expires_at_ms: 1_000_000_000,
+        },
+        { date: "not-a-date" },
+      ),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+    client.extendReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "ACTIVE", expires_at_ms: 1_000_060_000 }),
+    );
+
+    const retryEngine = makeRetryEngine();
+    const lifecycle = new AsyncCyclesLifecycle(client as any, retryEngine, { tenant: "acme" });
+
+    const result = await lifecycle.execute(
+      async () => {
+        // Unparseable Date -> effectiveTtl = requested ttl -> beat at 30s.
+        await vi.advanceTimersByTimeAsync(30000);
+        expect(client.extendReservation).toHaveBeenCalledTimes(1);
+        return "ok";
+      },
+      [],
+      { estimate: 1000, ttlMs: 60000 },
+    );
+    expect(result).toBe("ok");
+    expect(client.extendReservation.mock.calls[0][1].extend_by_ms).toBe(60000);
+
+    vi.useRealTimers();
+  });
+
+  it("heartbeat stops permanently on TENANT_CLOSED", async () => {
+    vi.useFakeTimers();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-hb-closed",
+        affected_scopes: [],
+        expires_at_ms: 1_000_000_000,
+      }),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+    client.extendReservation.mockResolvedValue(
+      CyclesResponse.httpError(403, "Tenant closed", { error: "TENANT_CLOSED" }),
+    );
+
+    const retryEngine = makeRetryEngine();
+    const lifecycle = new AsyncCyclesLifecycle(client as any, retryEngine, { tenant: "acme" });
+
+    const result = await lifecycle.execute(
+      async () => {
+        await vi.advanceTimersByTimeAsync(30000);
+        expect(client.extendReservation).toHaveBeenCalledTimes(1);
+        // Tenant closure is irreversible — no further attempts.
+        await vi.advanceTimersByTimeAsync(90000);
+        expect(client.extendReservation).toHaveBeenCalledTimes(1);
+        return "ok";
+      },
+      [],
+      { estimate: 1000, ttlMs: 60000 },
+    );
+    expect(result).toBe("ok");
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("permanently rejected"),
+    );
+
+    vi.useRealTimers();
+  });
+
+  // --- computeEffectiveTtlMs unit tests ---
+
+  describe("computeEffectiveTtlMs", () => {
+    it("returns the requested ttl when either server timestamp is missing", () => {
+      expect(computeEffectiveTtlMs(60000, undefined, 1000)).toBe(60000);
+      expect(computeEffectiveTtlMs(60000, 61000, undefined)).toBe(60000);
+      expect(computeEffectiveTtlMs(60000, undefined, undefined)).toBe(60000);
+    });
+
+    it("returns the granted ttl when the server capped the request", () => {
+      expect(computeEffectiveTtlMs(86_400_000, 5_000_000, 1_400_000)).toBe(3_600_000);
+    });
+
+    it("clamps to [1000, requestedTtl]", () => {
+      // Granted below the spec floor (or negative): clamp up to 1s.
+      expect(computeEffectiveTtlMs(60000, 1500, 1000)).toBe(1000);
+      expect(computeEffectiveTtlMs(60000, 900, 1000)).toBe(1000);
+      // Granted above the request (drifted clock or generous server):
+      // never beat slower than the requested ttl implies.
+      expect(computeEffectiveTtlMs(60000, 1_000_000, 1000)).toBe(60000);
+    });
   });
 
   // --- evaluateActual tests ---

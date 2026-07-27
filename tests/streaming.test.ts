@@ -710,6 +710,92 @@ describe("reserveForStream", () => {
     vi.useRealTimers();
   });
 
+  it("heartbeat seeds from the EFFECTIVE granted ttl when tenant policy caps it", async () => {
+    vi.useFakeTimers();
+    const client = makeMockClient();
+    // Requested 24h, but the grant is capped at 1h:
+    // expires_at_ms - Date header = 1h.
+    const d0 = Date.parse("Wed, 21 Oct 2026 07:28:00 GMT"); // server frame
+    const oneHour = 3_600_000;
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(
+        200,
+        {
+          decision: "ALLOW",
+          reservation_id: "r-hb-capped",
+          affected_scopes: [],
+          expires_at_ms: d0 + oneHour,
+        },
+        { date: new Date(d0).toUTCString() },
+      ),
+    );
+    let expiry = d0 + oneHour;
+    client.extendReservation.mockImplementation(async () => {
+      expiry += oneHour;
+      return CyclesResponse.success(200, { status: "ACTIVE", expires_at_ms: expiry });
+    });
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+      ttlMs: 86_400_000,
+    });
+
+    // First beat at effectiveTtl/2 = 30min — NOT requestedTtl/2 = 12h.
+    await vi.advanceTimersByTimeAsync(oneHour / 2 - 1000);
+    expect(client.extendReservation).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(client.extendReservation).toHaveBeenCalledTimes(1);
+    // extend_by_ms requests the EFFECTIVE ttl, not the capped-away 24h.
+    expect(client.extendReservation.mock.calls[0][1].extend_by_ms).toBe(oneHour);
+
+    await handle.commit(500);
+    vi.useRealTimers();
+  });
+
+  it("heartbeat stops permanently on NOT_FOUND", async () => {
+    vi.useFakeTimers();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-hb-404",
+        affected_scopes: [],
+        expires_at_ms: 1_000_000_000,
+      }),
+    );
+    client.extendReservation.mockResolvedValue(
+      CyclesResponse.httpError(404, "Not found", { error: "NOT_FOUND" }),
+    );
+    client.releaseReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "RELEASED" }),
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+      ttlMs: 60000,
+    });
+
+    await vi.advanceTimersByTimeAsync(30000);
+    expect(client.extendReservation).toHaveBeenCalledTimes(1);
+    // A 404'd reservation never comes back — no further attempts.
+    await vi.advanceTimersByTimeAsync(90000);
+    expect(client.extendReservation).toHaveBeenCalledTimes(1);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("permanently rejected"),
+    );
+
+    await handle.release("gone");
+    vi.useRealTimers();
+  });
+
   // --- Missing reservation_id guard ---
 
   it("throws when reservation_id missing from success response", async () => {

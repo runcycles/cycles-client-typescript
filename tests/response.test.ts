@@ -73,6 +73,19 @@ describe("CyclesResponse", () => {
       expect(resp.rateLimitReset).toBeUndefined();
       expect(resp.cyclesTenant).toBeUndefined();
       expect(resp.retryAfterMsHeader).toBeUndefined();
+      expect(resp.serverDateMs).toBeUndefined();
+    });
+
+    it("parses the HTTP Date header to epoch ms", () => {
+      const resp = CyclesResponse.success(200, {}, {
+        date: "Wed, 21 Oct 2026 07:28:00 GMT",
+      });
+      expect(resp.serverDateMs).toBe(Date.parse("Wed, 21 Oct 2026 07:28:00 GMT"));
+    });
+
+    it("ignores a garbage Date header gracefully", () => {
+      const resp = CyclesResponse.success(200, {}, { date: "not-a-date" });
+      expect(resp.serverDateMs).toBeUndefined();
     });
   });
 

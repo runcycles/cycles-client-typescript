@@ -761,11 +761,12 @@ Anything still pending when the deadline elapses stays journaled and replays on 
 
 Both `withCycles` and `reserveForStream` start an automatic heartbeat that extends the reservation TTL while your work runs:
 
-- **Interval:** `ttlMs / 2` — e.g., a 60s TTL heartbeats every 30s (no lower floor; the spec's minimum `ttl_ms` of 1000 makes the minimum interval 500ms)
-- **Lead-estimate extension:** the server extends relative to the *current* `expires_at_ms`, so each beat estimates the expiry *lead* — `(knownExpiry − initialExpiry) + ttl − elapsed`, using only server-frame and client-monotonic differences (never client clock vs. server expiry, so clock skew is irrelevant) — and skips the extend when the lead is already ≥ `1.5 * ttl`. Steady-state pattern: extend, extend, skip. Expiry lead stays within `[ttl/2, 1.5 * ttl]` with no outward drift, and about one of the server's `max_extensions` (default 10) is consumed per `ttl` of runtime. Server-clamped grants self-correct via the authoritative `expires_at_ms` in each response
-- **Extension amount:** `extend_by_ms` equals the full `ttlMs` each time
+- **Effective TTL:** tenant policy `max_reservation_ttl_ms` can silently cap the granted TTL below the requested one (governance default: 1 hour), so the heartbeat is seeded from `effectiveTtl = clamp(expires_at_ms − HTTP Date header, 1000, requestedTtl)` — both terms server-frame, so clock skew is irrelevant — falling back to the requested TTL when either timestamp is unavailable. The effective TTL drives the interval, the lead estimate, the skip threshold, and `extend_by_ms`
+- **Interval:** `effectiveTtl / 2` — e.g., a 60s TTL heartbeats every 30s (no lower floor; the spec's minimum `ttl_ms` of 1000 makes the minimum interval 500ms)
+- **Lead-estimate extension:** the server extends relative to the *current* `expires_at_ms`, so each beat estimates the expiry *lead* — `(knownExpiry − initialExpiry) + effectiveTtl − elapsed`, using only server-frame and client-monotonic differences (never client clock vs. server expiry, so clock skew is irrelevant) — and skips the extend when the lead is already ≥ `1.5 * effectiveTtl`. Steady-state pattern: extend, extend, skip. Expiry lead stays within `[ttl/2, 1.5 * ttl]` with no outward drift, and about one of the server's `max_extensions` (default 10) is consumed per `ttl` of runtime. Server-clamped grants self-correct via the authoritative `expires_at_ms` in each response
+- **Extension amount:** `extend_by_ms` equals the full `effectiveTtl` each time
 - **Best-effort with exactly-once retries:** a transiently failed extend is retried on the next beat **with the same idempotency key** (a lost response cannot double-extend); a success regenerates the key
-- **Permanent-failure stop:** HTTP 410, `RESERVATION_EXPIRED`, `RESERVATION_FINALIZED`, or `MAX_EXTENSIONS_EXCEEDED` stops the heartbeat permanently — no retry can fix those
+- **Permanent-failure stop:** HTTP 410, `RESERVATION_EXPIRED`, `RESERVATION_FINALIZED`, `MAX_EXTENSIONS_EXCEEDED`, `TENANT_CLOSED`, or `NOT_FOUND` stops the heartbeat permanently — no retry can fix those
 - **Auto-stop:** the heartbeat stops when the reservation is committed, released, or disposed
 
 ## Validation

@@ -232,7 +232,34 @@ export const PERMANENT_EXTEND_ERROR_CODES: ReadonlySet<string> = new Set([
   "RESERVATION_EXPIRED",
   "RESERVATION_FINALIZED",
   "MAX_EXTENSIONS_EXCEEDED",
+  "TENANT_CLOSED", // tenant closure is irreversible
+  "NOT_FOUND", // a 404'd reservation never comes back
 ]);
+
+/**
+ * Compute the EFFECTIVE granted TTL for heartbeat scheduling.
+ *
+ * Tenant policy `max_reservation_ttl_ms` silently CAPS the granted TTL at
+ * reserve time (governance default: 1 hour) and the create response has no
+ * effective-TTL field — seeding the heartbeat from the REQUESTED ttl would
+ * schedule the first beat far too late (a 24h request capped to 1h would
+ * put the first beat at 12h, long after expiry). Recover the granted TTL
+ * as `expires_at_ms - HTTP Date header`: both terms are server-frame, so
+ * the difference is clock-skew-free (HTTP-date resolution is ~1s, which
+ * the heartbeat margins absorb). Clamped to [1000, requestedTtlMs]; falls
+ * back to the requested ttl when either server timestamp is unavailable.
+ */
+export function computeEffectiveTtlMs(
+  requestedTtlMs: number,
+  expiresAtMs: number | undefined,
+  serverDateMs: number | undefined,
+): number {
+  if (expiresAtMs === undefined || serverDateMs === undefined) {
+    return requestedTtlMs;
+  }
+  const grantedMs = expiresAtMs - serverDateMs;
+  return Math.min(Math.max(grantedMs, 1_000), requestedTtlMs);
+}
 
 /** Extract the wire error code from a non-2xx response (body-tolerant). */
 export function extractExtendErrorCode(response: {
@@ -335,8 +362,14 @@ export class AsyncCyclesLifecycle {
       balances: resResult.balances,
     };
 
-    // Start heartbeat
-    const heartbeatRef = this._startHeartbeat(reservationId, ttlMs, ctx);
+    // Start heartbeat, seeded from the EFFECTIVE granted TTL — a tenant
+    // policy may have silently capped the requested one at reserve time.
+    const effectiveTtlMs = computeEffectiveTtlMs(
+      ttlMs,
+      resResult.expiresAtMs,
+      resResponse.serverDateMs,
+    );
+    const heartbeatRef = this._startHeartbeat(reservationId, effectiveTtlMs, ctx);
 
     try {
       const result = await runWithContext(ctx, () => fn(...args));
@@ -505,6 +538,11 @@ export class AsyncCyclesLifecycle {
     }
   }
 
+  /**
+   * `ttlMs` is the EFFECTIVE granted TTL (see {@link computeEffectiveTtlMs}),
+   * used for the beat interval, the lead estimate, the skip threshold, and
+   * the requested `extend_by_ms` alike.
+   */
   private _startHeartbeat(
     reservationId: string,
     ttlMs: number,

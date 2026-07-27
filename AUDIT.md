@@ -1,6 +1,6 @@
 # Cycles Protocol v0.1.25 — Client (TypeScript) Audit
 
-**Date:** 2026-07-27 (v0.4.1 — heartbeat lead-estimate extension fixes expiry drift and halves `max_extensions` consumption (replaces the alternate-beat scheme after adversarial review found liveness regressions); permanent extend rejections stop the heartbeat; extend retries reuse the idempotency key; estimate-fallback commits marked `metadata.actual_source="estimate"`. 421 tests pass at 98.5% line coverage.),
+**Date:** 2026-07-27 (v0.4.1 — heartbeat lead-estimate extension fixes expiry drift and halves `max_extensions` consumption (replaces the alternate-beat scheme after adversarial review found liveness regressions); heartbeat seeded from the effective granted TTL recovered via the HTTP `Date` header (tenant policy `max_reservation_ttl_ms` silently caps grants); permanent extend rejections (incl. `TENANT_CLOSED`, `NOT_FOUND`) stop the heartbeat; extend retries reuse the idempotency key; estimate-fallback commits marked `metadata.actual_source="estimate"`. 432 tests pass at 98.5% line coverage.),
 2026-07-27 (v0.4.0 — durable commit retries: on-disk pending-commit journal with next-run replay and POST /v1/events recovery; first-attempt 429/401/403 never release; Retry-After persisted; streaming commit() resolves on transient failures. Review round 2 adds `flushPendingCommits()`, unclassifiable-4xx retention, 410-by-status expiry, delay clamps, and journal-parse strictness. See the dated entries below. 407 tests pass at 99.0% line coverage.),
 2026-07-24 (v0.3.4 release prep — package and changelog aligned; vendored contract fixture refreshed from runtime protocol v0.1.24 to v0.1.25.15 at `cycles-protocol@99f1391`; exact `ErrorCode` contract assertion updated for `LIMIT_EXCEEDED` and `TENANT_CLOSED`; test-only `fast-uri` updated to 3.1.4. Clean install and audit pass with zero vulnerabilities; 339 tests pass at 98.61% statement / 99.81% line coverage; lint, typecheck, build, and package dry-run are clean.),
 2026-07-10 (v0.3.4 — `TENANT_CLOSED` support from runtime spec v0.1.25.13: `ErrorCode.TENANT_CLOSED`, exported `TenantClosedError`, `CyclesProtocolError.isTenantClosed()`, and reservation-time typed exception mapping. Also `LIMIT_EXCEEDED` support from v0.1.25.12, retry classification, and `Retry-After` header exposure through `CyclesResponse.retryAfterMsHeader`.),
@@ -28,15 +28,25 @@ the lead is ≥ `1.5*ttl`; steady state extend, extend, skip keeps the lead
 in `[ttl/2, 1.5*ttl]`, and clamped grants self-correct from the response
 `expires_at_ms`. Failed extends retry next beat with the SAME idempotency
 key (lost responses cannot double-extend); 410 / `RESERVATION_EXPIRED` /
-`RESERVATION_FINALIZED` / `MAX_EXTENSIONS_EXCEEDED` stop the heartbeat
-permanently. This replaces the alternate-beat scheme first shipped on this
-branch: adversarial self-review showed it left every steady-state attempt
-at exactly `ttl/2` lead (one failure → retry at lead 0) and lapsed for
-small ttls. Also, estimate-fallback commits (`actual` not configured) now
-carry `metadata.actual_source = "estimate"`, which flows into the
-`/v1/events` fallback body; streaming commits always take an explicit
-actual and are unmarked. 421 tests pass; line coverage 98.5%, branch
-93.8% (gates 95/85); lint and typecheck clean.
+`RESERVATION_FINALIZED` / `MAX_EXTENSIONS_EXCEEDED` / `TENANT_CLOSED` /
+`NOT_FOUND` stop the heartbeat permanently. This replaces the
+alternate-beat scheme first shipped on this branch: adversarial
+self-review showed it left every steady-state attempt at exactly `ttl/2`
+lead (one failure → retry at lead 0) and lapsed for small ttls. Spec
+review also showed tenant policy `max_reservation_ttl_ms` silently CAPS
+the granted TTL at reserve time (governance default 1 h) with no
+effective-TTL response field, so a heartbeat seeded from the requested
+ttl (24 h → first beat at 12 h) would fire long after expiry: the client
+now captures the HTTP `Date` header (`CyclesResponse.serverDateMs`) and
+both heartbeats seed from `effectiveTtl = clamp(expires_at_ms −
+serverDateMs, 1000, requestedTtl)` — both terms server-frame, so still
+clock-skew-free — for the interval, lead term, skip threshold, and
+`extend_by_ms`, falling back to the requested ttl when either timestamp
+is missing or unparseable. Also, estimate-fallback commits (`actual` not
+configured) now carry `metadata.actual_source = "estimate"`, which flows
+into the `/v1/events` fallback body; streaming commits always take an
+explicit actual and are unmarked. 432 tests pass; line coverage 98.5%,
+branch 94.0% (gates 95/85); lint and typecheck clean.
 
 ## 2026-07-27 — Durable-retry review fixes (PR #172 round 2)
 
