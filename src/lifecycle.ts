@@ -222,10 +222,27 @@ function buildReleaseBody(reason: string): Record<string, unknown> {
   return { idempotency_key: randomUUID(), reason };
 }
 
-/** Build wire-format extend request body. */
-function buildExtendBody(extendByMs: number): Record<string, unknown> {
-  validateExtendByMs(extendByMs);
-  return { idempotency_key: randomUUID(), extend_by_ms: extendByMs };
+/**
+ * Extend-error codes that no retry can ever fix: the reservation is gone
+ * (expired), settled (finalized), or the server refuses further extensions.
+ * The heartbeat stops permanently on any of these instead of hammering the
+ * server with doomed retries forever.
+ */
+export const PERMANENT_EXTEND_ERROR_CODES: ReadonlySet<string> = new Set([
+  "RESERVATION_EXPIRED",
+  "RESERVATION_FINALIZED",
+  "MAX_EXTENSIONS_EXCEEDED",
+]);
+
+/** Extract the wire error code from a non-2xx response (body-tolerant). */
+export function extractExtendErrorCode(response: {
+  getErrorResponse: () => { error?: string } | undefined;
+  getBodyAttribute: (key: string) => unknown;
+}): string | undefined {
+  const structured = response.getErrorResponse()?.error;
+  if (structured !== undefined) return structured;
+  const raw = response.getBodyAttribute("error");
+  return typeof raw === "string" ? raw : undefined;
 }
 
 export class AsyncCyclesLifecycle {
@@ -494,50 +511,121 @@ export class AsyncCyclesLifecycle {
     ctx: CyclesContext,
   ): { stop: () => void } | undefined {
     if (ttlMs <= 0) return undefined;
-    const intervalMs = Math.max(ttlMs / 2, 1_000);
+    validateExtendByMs(ttlMs);
+    // Beat every ttl/2 — deliberately NO lower floor. The spec's minimum
+    // ttl_ms is 1000, so the interval is at least 500ms; a floor could only
+    // ever bind for ttl < 2000, where beating slower than ttl/2 guarantees
+    // the reservation lapses between beats.
+    const intervalMs = ttlMs / 2;
     let stopped = false;
     let currentTimer: ReturnType<typeof setTimeout> | undefined;
 
-    // Alternate-beat extension. Each extend is relative to the CURRENT
-    // expires_at_ms (spec: extend_by_ms extends from current expiry), so
-    // extending by the full ttlMs on every ttl/2 beat would drift expiry
-    // outward by ttl/2 per beat (zombie budget lockup on process death)
-    // and burn the server's max_extensions budget twice as fast as needed.
-    // Instead we extend on every OTHER beat: expiry lead oscillates in
-    // [ttl/2, 1.5*ttl] with no drift. The counter starts at 1 so the FIRST
-    // beat extends (at that point only ttl/2 of lifetime remains — skipping
-    // it would let the reservation lapse before beat 2). After a successful
-    // extend the counter resets and the next beat is skipped; after a
-    // failed extend (non-2xx or thrown) the very next beat retries.
-    // Client clocks are never compared to server expires_at_ms — clock
-    // skew makes that unsafe.
-    let beatsSinceExtend = 1;
+    // Lead-estimate extension. `extend_by_ms` extends relative to the
+    // CURRENT expires_at_ms (spec), so blindly extending by ttlMs on every
+    // ttl/2 beat would drift expiry outward by ttl/2 per beat (zombie
+    // budget lockup on process death) and burn the server's max_extensions
+    // budget twice as fast as needed. Instead each beat estimates the
+    // expiry LEAD — how far ahead of "now" the expiry sits — and skips the
+    // extend only when the lead is already comfortably large (>= 1.5*ttl).
+    //
+    // The estimate is clock-skew-free by construction: it only ever
+    // subtracts server timestamps from server timestamps and client
+    // monotonic timestamps from client monotonic timestamps — the client
+    // wall clock is never compared to the server's expires_at_ms:
+    //
+    //   lead = (knownExpiry - initialExpiry) + ttlMs - (now - anchor)
+    //
+    // where `initialExpiry`/`knownExpiry` are server-frame expiries and
+    // `anchor` is a client performance.now() reading taken at heartbeat
+    // start. `grantedMs` tracks the server-frame difference
+    // (knownExpiry - initialExpiry); when no server-frame reference is
+    // available (create or extend response without a numeric
+    // expires_at_ms) it accumulates ttlMs per applied grant instead. The
+    // estimate is optimistic by at most one response leg (expiries are
+    // read after the network round trip), which the ttl/2 cadence and the
+    // 1.5*ttl skip threshold absorb.
+    const initialExpiry = ctx.expiresAtMs;
+    let knownExpiry = initialExpiry;
+    const anchor = performance.now();
+    let grantedMs = 0;
+    // Idempotency key of an extend whose outcome we never saw. It is
+    // reused on the retry so a lost response cannot double-extend.
+    let pendingKey: string | undefined;
 
     const tick = (): void => {
       if (stopped) return;
       currentTimer = setTimeout(() => {
         if (stopped) return;
-        if (beatsSinceExtend < 1) {
-          beatsSinceExtend += 1;
+        const elapsed = performance.now() - anchor;
+        const leadMs = grantedMs + ttlMs - elapsed;
+        if (leadMs >= 1.5 * ttlMs) {
+          // Plenty of lead — skip this beat (no server call).
           tick();
           return;
         }
-        const body = buildExtendBody(ttlMs);
+        const key = pendingKey ?? randomUUID();
+        pendingKey = key;
+        const body = { idempotency_key: key, extend_by_ms: ttlMs };
         void this._client
           .extendReservation(reservationId, body)
           .then((response) => {
             if (response.isSuccess) {
-              beatsSinceExtend = 0;
-              // Wire-format key
-              const newExpires = response.getBodyAttribute("expires_at_ms");
-              if (typeof newExpires === "number") {
-                ctx.expiresAtMs = newExpires;
+              // Any 2xx counts as applied — its expires_at_ms is
+              // authoritative proof — even if the status field looks odd.
+              pendingKey = undefined;
+              const status = response.getBodyAttribute("status");
+              if (typeof status === "string" && status !== "ACTIVE") {
+                console.warn(
+                  `[runcycles] Heartbeat extend returned 2xx with unexpected status "${status}"; treating as applied: ${reservationId}`,
+                );
               }
+              const newExpires = response.getBodyAttribute("expires_at_ms");
+              if (
+                typeof newExpires === "number" &&
+                initialExpiry !== undefined
+              ) {
+                // Authoritative server-frame resync (self-corrects after
+                // clamped grants or missing bodies).
+                grantedMs = newExpires - initialExpiry;
+                knownExpiry = newExpires;
+                ctx.expiresAtMs = newExpires;
+              } else {
+                // No server-frame diff available — count the applied grant
+                // optimistically as +ttlMs of lead.
+                grantedMs += ttlMs;
+                if (typeof newExpires === "number") {
+                  knownExpiry = newExpires;
+                  ctx.expiresAtMs = newExpires;
+                } else if (knownExpiry !== undefined) {
+                  knownExpiry += ttlMs;
+                  ctx.expiresAtMs = knownExpiry;
+                }
+              }
+              return;
             }
-            // Non-2xx: leave the counter so the next beat retries.
+            // Failure: KEEP pendingKey so the next beat retries with the
+            // same idempotency key. Permanent rejections (reservation gone,
+            // settled, or extension budget exhausted) stop the heartbeat —
+            // no retry can ever fix them. The bare status check catches
+            // bodyless 410 Gone responses.
+            const errorCode = extractExtendErrorCode(response);
+            if (
+              response.status === 410 ||
+              (errorCode !== undefined &&
+                PERMANENT_EXTEND_ERROR_CODES.has(errorCode))
+            ) {
+              console.warn(
+                `[runcycles] Heartbeat extend permanently rejected (status=${response.status}, error=${String(errorCode)}); stopping heartbeat: ${reservationId}`,
+              );
+              stopped = true;
+              return;
+            }
+            console.warn(
+              `[runcycles] Heartbeat extend failed (status=${response.status}); retrying next beat: ${reservationId}`,
+            );
           })
           .catch(() => {
-            // Best-effort heartbeat; retry on the next beat.
+            // Transport error: best-effort — retry next beat, same key.
           })
           .finally(() => {
             tick();

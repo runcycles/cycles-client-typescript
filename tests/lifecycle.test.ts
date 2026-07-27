@@ -483,38 +483,45 @@ describe("AsyncCyclesLifecycle", () => {
     vi.useRealTimers();
   });
 
-  it("heartbeat extends on the first beat, skips the second, extends on the third", async () => {
+  it("heartbeat lead-estimate: extend, extend, skip, extend over four beats", async () => {
     vi.useFakeTimers();
     const client = makeMockClient();
+    const e0 = 1_000_000_000; // server-frame initial expiry
     client.createReservation.mockResolvedValue(
       CyclesResponse.success(200, {
         decision: "ALLOW",
-        reservation_id: "r-hb-alt",
+        reservation_id: "r-hb-lead",
         affected_scopes: [],
-        expires_at_ms: Date.now() + 60000,
+        expires_at_ms: e0,
       }),
     );
     client.commitReservation.mockResolvedValue(
       CyclesResponse.success(200, { status: "COMMITTED" }),
     );
-    client.extendReservation.mockResolvedValue(
-      CyclesResponse.success(200, { status: "ACTIVE", expires_at_ms: Date.now() + 120000 }),
-    );
+    // Each applied extend grants the full ttl relative to current expiry.
+    let expiry = e0;
+    client.extendReservation.mockImplementation(async () => {
+      expiry += 60000;
+      return CyclesResponse.success(200, { status: "ACTIVE", expires_at_ms: expiry });
+    });
 
     const retryEngine = makeRetryEngine();
     const lifecycle = new AsyncCyclesLifecycle(client as any, retryEngine, { tenant: "acme" });
 
     const result = await lifecycle.execute(
       async () => {
-        // Beat 1 at 30s: extends (only ttl/2 of lifetime left)
+        // Beat 1 at 30s: lead = ttl/2 -> extend (lead becomes 1.5*ttl)
         await vi.advanceTimersByTimeAsync(30000);
         expect(client.extendReservation).toHaveBeenCalledTimes(1);
-        // Beat 2 at 60s: skipped (previous extend succeeded)
-        await vi.advanceTimersByTimeAsync(30000);
-        expect(client.extendReservation).toHaveBeenCalledTimes(1);
-        // Beat 3 at 90s: extends again
+        // Beat 2 at 60s: lead = ttl -> extend (lead becomes 2*ttl)
         await vi.advanceTimersByTimeAsync(30000);
         expect(client.extendReservation).toHaveBeenCalledTimes(2);
+        // Beat 3 at 90s: lead = 1.5*ttl -> skip
+        await vi.advanceTimersByTimeAsync(30000);
+        expect(client.extendReservation).toHaveBeenCalledTimes(2);
+        // Beat 4 at 120s: lead = ttl -> extend
+        await vi.advanceTimersByTimeAsync(30000);
+        expect(client.extendReservation).toHaveBeenCalledTimes(3);
         return "done";
       },
       [],
@@ -522,7 +529,7 @@ describe("AsyncCyclesLifecycle", () => {
     );
     expect(result).toBe("done");
 
-    // The extend body still requests the full ttlMs.
+    // The extend body requests the full ttlMs.
     const extendBody = client.extendReservation.mock.calls[0][1];
     expect(extendBody.extend_by_ms).toBe(60000);
     expect(extendBody.idempotency_key).toBeDefined();
@@ -530,26 +537,32 @@ describe("AsyncCyclesLifecycle", () => {
     vi.useRealTimers();
   });
 
-  it("heartbeat retries on the very next beat after a failed extend", async () => {
+  it("heartbeat retries a failed extend with the SAME idempotency key, then regenerates after success", async () => {
     vi.useFakeTimers();
     const client = makeMockClient();
+    const e0 = 1_000_000_000;
     client.createReservation.mockResolvedValue(
       CyclesResponse.success(200, {
         decision: "ALLOW",
         reservation_id: "r-hb-retry",
         affected_scopes: [],
+        expires_at_ms: e0,
       }),
     );
     client.commitReservation.mockResolvedValue(
       CyclesResponse.success(200, { status: "COMMITTED" }),
     );
-    // Beat 1 throws, beat 2 gets a non-2xx, beat 3 succeeds, beat 4 skipped.
-    client.extendReservation
-      .mockRejectedValueOnce(new Error("network down"))
-      .mockResolvedValueOnce(CyclesResponse.httpError(500, "Server error"))
-      .mockResolvedValue(
-        CyclesResponse.success(200, { status: "ACTIVE", expires_at_ms: Date.now() + 120000 }),
-      );
+    // Beat 1 throws, beat 2 gets a retryable non-2xx, beat 3+ succeed.
+    let calls = 0;
+    client.extendReservation.mockImplementation(async () => {
+      calls += 1;
+      if (calls === 1) throw new Error("network down");
+      if (calls === 2) return CyclesResponse.httpError(500, "Server error");
+      return CyclesResponse.success(200, {
+        status: "ACTIVE",
+        expires_at_ms: e0 + 60000 * (calls - 2),
+      });
+    });
 
     const retryEngine = makeRetryEngine();
     const lifecycle = new AsyncCyclesLifecycle(client as any, retryEngine, { tenant: "acme" });
@@ -559,13 +572,203 @@ describe("AsyncCyclesLifecycle", () => {
         // Beat 1: attempt fails (thrown)
         await vi.advanceTimersByTimeAsync(30000);
         expect(client.extendReservation).toHaveBeenCalledTimes(1);
-        // Beat 2: retried immediately, fails again (non-2xx)
+        // Beat 2: retried on the next beat, fails again (non-2xx)
         await vi.advanceTimersByTimeAsync(30000);
         expect(client.extendReservation).toHaveBeenCalledTimes(2);
-        // Beat 3: retried immediately, succeeds
+        // Beat 3: retried, succeeds
         await vi.advanceTimersByTimeAsync(30000);
         expect(client.extendReservation).toHaveBeenCalledTimes(3);
-        // Beat 4: skipped after the success
+        // Beat 4: only one grant applied so far (lead = ttl/2 + something
+        // small) -> extends again with a FRESH key
+        await vi.advanceTimersByTimeAsync(30000);
+        expect(client.extendReservation).toHaveBeenCalledTimes(4);
+        return "ok";
+      },
+      [],
+      { estimate: 1000, ttlMs: 60000 },
+    );
+    expect(result).toBe("ok");
+
+    // Retries of an unresolved extend reuse the SAME idempotency key so a
+    // lost response cannot double-extend; success regenerates.
+    const keys = client.extendReservation.mock.calls.map((c: any[]) => c[1].idempotency_key);
+    expect(keys[1]).toBe(keys[0]);
+    expect(keys[2]).toBe(keys[0]);
+    expect(keys[3]).not.toBe(keys[0]);
+
+    vi.useRealTimers();
+  });
+
+  it("heartbeat stops permanently on MAX_EXTENSIONS_EXCEEDED", async () => {
+    vi.useFakeTimers();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-hb-max",
+        affected_scopes: [],
+        expires_at_ms: 1_000_000_000,
+      }),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+    client.extendReservation.mockResolvedValue(
+      CyclesResponse.httpError(409, "Max extensions exceeded", {
+        error: "MAX_EXTENSIONS_EXCEEDED",
+      }),
+    );
+
+    const retryEngine = makeRetryEngine();
+    const lifecycle = new AsyncCyclesLifecycle(client as any, retryEngine, { tenant: "acme" });
+
+    const result = await lifecycle.execute(
+      async () => {
+        // Beat 1: extend rejected permanently -> heartbeat stops
+        await vi.advanceTimersByTimeAsync(30000);
+        expect(client.extendReservation).toHaveBeenCalledTimes(1);
+        // Beats 2-4: no further extend attempts
+        await vi.advanceTimersByTimeAsync(90000);
+        expect(client.extendReservation).toHaveBeenCalledTimes(1);
+        return "ok";
+      },
+      [],
+      { estimate: 1000, ttlMs: 60000 },
+    );
+    expect(result).toBe("ok");
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("permanently rejected"),
+    );
+
+    vi.useRealTimers();
+  });
+
+  it("heartbeat stays live for small ttl (1200ms): interval is ttl/2 with no 1s floor", async () => {
+    vi.useFakeTimers();
+    const client = makeMockClient();
+    const e0 = 1_000_000_000;
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-hb-small",
+        affected_scopes: [],
+        expires_at_ms: e0,
+      }),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+    let expiry = e0;
+    client.extendReservation.mockImplementation(async () => {
+      expiry += 1200;
+      return CyclesResponse.success(200, { status: "ACTIVE", expires_at_ms: expiry });
+    });
+
+    const retryEngine = makeRetryEngine();
+    const lifecycle = new AsyncCyclesLifecycle(client as any, retryEngine, { tenant: "acme" });
+
+    const result = await lifecycle.execute(
+      async () => {
+        // Beats at 600ms cadence (ttl/2 = 600, NOT clamped to 1000 — a 1s
+        // interval would add only 1.2s of expiry per 2s of wall time and
+        // guarantee a lapse). Pattern: extend, extend, skip, extend keeps
+        // the lead positive.
+        await vi.advanceTimersByTimeAsync(600);
+        expect(client.extendReservation).toHaveBeenCalledTimes(1);
+        await vi.advanceTimersByTimeAsync(600);
+        expect(client.extendReservation).toHaveBeenCalledTimes(2);
+        await vi.advanceTimersByTimeAsync(600);
+        expect(client.extendReservation).toHaveBeenCalledTimes(2); // skip
+        await vi.advanceTimersByTimeAsync(600);
+        expect(client.extendReservation).toHaveBeenCalledTimes(3);
+        return "ok";
+      },
+      [],
+      { estimate: 1000, ttlMs: 1200 },
+    );
+    expect(result).toBe("ok");
+
+    vi.useRealTimers();
+  });
+
+  it("heartbeat self-corrects on clamped grants: extends every beat", async () => {
+    vi.useFakeTimers();
+    const client = makeMockClient();
+    const e0 = 1_000_000_000;
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-hb-clamp",
+        affected_scopes: [],
+        expires_at_ms: e0,
+      }),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+    // Server clamps every grant to ttl/4 instead of the requested ttl.
+    let expiry = e0;
+    client.extendReservation.mockImplementation(async () => {
+      expiry += 15000;
+      return CyclesResponse.success(200, { status: "ACTIVE", expires_at_ms: expiry });
+    });
+
+    const retryEngine = makeRetryEngine();
+    const lifecycle = new AsyncCyclesLifecycle(client as any, retryEngine, { tenant: "acme" });
+
+    const result = await lifecycle.execute(
+      async () => {
+        // The authoritative expires_at_ms keeps the lead estimate small,
+        // so every beat extends — no false skips.
+        for (let beat = 1; beat <= 4; beat++) {
+          await vi.advanceTimersByTimeAsync(30000);
+          expect(client.extendReservation).toHaveBeenCalledTimes(beat);
+        }
+        return "ok";
+      },
+      [],
+      { estimate: 1000, ttlMs: 60000 },
+    );
+    expect(result).toBe("ok");
+
+    vi.useRealTimers();
+  });
+
+  it("heartbeat 2xx without expires_at_ms counts the grant as +ttl and warns on odd status", async () => {
+    vi.useFakeTimers();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-hb-noexp",
+        affected_scopes: [],
+        expires_at_ms: 1_000_000_000,
+      }),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+    // 2xx is proof the extend applied even with an odd status field and no
+    // expires_at_ms in the body.
+    client.extendReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "EXTENDED" }),
+    );
+
+    const retryEngine = makeRetryEngine();
+    const lifecycle = new AsyncCyclesLifecycle(client as any, retryEngine, { tenant: "acme" });
+
+    const result = await lifecycle.execute(
+      async () => {
+        // Fallback accounting (+ttl per applied grant) yields the same
+        // extend, extend, skip, extend pattern.
+        await vi.advanceTimersByTimeAsync(30000);
+        expect(client.extendReservation).toHaveBeenCalledTimes(1);
+        await vi.advanceTimersByTimeAsync(30000);
+        expect(client.extendReservation).toHaveBeenCalledTimes(2);
+        await vi.advanceTimersByTimeAsync(30000);
+        expect(client.extendReservation).toHaveBeenCalledTimes(2); // skip
         await vi.advanceTimersByTimeAsync(30000);
         expect(client.extendReservation).toHaveBeenCalledTimes(3);
         return "ok";
@@ -574,6 +777,9 @@ describe("AsyncCyclesLifecycle", () => {
       { estimate: 1000, ttlMs: 60000 },
     );
     expect(result).toBe("ok");
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('unexpected status "EXTENDED"'),
+    );
 
     vi.useRealTimers();
   });
