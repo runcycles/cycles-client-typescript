@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-07-27
+
+### Fixed
+
+- **Heartbeat extend drift (P1 liveness).** Per the protocol spec, `extend_by_ms` extends relative to the *current* `expires_at_ms`, and the server caps `extension_count` at `max_extensions` (default 10). Both heartbeats (`withCycles` and `reserveForStream`) beat every `max(ttlMs/2, 1000)` ms and extended by the full `ttlMs` on **every** beat, so expiry drifted outward by `ttl/2` per beat — a process crash left the budget reserved until the drifted expiry (zombie budget lockup) — and the extension budget burned twice as fast as needed, so runs longer than about `max_extensions * ttl/2` lost heartbeat protection mid-flight. Both heartbeats now extend on every **other** beat (alternate-beat extension): the first beat extends (only `ttl/2` of lifetime remains by then), a successful extend skips the next beat, and a failed extend (non-2xx or thrown) is retried on the very next beat. Expiry lead now oscillates in `[ttl/2, 1.5 * ttl]` with no drift, and one extension is consumed per `ttl` of runtime. The client never compares its own clock to the server's `expires_at_ms` (clock skew makes that unsafe); `ctx.expiresAtMs` is still updated from the authoritative extend response.
+
+### Added
+
+- **`metadata.actual_source = "estimate"` marker on estimate-fallback commits.** When `cfg.actual` is not configured and `useEstimateIfActualNotProvided` is left at its default, `withCycles` commits the estimate as the actual; previously that estimate was recorded as measured spend with no trace. The commit body now carries `actual_source: "estimate"` in `metadata` (merged with any commit metadata set via `ctx.commitMetadata`; created when absent) plus a `console.debug` note, and the marker flows into the `POST /v1/events` fallback body, which copies commit metadata. The default fallback behavior itself is unchanged. `reserveForStream` is unaffected: `handle.commit(actual, ...)` always takes an explicit caller-provided actual, so no fallback (and no marker) exists there.
+
 ## [0.4.0] - 2026-07-27
 
 Durable commit retries. Previously a commit that failed transiently lived only in a floating in-memory promise: `process.exit()`, a crash, or a signal dropped it, and once the reservation's grace period elapsed the server's expiry sweep returned the reserved budget to the pool, permanently under-counting spend that had already happened. Ports the full design from `cycles-client-python` v0.5.0 (PR runcycles/cycles-client-python#89, three review rounds).

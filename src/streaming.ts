@@ -216,15 +216,37 @@ export async function reserveForStream(
     if (ttlMs <= 0) return;
     const intervalMs = Math.max(ttlMs / 2, 1_000);
 
+    // Alternate-beat extension. `extend_by_ms` extends relative to the
+    // CURRENT expires_at_ms (spec), so extending by the full ttlMs on every
+    // ttl/2 beat would drift expiry outward by ttl/2 per beat and burn the
+    // server's max_extensions budget twice as fast as needed. Extend on
+    // every OTHER beat instead: expiry lead oscillates in [ttl/2, 1.5*ttl]
+    // with no drift. The counter starts at 1 so the FIRST beat extends
+    // (only ttl/2 of lifetime remains by then); a successful extend resets
+    // it (next beat skipped), a failed extend retries on the very next
+    // beat. Client clocks are never compared to server expires_at_ms.
+    let beatsSinceExtend = 1;
+
     const tick = (): void => {
       if (heartbeatStopped) return;
       currentTimer = setTimeout(() => {
         if (heartbeatStopped) return;
+        if (beatsSinceExtend < 1) {
+          beatsSinceExtend += 1;
+          tick();
+          return;
+        }
         validateExtendByMs(ttlMs);
         const extendBody = { idempotency_key: randomUUID(), extend_by_ms: ttlMs };
         void client
           .extendReservation(reservationId, extendBody)
-          .catch(() => { /* best-effort */ })
+          .then((response) => {
+            if (response.isSuccess) {
+              beatsSinceExtend = 0;
+            }
+            // Non-2xx: leave the counter so the next beat retries.
+          })
+          .catch(() => { /* best-effort; retry on the next beat */ })
           .finally(() => { tick(); });
       }, intervalMs);
     };

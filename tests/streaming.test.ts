@@ -524,6 +524,94 @@ describe("reserveForStream", () => {
     vi.useRealTimers();
   });
 
+  it("heartbeat extends on the first beat, skips the second, extends on the third", async () => {
+    vi.useFakeTimers();
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-hb-alt",
+        affected_scopes: [],
+      }),
+    );
+    client.extendReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "ACTIVE", expires_at_ms: Date.now() + 120000 }),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+      ttlMs: 60000,
+    });
+
+    // Beat 1 at 30s: extends (only ttl/2 of lifetime left)
+    await vi.advanceTimersByTimeAsync(30000);
+    expect(client.extendReservation).toHaveBeenCalledTimes(1);
+    // Beat 2 at 60s: skipped (previous extend succeeded)
+    await vi.advanceTimersByTimeAsync(30000);
+    expect(client.extendReservation).toHaveBeenCalledTimes(1);
+    // Beat 3 at 90s: extends again
+    await vi.advanceTimersByTimeAsync(30000);
+    expect(client.extendReservation).toHaveBeenCalledTimes(2);
+
+    // Body still requests the full ttlMs each time
+    const extendBody = client.extendReservation.mock.calls[0][1];
+    expect(extendBody.extend_by_ms).toBe(60000);
+    expect(extendBody.idempotency_key).toBeDefined();
+
+    await handle.commit(500);
+    vi.useRealTimers();
+  });
+
+  it("heartbeat retries on the very next beat after a failed extend", async () => {
+    vi.useFakeTimers();
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-hb-retry",
+        affected_scopes: [],
+      }),
+    );
+    // Beat 1 throws, beat 2 gets a non-2xx, beat 3 succeeds, beat 4 skipped.
+    client.extendReservation
+      .mockRejectedValueOnce(new Error("network down"))
+      .mockResolvedValueOnce(CyclesResponse.httpError(500, "Server error"))
+      .mockResolvedValue(
+        CyclesResponse.success(200, { status: "ACTIVE", expires_at_ms: Date.now() + 120000 }),
+      );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+      ttlMs: 60000,
+    });
+
+    // Beat 1: attempt fails (thrown)
+    await vi.advanceTimersByTimeAsync(30000);
+    expect(client.extendReservation).toHaveBeenCalledTimes(1);
+    // Beat 2: retried immediately, fails again (non-2xx)
+    await vi.advanceTimersByTimeAsync(30000);
+    expect(client.extendReservation).toHaveBeenCalledTimes(2);
+    // Beat 3: retried immediately, succeeds
+    await vi.advanceTimersByTimeAsync(30000);
+    expect(client.extendReservation).toHaveBeenCalledTimes(3);
+    // Beat 4: skipped after the success
+    await vi.advanceTimersByTimeAsync(30000);
+    expect(client.extendReservation).toHaveBeenCalledTimes(3);
+
+    await handle.commit(500);
+    vi.useRealTimers();
+  });
+
   // --- Missing reservation_id guard ---
 
   it("throws when reservation_id missing from success response", async () => {

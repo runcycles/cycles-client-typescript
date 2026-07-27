@@ -75,15 +75,15 @@ function evaluateActual(
   result: unknown,
   estimate: number,
   useEstimateFallback: boolean,
-): number {
+): { amount: number; usedEstimateFallback: boolean } {
   if (expr !== undefined) {
     if (typeof expr === "function") {
-      return expr(result);
+      return { amount: expr(result), usedEstimateFallback: false };
     }
-    return expr;
+    return { amount: expr, usedEstimateFallback: false };
   }
   if (useEstimateFallback) {
-    return estimate;
+    return { amount: estimate, usedEstimateFallback: true };
   }
   throw new Error(
     "actual expression is required when useEstimateIfActualNotProvided is false",
@@ -327,7 +327,7 @@ export class AsyncCyclesLifecycle {
 
       // Resolve actual
       const useEstimateFallback = cfg.useEstimateIfActualNotProvided !== false;
-      const actualAmount = evaluateActual(
+      const { amount: actualAmount, usedEstimateFallback } = evaluateActual(
         cfg.actual,
         result,
         estimate,
@@ -343,11 +343,23 @@ export class AsyncCyclesLifecycle {
         metrics = { ...metrics, latencyMs: methodElapsed };
       }
 
+      // Audit honesty: when no `actual` was configured and the estimate is
+      // committed in its place, mark the commit so downstream consumers can
+      // tell measured spend from estimated spend. The marker also flows
+      // into the /v1/events fallback body, which copies commit metadata.
+      let commitMetadata = ctx.commitMetadata;
+      if (usedEstimateFallback) {
+        commitMetadata = { ...(commitMetadata ?? {}), actual_source: "estimate" };
+        console.debug(
+          `[runcycles] No actual configured; committing estimate as actual (metadata.actual_source="estimate"): ${reservationId}`,
+        );
+      }
+
       const commitBody = buildCommitBody(
         actualAmount,
         unit,
         metrics,
-        ctx.commitMetadata,
+        commitMetadata,
       );
       const eventFallback = buildEventFallbackBody(
         reservationId,
@@ -486,24 +498,46 @@ export class AsyncCyclesLifecycle {
     let stopped = false;
     let currentTimer: ReturnType<typeof setTimeout> | undefined;
 
+    // Alternate-beat extension. Each extend is relative to the CURRENT
+    // expires_at_ms (spec: extend_by_ms extends from current expiry), so
+    // extending by the full ttlMs on every ttl/2 beat would drift expiry
+    // outward by ttl/2 per beat (zombie budget lockup on process death)
+    // and burn the server's max_extensions budget twice as fast as needed.
+    // Instead we extend on every OTHER beat: expiry lead oscillates in
+    // [ttl/2, 1.5*ttl] with no drift. The counter starts at 1 so the FIRST
+    // beat extends (at that point only ttl/2 of lifetime remains — skipping
+    // it would let the reservation lapse before beat 2). After a successful
+    // extend the counter resets and the next beat is skipped; after a
+    // failed extend (non-2xx or thrown) the very next beat retries.
+    // Client clocks are never compared to server expires_at_ms — clock
+    // skew makes that unsafe.
+    let beatsSinceExtend = 1;
+
     const tick = (): void => {
       if (stopped) return;
       currentTimer = setTimeout(() => {
         if (stopped) return;
+        if (beatsSinceExtend < 1) {
+          beatsSinceExtend += 1;
+          tick();
+          return;
+        }
         const body = buildExtendBody(ttlMs);
         void this._client
           .extendReservation(reservationId, body)
           .then((response) => {
             if (response.isSuccess) {
+              beatsSinceExtend = 0;
               // Wire-format key
               const newExpires = response.getBodyAttribute("expires_at_ms");
               if (typeof newExpires === "number") {
                 ctx.expiresAtMs = newExpires;
               }
             }
+            // Non-2xx: leave the counter so the next beat retries.
           })
           .catch(() => {
-            // Best-effort heartbeat
+            // Best-effort heartbeat; retry on the next beat.
           })
           .finally(() => {
             tick();

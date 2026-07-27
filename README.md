@@ -319,7 +319,10 @@ interface WithCyclesConfig {
 
   // Actual cost — optional (defaults to estimate if not provided)
   actual?: number | ((result) => number);    // Actual cost (static or computed from result)
-  useEstimateIfActualNotProvided?: boolean;  // Default: true — use estimate as actual
+  useEstimateIfActualNotProvided?: boolean;  // Default: true — use estimate as actual.
+                                             // When this fallback is taken the commit carries
+                                             // metadata.actual_source = "estimate" so estimated
+                                             // spend is distinguishable from measured spend.
 
   // Action identification (static or computed from args)
   actionKind?: string | ((...args) => string | undefined);  // e.g. "llm.completion" (default: "unknown")
@@ -759,8 +762,9 @@ Anything still pending when the deadline elapses stays journaled and replays on 
 Both `withCycles` and `reserveForStream` start an automatic heartbeat that extends the reservation TTL while your work runs:
 
 - **Interval:** `max(ttlMs / 2, 1000ms)` — e.g., a 60s TTL heartbeats every 30s
-- **Extension amount:** equals the full `ttlMs` each time
-- **Best-effort:** heartbeat failures are silently ignored
+- **Alternate-beat extension:** the server extends relative to the *current* `expires_at_ms`, so the client extends on every **other** beat (first beat extends, next is skipped after a success). Expiry lead stays within `[ttl/2, 1.5 * ttl]` with no outward drift, and only one of the server's `max_extensions` (default 10) is consumed per `ttl` of runtime
+- **Extension amount:** `extend_by_ms` equals the full `ttlMs` each time
+- **Best-effort:** heartbeat failures are silently ignored; a failed extend is retried on the very next beat
 - **Auto-stop:** the heartbeat stops when the reservation is committed, released, or disposed
 
 ## Validation

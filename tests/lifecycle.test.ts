@@ -483,6 +483,101 @@ describe("AsyncCyclesLifecycle", () => {
     vi.useRealTimers();
   });
 
+  it("heartbeat extends on the first beat, skips the second, extends on the third", async () => {
+    vi.useFakeTimers();
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-hb-alt",
+        affected_scopes: [],
+        expires_at_ms: Date.now() + 60000,
+      }),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+    client.extendReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "ACTIVE", expires_at_ms: Date.now() + 120000 }),
+    );
+
+    const retryEngine = makeRetryEngine();
+    const lifecycle = new AsyncCyclesLifecycle(client as any, retryEngine, { tenant: "acme" });
+
+    const result = await lifecycle.execute(
+      async () => {
+        // Beat 1 at 30s: extends (only ttl/2 of lifetime left)
+        await vi.advanceTimersByTimeAsync(30000);
+        expect(client.extendReservation).toHaveBeenCalledTimes(1);
+        // Beat 2 at 60s: skipped (previous extend succeeded)
+        await vi.advanceTimersByTimeAsync(30000);
+        expect(client.extendReservation).toHaveBeenCalledTimes(1);
+        // Beat 3 at 90s: extends again
+        await vi.advanceTimersByTimeAsync(30000);
+        expect(client.extendReservation).toHaveBeenCalledTimes(2);
+        return "done";
+      },
+      [],
+      { estimate: 1000, ttlMs: 60000 },
+    );
+    expect(result).toBe("done");
+
+    // The extend body still requests the full ttlMs.
+    const extendBody = client.extendReservation.mock.calls[0][1];
+    expect(extendBody.extend_by_ms).toBe(60000);
+    expect(extendBody.idempotency_key).toBeDefined();
+
+    vi.useRealTimers();
+  });
+
+  it("heartbeat retries on the very next beat after a failed extend", async () => {
+    vi.useFakeTimers();
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-hb-retry",
+        affected_scopes: [],
+      }),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+    // Beat 1 throws, beat 2 gets a non-2xx, beat 3 succeeds, beat 4 skipped.
+    client.extendReservation
+      .mockRejectedValueOnce(new Error("network down"))
+      .mockResolvedValueOnce(CyclesResponse.httpError(500, "Server error"))
+      .mockResolvedValue(
+        CyclesResponse.success(200, { status: "ACTIVE", expires_at_ms: Date.now() + 120000 }),
+      );
+
+    const retryEngine = makeRetryEngine();
+    const lifecycle = new AsyncCyclesLifecycle(client as any, retryEngine, { tenant: "acme" });
+
+    const result = await lifecycle.execute(
+      async () => {
+        // Beat 1: attempt fails (thrown)
+        await vi.advanceTimersByTimeAsync(30000);
+        expect(client.extendReservation).toHaveBeenCalledTimes(1);
+        // Beat 2: retried immediately, fails again (non-2xx)
+        await vi.advanceTimersByTimeAsync(30000);
+        expect(client.extendReservation).toHaveBeenCalledTimes(2);
+        // Beat 3: retried immediately, succeeds
+        await vi.advanceTimersByTimeAsync(30000);
+        expect(client.extendReservation).toHaveBeenCalledTimes(3);
+        // Beat 4: skipped after the success
+        await vi.advanceTimersByTimeAsync(30000);
+        expect(client.extendReservation).toHaveBeenCalledTimes(3);
+        return "ok";
+      },
+      [],
+      { estimate: 1000, ttlMs: 60000 },
+    );
+    expect(result).toBe("ok");
+
+    vi.useRealTimers();
+  });
+
   // --- evaluateActual tests ---
 
   it("uses callable actual function to compute actual amount", async () => {
@@ -559,6 +654,134 @@ describe("AsyncCyclesLifecycle", () => {
     ).rejects.toThrow("actual expression is required");
   });
 
+  // --- estimate-committed-as-actual marker tests ---
+
+  it("marks metadata.actual_source=estimate when the estimate fallback is committed", async () => {
+    const debugSpy = vi.spyOn(console, "debug").mockImplementation(() => {});
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-est",
+        affected_scopes: [],
+      }),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+
+    const retryEngine = makeRetryEngine();
+    const lifecycle = new AsyncCyclesLifecycle(client as any, retryEngine, { tenant: "acme" });
+
+    // No `actual` configured — the estimate is committed as actual.
+    await lifecycle.execute(
+      async () => {
+        const ctx = getCyclesContext()!;
+        ctx.commitMetadata = { model: "gpt-4o" };
+        return "ok";
+      },
+      [],
+      { estimate: 1000 },
+    );
+
+    const commitBody = client.commitReservation.mock.calls[0][1];
+    expect(commitBody.actual.amount).toBe(1000);
+    // Marker merged into existing commit metadata
+    expect(commitBody.metadata).toEqual({
+      model: "gpt-4o",
+      actual_source: "estimate",
+    });
+    expect(debugSpy).toHaveBeenCalledOnce();
+    debugSpy.mockRestore();
+  });
+
+  it("creates metadata for the marker when no commit metadata exists", async () => {
+    const debugSpy = vi.spyOn(console, "debug").mockImplementation(() => {});
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-est-2",
+        affected_scopes: [],
+      }),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+
+    const retryEngine = makeRetryEngine();
+    const lifecycle = new AsyncCyclesLifecycle(client as any, retryEngine, { tenant: "acme" });
+
+    await lifecycle.execute(async () => "ok", [], { estimate: 1000 });
+
+    const commitBody = client.commitReservation.mock.calls[0][1];
+    expect(commitBody.metadata).toEqual({ actual_source: "estimate" });
+    debugSpy.mockRestore();
+  });
+
+  it("does not add the marker when an explicit actual is provided", async () => {
+    const debugSpy = vi.spyOn(console, "debug").mockImplementation(() => {});
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-real",
+        affected_scopes: [],
+      }),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+
+    const retryEngine = makeRetryEngine();
+    const lifecycle = new AsyncCyclesLifecycle(client as any, retryEngine, { tenant: "acme" });
+
+    await lifecycle.execute(async () => "ok", [], { estimate: 1000, actual: 777 });
+
+    const commitBody = client.commitReservation.mock.calls[0][1];
+    expect(commitBody.metadata).toBeUndefined();
+    expect(debugSpy).not.toHaveBeenCalled();
+    debugSpy.mockRestore();
+  });
+
+  it("carries the marker into the /v1/events fallback body when the reservation expired", async () => {
+    const debugSpy = vi.spyOn(console, "debug").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-est-exp",
+        affected_scopes: [],
+      }),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.httpError(410, "Gone", {
+        error: "RESERVATION_EXPIRED",
+        message: "Reservation expired",
+        request_id: "req-1",
+      }),
+    );
+
+    const retryEngine = makeRetryEngine();
+    // Stubbed: this test asserts the fallback body content, not the loop.
+    const scheduleEventSpy = vi
+      .spyOn(retryEngine, "scheduleEvent")
+      .mockImplementation(() => {});
+    const lifecycle = new AsyncCyclesLifecycle(client as any, retryEngine, { tenant: "acme" });
+
+    await lifecycle.execute(async () => "ok", [], { estimate: 1000 });
+
+    expect(scheduleEventSpy).toHaveBeenCalledOnce();
+    const eventBody = scheduleEventSpy.mock.calls[0][1] as Record<string, unknown>;
+    const metadata = eventBody.metadata as Record<string, unknown>;
+    expect(metadata.actual_source).toBe("estimate");
+    expect(metadata.recovered_reservation_id).toBe("r-est-exp");
+    expect(metadata.recovery_reason).toBe("commit_after_reservation_expired");
+    debugSpy.mockRestore();
+    warnSpy.mockRestore();
+  });
+
   // --- Context metrics and metadata tests ---
 
   it("commit includes context metrics and metadata set inside guarded function", async () => {
@@ -585,7 +808,7 @@ describe("AsyncCyclesLifecycle", () => {
         return "done";
       },
       [],
-      { estimate: 1000 },
+      { estimate: 1000, actual: 900 },
     );
 
     const commitBody = client.commitReservation.mock.calls[0][1];
