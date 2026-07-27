@@ -13,6 +13,9 @@ export { withCycles, setDefaultClient, setDefaultConfig } from "./withCycles.js"
 export { reserveForStream } from "./streaming.js";
 export type { StreamReservation, StreamReservationOptions } from "./streaming.js";
 
+// Durable-retry flush (serverless: await before returning the response)
+export { flushPendingCommits } from "./retry.js";
+
 // Context
 export { getCyclesContext } from "./context.js";
 export type { CyclesContext } from "./context.js";

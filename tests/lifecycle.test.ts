@@ -718,7 +718,10 @@ describe("AsyncCyclesLifecycle", () => {
     expect(client.releaseReservation).not.toHaveBeenCalled();
   });
 
-  it("uses 'unknown' in release reason when error code is truly missing", async () => {
+  it("journals instead of releasing when the error code is truly missing", async () => {
+    // A 4xx without a recognized error code is unclassifiable: releasing
+    // would return budget for spend that already happened.
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     const client = makeMockClient();
     client.createReservation.mockResolvedValue(
       CyclesResponse.success(200, {
@@ -733,18 +736,19 @@ describe("AsyncCyclesLifecycle", () => {
         message: "Malformed body",
       }),
     );
-    client.releaseReservation.mockResolvedValue(
-      CyclesResponse.success(200, { status: "RELEASED" }),
-    );
 
     const retryEngine = makeRetryEngine();
+    // Stubbed: this test asserts routing, not the background loop itself.
+    const scheduleSpy = vi
+      .spyOn(retryEngine, "schedule")
+      .mockImplementation(() => {});
     const lifecycle = new AsyncCyclesLifecycle(client as any, retryEngine, { tenant: "acme" });
 
     await lifecycle.execute(async () => "ok", [], { estimate: 1000 });
 
-    expect(client.releaseReservation).toHaveBeenCalledOnce();
-    const releaseBody = client.releaseReservation.mock.calls[0][1];
-    expect(releaseBody.reason).toBe("commit_rejected_unknown");
+    expect(scheduleSpy).toHaveBeenCalledOnce();
+    expect(client.releaseReservation).not.toHaveBeenCalled();
+    errorSpy.mockRestore();
   });
 
   it("uses gracePeriodMs and dimensions in request body", async () => {

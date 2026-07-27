@@ -1,17 +1,31 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { reserveForStream } from "../src/streaming.js";
 import { CyclesConfig } from "../src/config.js";
+import { authFingerprint, defaultJournalDir } from "../src/journal.js";
 import { CyclesResponse } from "../src/response.js";
 import { BudgetExceededError, CyclesError, TenantClosedError } from "../src/exceptions.js";
 
-function makeMockClient() {
+function makeMockClient(
+  configOverrides: Partial<ConstructorParameters<typeof CyclesConfig>[0]> = {},
+) {
   return {
-    config: new CyclesConfig({ baseUrl: "http://localhost", apiKey: "key" }),
+    config: new CyclesConfig({ baseUrl: "http://localhost", apiKey: "key", ...configOverrides }),
     createReservation: vi.fn(),
     commitReservation: vi.fn(),
     releaseReservation: vi.fn(),
     extendReservation: vi.fn(),
+    createEvent: vi.fn(),
   };
+}
+
+/** Journal files for the mock client's (server, key) identity. */
+function journalFiles(): string[] {
+  const dir = path.join(defaultJournalDir(), authFingerprint("http://localhost", "key"));
+  return fs.existsSync(dir)
+    ? fs.readdirSync(dir).filter((n) => n.endsWith(".json"))
+    : [];
 }
 
 describe("reserveForStream", () => {
@@ -642,8 +656,10 @@ describe("reserveForStream", () => {
 
   // --- Bug fix regression: commit failure recovery ---
 
-  it("commit resets finalized on transport failure so caller can retry", async () => {
-    const client = makeMockClient();
+  it("commit journals the spend and resolves on transport failure", async () => {
+    // retryEnabled: false keeps the background loop out of the test; the
+    // journal entry alone proves durability.
+    const client = makeMockClient({ retryEnabled: false });
     client.createReservation.mockResolvedValue(
       CyclesResponse.success(200, {
         decision: "ALLOW",
@@ -651,11 +667,7 @@ describe("reserveForStream", () => {
         affected_scopes: [],
       }),
     );
-    // First commit throws (network error)
-    client.commitReservation
-      .mockRejectedValueOnce(new Error("ECONNRESET"))
-      // Second commit succeeds
-      .mockResolvedValueOnce(CyclesResponse.success(200, { status: "COMMITTED" }));
+    client.commitReservation.mockRejectedValueOnce(new Error("ECONNRESET"));
 
     const handle = await reserveForStream({
       client: client as any,
@@ -663,19 +675,14 @@ describe("reserveForStream", () => {
       tenant: "acme",
     });
 
-    // First commit fails
-    await expect(handle.commit(500)).rejects.toThrow("ECONNRESET");
-    // Handle should NOT be finalized — caller can retry
-    expect(handle.finalized).toBe(false);
-
-    // Retry succeeds
+    // Spend already happened: the SDK owns recovery, the caller is done.
     await handle.commit(500);
     expect(handle.finalized).toBe(true);
-    expect(client.commitReservation).toHaveBeenCalledTimes(2);
+    expect(journalFiles()).toHaveLength(1);
   });
 
-  it("commit throws CyclesError on non-success HTTP response", async () => {
-    const client = makeMockClient();
+  it("commit recovers an expired reservation via the event fallback", async () => {
+    const client = makeMockClient({ retryEnabled: false });
     client.createReservation.mockResolvedValue(
       CyclesResponse.success(200, {
         decision: "ALLOW",
@@ -697,19 +704,26 @@ describe("reserveForStream", () => {
       tenant: "acme",
     });
 
-    await expect(handle.commit(500)).rejects.toThrow("Commit failed with status 409");
-    // Should be recoverable — can fall back to release
-    expect(handle.finalized).toBe(false);
-
-    client.releaseReservation.mockResolvedValue(
-      CyclesResponse.success(200, { status: "RELEASED" }),
-    );
-    await handle.release("commit_failed");
+    // The server already returned the budget to the pool: the spend is
+    // re-recorded via POST /v1/events, not surfaced to the caller.
+    await handle.commit(500);
     expect(handle.finalized).toBe(true);
+
+    const files = journalFiles();
+    expect(files).toHaveLength(1);
+    const record = JSON.parse(
+      fs.readFileSync(
+        path.join(defaultJournalDir(), authFingerprint("http://localhost", "key"), files[0]),
+        "utf-8",
+      ),
+    );
+    expect(record.mode).toBe("event");
+    expect(record.event_fallback_body.metadata.recovered_reservation_id).toBe("r-4xx");
+    expect(record.event_fallback_body.subject).toEqual({ tenant: "acme" });
   });
 
-  it("commit failure allows release as fallback", async () => {
-    const client = makeMockClient();
+  it("genuine commit rejection throws and allows release as fallback", async () => {
+    const client = makeMockClient({ retryEnabled: false });
     client.createReservation.mockResolvedValue(
       CyclesResponse.success(200, {
         decision: "ALLOW",
@@ -717,7 +731,13 @@ describe("reserveForStream", () => {
         affected_scopes: [],
       }),
     );
-    client.commitReservation.mockRejectedValueOnce(new Error("network error"));
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.httpError(409, "Unit mismatch", {
+        error: "UNIT_MISMATCH",
+        message: "Unit mismatch",
+        request_id: "req-2",
+      }),
+    );
     client.releaseReservation.mockResolvedValue(
       CyclesResponse.success(200, { status: "RELEASED" }),
     );
@@ -728,14 +748,214 @@ describe("reserveForStream", () => {
       tenant: "acme",
     });
 
-    // Commit fails
-    await expect(handle.commit(500)).rejects.toThrow("network error");
+    // A malformed commit is the caller's to correct — not journaled.
+    await expect(handle.commit(500)).rejects.toThrow("Commit failed with status 409");
     expect(handle.finalized).toBe(false);
+    expect(journalFiles()).toHaveLength(0);
 
-    // Caller falls back to release instead of retrying
+    // Caller falls back to release
     await handle.release("commit_failed");
     expect(handle.finalized).toBe(true);
     expect(client.releaseReservation).toHaveBeenCalledOnce();
+  });
+
+  it("commit treats a bodyless 410 as expired and uses the event fallback", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const client = makeMockClient({ retryEnabled: false });
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-410",
+        affected_scopes: [],
+      }),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.httpError(410, "Gone"), // no JSON body at all
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+    });
+
+    await handle.commit(500);
+    expect(handle.finalized).toBe(true);
+
+    const files = journalFiles();
+    expect(files).toHaveLength(1);
+    const record = JSON.parse(
+      fs.readFileSync(
+        path.join(defaultJournalDir(), authFingerprint("http://localhost", "key"), files[0]),
+        "utf-8",
+      ),
+    );
+    expect(record.mode).toBe("event");
+    expect(record.event_fallback_body.metadata.recovered_reservation_id).toBe("r-410");
+    warnSpy.mockRestore();
+  });
+
+  it("commit journals instead of throwing on an unrecognized 4xx code", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const client = makeMockClient({ retryEnabled: false });
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-future",
+        affected_scopes: [],
+      }),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.httpError(400, "weird", {
+        error: "SOME_FUTURE_CODE",
+        message: "m",
+        request_id: "r",
+      }),
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+    });
+
+    // Unclassifiable: the spend already happened — resolve, journal, retain.
+    await handle.commit(500);
+    expect(handle.finalized).toBe(true);
+    expect(journalFiles()).toHaveLength(1);
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("unclassifiable"));
+    errorSpy.mockRestore();
+    warnSpy.mockRestore();
+  });
+
+  it("commit journals instead of throwing on a codeless 4xx", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const client = makeMockClient({ retryEnabled: false });
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-codeless",
+        affected_scopes: [],
+      }),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.httpError(400, "Bad request"),
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+    });
+
+    await handle.commit(500);
+    expect(handle.finalized).toBe(true);
+    expect(journalFiles()).toHaveLength(1);
+    errorSpy.mockRestore();
+    warnSpy.mockRestore();
+  });
+
+  it("commit journals with the Retry-After floor on a rate-limited response", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const client = makeMockClient({ retryEnabled: false });
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-429",
+        affected_scopes: [],
+      }),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.httpError(
+        429,
+        "busy",
+        { error: "LIMIT_EXCEEDED", message: "slow down", request_id: "r" },
+        { "retry-after": "3" },
+      ),
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+    });
+
+    await handle.commit(500);
+    expect(handle.finalized).toBe(true);
+    expect(client.releaseReservation).not.toHaveBeenCalled();
+
+    const files = journalFiles();
+    expect(files).toHaveLength(1);
+    const record = JSON.parse(
+      fs.readFileSync(
+        path.join(defaultJournalDir(), authFingerprint("http://localhost", "key"), files[0]),
+        "utf-8",
+      ),
+    );
+    expect(record.not_before_ms).toBeGreaterThan(Date.now());
+    warnSpy.mockRestore();
+  });
+
+  it("commit journals instead of releasing on an authentication failure", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const client = makeMockClient({ retryEnabled: false });
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-401",
+        affected_scopes: [],
+      }),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.httpError(401, "Unauthorized"),
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+    });
+
+    await handle.commit(500);
+    expect(handle.finalized).toBe(true);
+    expect(client.releaseReservation).not.toHaveBeenCalled();
+    expect(journalFiles()).toHaveLength(1);
+    errorSpy.mockRestore();
+    warnSpy.mockRestore();
+  });
+
+  it("commit resolves quietly when the reservation is already settled", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const client = makeMockClient({ retryEnabled: false });
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-settled",
+        affected_scopes: [],
+      }),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.httpError(409, "Finalized", {
+        error: "RESERVATION_FINALIZED",
+        message: "Finalized",
+        request_id: "r",
+      }),
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+    });
+
+    await handle.commit(500);
+    expect(handle.finalized).toBe(true);
+    expect(journalFiles()).toHaveLength(0);
+    expect(client.releaseReservation).not.toHaveBeenCalled();
+    warnSpy.mockRestore();
   });
 
   it("passes gracePeriodMs and actionTags in request body", async () => {
