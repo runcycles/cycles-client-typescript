@@ -237,28 +237,32 @@ export const PERMANENT_EXTEND_ERROR_CODES: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Compute the EFFECTIVE granted TTL for heartbeat scheduling.
+ * Estimate the first granted TTL from the create response — a first-beat
+ * cadence HINT only, never a correctness input.
  *
  * Tenant policy `max_reservation_ttl_ms` silently CAPS the granted TTL at
  * reserve time (governance default: 1 hour) and the create response has no
- * effective-TTL field — seeding the heartbeat from the REQUESTED ttl would
- * schedule the first beat far too late (a 24h request capped to 1h would
- * put the first beat at 12h, long after expiry). Recover the granted TTL
- * as `expires_at_ms - HTTP Date header`: both terms are server-frame, so
- * the difference is clock-skew-free (HTTP-date resolution is ~1s, which
- * the heartbeat margins absorb). Clamped to [1000, requestedTtlMs]; falls
- * back to the requested ttl when either server timestamp is unavailable.
+ * effective-TTL field. `expires_at_ms - HTTP Date header` recovers a rough
+ * estimate of the grant, but the two are NOT a safe same-clock pair: per
+ * RFC 9110 the `Date` header is a whole-second, best-effort origination
+ * timestamp that intermediaries may replace, and in the reference server
+ * `expires_at_ms` comes from Redis `TIME` while `Date` comes from the
+ * servlet container. The heartbeat therefore uses this value only to
+ * TIGHTEN the first-beat delay (which is already capped at 30 s); all
+ * lead accounting uses measured server-frame grants instead. Returns the
+ * raw derived value floored at 0, or undefined when either timestamp is
+ * missing — no upward clamp: fabricating lease the server never granted
+ * is worse than a pessimistic hint.
  */
 export function computeEffectiveTtlMs(
   requestedTtlMs: number,
   expiresAtMs: number | undefined,
   serverDateMs: number | undefined,
-): number {
+): number | undefined {
   if (expiresAtMs === undefined || serverDateMs === undefined) {
-    return requestedTtlMs;
+    return undefined;
   }
-  const grantedMs = expiresAtMs - serverDateMs;
-  return Math.min(Math.max(grantedMs, 1_000), requestedTtlMs);
+  return Math.max(expiresAtMs - serverDateMs, 0);
 }
 
 /** Extract the wire error code from a non-2xx response (body-tolerant). */
@@ -362,14 +366,20 @@ export class AsyncCyclesLifecycle {
       balances: resResult.balances,
     };
 
-    // Start heartbeat, seeded from the EFFECTIVE granted TTL — a tenant
-    // policy may have silently capped the requested one at reserve time.
-    const effectiveTtlMs = computeEffectiveTtlMs(
+    // Start heartbeat. The Date-derived grant estimate is a first-beat
+    // cadence hint only (see computeEffectiveTtlMs); the requested ttl is
+    // what every extend asks for.
+    const estGrantMs = computeEffectiveTtlMs(
       ttlMs,
       resResult.expiresAtMs,
       resResponse.serverDateMs,
     );
-    const heartbeatRef = this._startHeartbeat(reservationId, effectiveTtlMs, ctx);
+    const heartbeatRef = this._startHeartbeat(
+      reservationId,
+      ttlMs,
+      estGrantMs,
+      ctx,
+    );
 
     try {
       const result = await runWithContext(ctx, () => fn(...args));
@@ -539,66 +549,74 @@ export class AsyncCyclesLifecycle {
   }
 
   /**
-   * `ttlMs` is the EFFECTIVE granted TTL (see {@link computeEffectiveTtlMs}),
-   * used for the beat interval, the lead estimate, the skip threshold, and
-   * the requested `extend_by_ms` alike.
+   * `ttlMs` is the REQUESTED ttl: it is what every `extend_by_ms` asks for
+   * and it bounds the beat cadence. `estGrantMs` is the Date-derived
+   * first-grant estimate (see {@link computeEffectiveTtlMs}) — a first-beat
+   * cadence HINT only, never a correctness input.
    */
   private _startHeartbeat(
     reservationId: string,
     ttlMs: number,
+    estGrantMs: number | undefined,
     ctx: CyclesContext,
   ): { stop: () => void } | undefined {
     if (ttlMs <= 0) return undefined;
     validateExtendByMs(ttlMs);
-    // Beat every ttl/2 — deliberately NO lower floor. The spec's minimum
-    // ttl_ms is 1000, so the interval is at least 500ms; a floor could only
-    // ever bind for ttl < 2000, where beating slower than ttl/2 guarantees
-    // the reservation lapses between beats.
-    const intervalMs = ttlMs / 2;
+    // First-beat delay: ttl/2 capped at 30 s. Tenant policy
+    // max_reservation_ttl_ms may have silently capped the granted TTL far
+    // below the requested one (governance default: 1 hour) and the create
+    // response has no effective-TTL field, so the first beat must land
+    // early regardless of what was actually granted. The Date-derived
+    // estimate, when available and positive, can only TIGHTEN this delay.
+    // After the first applied grant the cadence re-derives from the
+    // MEASURED grant: clamp(lastGrant/2, 500, ttl/2). The 500 ms floor
+    // cannot starve liveness — it binds only when the server grants less
+    // than 1 s per extend, i.e. below the spec's own minimum ttl_ms.
+    let intervalMs = Math.min(ttlMs / 2, 30_000);
+    if (estGrantMs !== undefined && estGrantMs > 0) {
+      intervalMs = Math.min(intervalMs, estGrantMs / 2);
+    }
     let stopped = false;
     let currentTimer: ReturnType<typeof setTimeout> | undefined;
 
-    // Lead-estimate extension. `extend_by_ms` extends relative to the
-    // CURRENT expires_at_ms (spec), so blindly extending by ttlMs on every
-    // ttl/2 beat would drift expiry outward by ttl/2 per beat (zombie
-    // budget lockup on process death) and burn the server's max_extensions
-    // budget twice as fast as needed. Instead each beat estimates the
-    // expiry LEAD — how far ahead of "now" the expiry sits — and skips the
-    // extend only when the lead is already comfortably large (>= 1.5*ttl).
+    // Lead lower-bound extension. `extend_by_ms` extends relative to the
+    // CURRENT expires_at_ms (spec), so blindly extending by ttlMs on
+    // every beat would drift expiry outward per beat (zombie budget
+    // lockup on process death) and burn the server's max_extensions
+    // budget faster than needed. Each beat instead computes a rigorous
+    // LOWER BOUND on the expiry lead:
     //
-    // The estimate is clock-skew-free by construction: it only ever
-    // subtracts server timestamps from server timestamps and client
-    // monotonic timestamps from client monotonic timestamps — the client
-    // wall clock is never compared to the server's expires_at_ms:
+    //   leadMin = grantsSum - (now - anchor)
     //
-    //   lead = (knownExpiry - initialExpiry) + ttlMs - (now - anchor)
-    //
-    // where `initialExpiry`/`knownExpiry` are server-frame expiries and
-    // `anchor` is a client performance.now() reading taken at heartbeat
-    // start. `grantedMs` tracks the server-frame difference
-    // (knownExpiry - initialExpiry); when no server-frame reference is
-    // available (create or extend response without a numeric
-    // expires_at_ms) it accumulates ttlMs per applied grant instead. The
-    // estimate is optimistic by at most one response leg (expiries are
-    // read after the network round trip), which the ttl/2 cadence and the
-    // 1.5*ttl skip threshold absorb.
-    const initialExpiry = ctx.expiresAtMs;
-    let knownExpiry = initialExpiry;
+    // where grants are differences of SUCCESSIVE expires_at_ms values
+    // returned by the server (same server clock frame) and the elapsed
+    // term is client-monotonic — no cross-clock arithmetic anywhere.
+    // leadMin starts at 0: the initial grant is deliberately NOT counted,
+    // because there is no safe same-clock anchor to measure it against
+    // (per RFC 9110 the HTTP Date header is a whole-second, best-effort
+    // origination time that intermediaries may replace; in the reference
+    // server expires_at_ms comes from Redis TIME while Date comes from
+    // the servlet container). So leadMin never overstates the real lead.
+    // A beat is skipped only when leadMin >= 1.5x the last MEASURED
+    // grant; otherwise it extends by the requested ttl. When a response
+    // carries no numeric expires_at_ms, the grant falls back to the
+    // requested ttl (2xx is proof the extend applied).
+    let prevExpiry = ctx.expiresAtMs;
     const anchor = performance.now();
-    let grantedMs = 0;
+    let grantsSum = 0;
+    let lastGrant: number | undefined;
     // Idempotency key of an extend whose outcome we never saw. It is
     // reused on the retry so a lost response cannot double-extend.
     let pendingKey: string | undefined;
 
-    const tick = (): void => {
+    const tick = (delayMs: number): void => {
       if (stopped) return;
       currentTimer = setTimeout(() => {
         if (stopped) return;
-        const elapsed = performance.now() - anchor;
-        const leadMs = grantedMs + ttlMs - elapsed;
-        if (leadMs >= 1.5 * ttlMs) {
-          // Plenty of lead — skip this beat (no server call).
-          tick();
+        const leadMin = grantsSum - (performance.now() - anchor);
+        if (lastGrant !== undefined && leadMin >= 1.5 * lastGrant) {
+          // Plenty of proven lead — skip this beat (no server call).
+          tick(intervalMs);
           return;
         }
         const key = pendingKey ?? randomUUID();
@@ -618,26 +636,24 @@ export class AsyncCyclesLifecycle {
                 );
               }
               const newExpires = response.getBodyAttribute("expires_at_ms");
-              if (
+              // Measured server-frame grant; requested-ttl fallback when
+              // either endpoint of the difference is unavailable.
+              const grant =
                 typeof newExpires === "number" &&
-                initialExpiry !== undefined
-              ) {
-                // Authoritative server-frame resync (self-corrects after
-                // clamped grants or missing bodies).
-                grantedMs = newExpires - initialExpiry;
-                knownExpiry = newExpires;
-                ctx.expiresAtMs = newExpires;
-              } else {
-                // No server-frame diff available — count the applied grant
-                // optimistically as +ttlMs of lead.
-                grantedMs += ttlMs;
-                if (typeof newExpires === "number") {
-                  knownExpiry = newExpires;
-                  ctx.expiresAtMs = newExpires;
-                } else if (knownExpiry !== undefined) {
-                  knownExpiry += ttlMs;
-                  ctx.expiresAtMs = knownExpiry;
-                }
+                typeof prevExpiry === "number"
+                  ? newExpires - prevExpiry
+                  : ttlMs;
+              prevExpiry =
+                typeof newExpires === "number"
+                  ? newExpires
+                  : prevExpiry !== undefined
+                    ? prevExpiry + ttlMs
+                    : undefined;
+              grantsSum += grant;
+              lastGrant = grant;
+              intervalMs = Math.min(Math.max(grant / 2, 500), ttlMs / 2);
+              if (prevExpiry !== undefined) {
+                ctx.expiresAtMs = prevExpiry;
               }
               return;
             }
@@ -666,12 +682,12 @@ export class AsyncCyclesLifecycle {
             // Transport error: best-effort — retry next beat, same key.
           })
           .finally(() => {
-            tick();
+            tick(intervalMs);
           });
-      }, intervalMs);
+      }, delayMs);
     };
 
-    tick();
+    tick(intervalMs);
     return {
       stop: () => {
         stopped = true;

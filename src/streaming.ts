@@ -219,65 +219,70 @@ export async function reserveForStream(
 
   const startHeartbeat = (): void => {
     if (ttlMs <= 0) return;
-    // Seed the heartbeat from the EFFECTIVE granted TTL — a tenant policy
-    // (max_reservation_ttl_ms) may have silently capped the requested one
-    // at reserve time. Used for the interval, the lead estimate, the skip
-    // threshold, and extend_by_ms alike.
-    const effTtlMs = computeEffectiveTtlMs(
+    validateExtendByMs(ttlMs);
+    // First-beat delay: ttl/2 capped at 30 s. Tenant policy
+    // max_reservation_ttl_ms may have silently capped the granted TTL far
+    // below the requested one (governance default: 1 hour) and the create
+    // response has no effective-TTL field, so the first beat must land
+    // early regardless of what was actually granted. The Date-derived
+    // estimate (see computeEffectiveTtlMs — a HINT only, never a
+    // correctness input) can only TIGHTEN this delay. After the first
+    // applied grant the cadence re-derives from the MEASURED grant:
+    // clamp(lastGrant/2, 500, ttl/2). The 500 ms floor cannot starve
+    // liveness — it binds only when the server grants less than 1 s per
+    // extend, i.e. below the spec's own minimum ttl_ms.
+    const estGrantMs = computeEffectiveTtlMs(
       ttlMs,
       parsed.expiresAtMs,
       response.serverDateMs,
     );
-    validateExtendByMs(effTtlMs);
-    // Beat every effTtl/2 — deliberately NO lower floor. The spec's minimum
-    // ttl_ms is 1000, so the interval is at least 500ms; a floor could only
-    // ever bind for ttl < 2000, where beating slower than ttl/2 guarantees
-    // the reservation lapses between beats.
-    const intervalMs = effTtlMs / 2;
+    let intervalMs = Math.min(ttlMs / 2, 30_000);
+    if (estGrantMs !== undefined && estGrantMs > 0) {
+      intervalMs = Math.min(intervalMs, estGrantMs / 2);
+    }
 
-    // Lead-estimate extension. `extend_by_ms` extends relative to the
-    // CURRENT expires_at_ms (spec), so blindly extending by ttlMs on every
-    // ttl/2 beat would drift expiry outward by ttl/2 per beat and burn the
-    // server's max_extensions budget twice as fast as needed. Each beat
-    // instead estimates the expiry LEAD — how far ahead of "now" the
-    // expiry sits — and skips the extend only when the lead is already
-    // comfortably large (>= 1.5*ttl).
+    // Lead lower-bound extension. `extend_by_ms` extends relative to the
+    // CURRENT expires_at_ms (spec), so blindly extending by ttlMs on
+    // every beat would drift expiry outward per beat and burn the
+    // server's max_extensions budget faster than needed. Each beat
+    // instead computes a rigorous LOWER BOUND on the expiry lead:
     //
-    // The estimate is clock-skew-free by construction: it only ever
-    // subtracts server timestamps from server timestamps and client
-    // monotonic timestamps from client monotonic timestamps — the client
-    // wall clock is never compared to the server's expires_at_ms:
+    //   leadMin = grantsSum - (now - anchor)
     //
-    //   lead = (knownExpiry - initialExpiry) + effTtlMs - (now - anchor)
-    //
-    // `grantedMs` tracks the server-frame difference
-    // (knownExpiry - initialExpiry); when no server-frame reference is
-    // available (create or extend response without a numeric
-    // expires_at_ms) it accumulates effTtlMs per applied grant instead.
-    // The estimate is optimistic by at most one response leg, which the
-    // ttl/2 cadence and the 1.5*ttl skip threshold absorb.
-    const initialExpiry = parsed.expiresAtMs;
-    let knownExpiry = initialExpiry;
+    // where grants are differences of SUCCESSIVE expires_at_ms values
+    // returned by the server (same server clock frame) and the elapsed
+    // term is client-monotonic — no cross-clock arithmetic anywhere.
+    // leadMin starts at 0: the initial grant is deliberately NOT counted,
+    // because there is no safe same-clock anchor to measure it against
+    // (per RFC 9110 the HTTP Date header is a whole-second, best-effort
+    // origination time that intermediaries may replace; in the reference
+    // server expires_at_ms comes from Redis TIME while Date comes from
+    // the servlet container). So leadMin never overstates the real lead.
+    // A beat is skipped only when leadMin >= 1.5x the last MEASURED
+    // grant; otherwise it extends by the requested ttl. When a response
+    // carries no numeric expires_at_ms, the grant falls back to the
+    // requested ttl (2xx is proof the extend applied).
+    let prevExpiry = parsed.expiresAtMs;
     const anchor = performance.now();
-    let grantedMs = 0;
+    let grantsSum = 0;
+    let lastGrant: number | undefined;
     // Idempotency key of an extend whose outcome we never saw. It is
     // reused on the retry so a lost response cannot double-extend.
     let pendingKey: string | undefined;
 
-    const tick = (): void => {
+    const tick = (delayMs: number): void => {
       if (heartbeatStopped) return;
       currentTimer = setTimeout(() => {
         if (heartbeatStopped) return;
-        const elapsed = performance.now() - anchor;
-        const leadMs = grantedMs + effTtlMs - elapsed;
-        if (leadMs >= 1.5 * effTtlMs) {
-          // Plenty of lead — skip this beat (no server call).
-          tick();
+        const leadMin = grantsSum - (performance.now() - anchor);
+        if (lastGrant !== undefined && leadMin >= 1.5 * lastGrant) {
+          // Plenty of proven lead — skip this beat (no server call).
+          tick(intervalMs);
           return;
         }
         const key = pendingKey ?? randomUUID();
         pendingKey = key;
-        const extendBody = { idempotency_key: key, extend_by_ms: effTtlMs };
+        const extendBody = { idempotency_key: key, extend_by_ms: ttlMs };
         void client
           .extendReservation(reservationId, extendBody)
           .then((response) => {
@@ -292,24 +297,22 @@ export async function reserveForStream(
                 );
               }
               const newExpires = response.getBodyAttribute("expires_at_ms");
-              if (
+              // Measured server-frame grant; requested-ttl fallback when
+              // either endpoint of the difference is unavailable.
+              const grant =
                 typeof newExpires === "number" &&
-                initialExpiry !== undefined
-              ) {
-                // Authoritative server-frame resync (self-corrects after
-                // clamped grants or missing bodies).
-                grantedMs = newExpires - initialExpiry;
-                knownExpiry = newExpires;
-              } else {
-                // No server-frame diff available — count the applied grant
-                // optimistically as +effTtlMs of lead.
-                grantedMs += effTtlMs;
-                if (typeof newExpires === "number") {
-                  knownExpiry = newExpires;
-                } else if (knownExpiry !== undefined) {
-                  knownExpiry += effTtlMs;
-                }
-              }
+                typeof prevExpiry === "number"
+                  ? newExpires - prevExpiry
+                  : ttlMs;
+              prevExpiry =
+                typeof newExpires === "number"
+                  ? newExpires
+                  : prevExpiry !== undefined
+                    ? prevExpiry + ttlMs
+                    : undefined;
+              grantsSum += grant;
+              lastGrant = grant;
+              intervalMs = Math.min(Math.max(grant / 2, 500), ttlMs / 2);
               return;
             }
             // Failure: KEEP pendingKey so the next beat retries with the
@@ -336,11 +339,11 @@ export async function reserveForStream(
           .catch(() => {
             // Transport error: best-effort — retry next beat, same key.
           })
-          .finally(() => { tick(); });
-      }, intervalMs);
+          .finally(() => { tick(intervalMs); });
+      }, delayMs);
     };
 
-    tick();
+    tick(intervalMs);
   };
 
   startHeartbeat();

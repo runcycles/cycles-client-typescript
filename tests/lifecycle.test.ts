@@ -483,7 +483,7 @@ describe("AsyncCyclesLifecycle", () => {
     vi.useRealTimers();
   });
 
-  it("heartbeat lead-estimate: extend, extend, skip, extend over four beats", async () => {
+  it("heartbeat leadMin: extends beats 1-4, skips beat 5, extends beat 6", async () => {
     vi.useFakeTimers();
     const client = makeMockClient();
     const e0 = 1_000_000_000; // server-frame initial expiry
@@ -510,18 +510,27 @@ describe("AsyncCyclesLifecycle", () => {
 
     const result = await lifecycle.execute(
       async () => {
-        // Beat 1 at 30s: lead = ttl/2 -> extend (lead becomes 1.5*ttl)
+        // leadMin = grantsSum - elapsed starts at 0 (the initial grant is
+        // never counted); each measured grant adds 60000, each 30s beat
+        // subtracts 30000, so leadMin before beat n is 30000*(n-1) - 30000.
+        // Beat 1 at 30s: lastGrant undefined -> extend (leadMin -30000)
         await vi.advanceTimersByTimeAsync(30000);
         expect(client.extendReservation).toHaveBeenCalledTimes(1);
-        // Beat 2 at 60s: lead = ttl -> extend (lead becomes 2*ttl)
+        // Beat 2 at 60s: leadMin 0 < 90000 -> extend
         await vi.advanceTimersByTimeAsync(30000);
         expect(client.extendReservation).toHaveBeenCalledTimes(2);
-        // Beat 3 at 90s: lead = 1.5*ttl -> skip
-        await vi.advanceTimersByTimeAsync(30000);
-        expect(client.extendReservation).toHaveBeenCalledTimes(2);
-        // Beat 4 at 120s: lead = ttl -> extend
+        // Beat 3 at 90s: leadMin 30000 < 90000 -> extend
         await vi.advanceTimersByTimeAsync(30000);
         expect(client.extendReservation).toHaveBeenCalledTimes(3);
+        // Beat 4 at 120s: leadMin 60000 < 90000 -> extend
+        await vi.advanceTimersByTimeAsync(30000);
+        expect(client.extendReservation).toHaveBeenCalledTimes(4);
+        // Beat 5 at 150s: leadMin 90000 >= 1.5*60000 -> skip
+        await vi.advanceTimersByTimeAsync(30000);
+        expect(client.extendReservation).toHaveBeenCalledTimes(4);
+        // Beat 6 at 180s: leadMin 60000 < 90000 -> extend
+        await vi.advanceTimersByTimeAsync(30000);
+        expect(client.extendReservation).toHaveBeenCalledTimes(5);
         return "done";
       },
       [],
@@ -529,10 +538,11 @@ describe("AsyncCyclesLifecycle", () => {
     );
     expect(result).toBe("done");
 
-    // The extend body requests the full ttlMs.
-    const extendBody = client.extendReservation.mock.calls[0][1];
-    expect(extendBody.extend_by_ms).toBe(60000);
-    expect(extendBody.idempotency_key).toBeDefined();
+    // Every extend body requests the full REQUESTED ttlMs.
+    for (const call of client.extendReservation.mock.calls) {
+      expect(call[1].extend_by_ms).toBe(60000);
+    }
+    expect(client.extendReservation.mock.calls[0][1].idempotency_key).toBeDefined();
 
     vi.useRealTimers();
   });
@@ -578,8 +588,8 @@ describe("AsyncCyclesLifecycle", () => {
         // Beat 3: retried, succeeds
         await vi.advanceTimersByTimeAsync(30000);
         expect(client.extendReservation).toHaveBeenCalledTimes(3);
-        // Beat 4: only one grant applied so far (lead = ttl/2 + something
-        // small) -> extends again with a FRESH key
+        // Beat 4: only one grant measured so far (leadMin = 60000 - 120000
+        // < 0) -> extends again with a FRESH key
         await vi.advanceTimersByTimeAsync(30000);
         expect(client.extendReservation).toHaveBeenCalledTimes(4);
         return "ok";
@@ -670,18 +680,24 @@ describe("AsyncCyclesLifecycle", () => {
 
     const result = await lifecycle.execute(
       async () => {
-        // Beats at 600ms cadence (ttl/2 = 600, NOT clamped to 1000 — a 1s
+        // First beat at min(ttl/2, 30s) = 600ms — no 1s floor (a 1s
         // interval would add only 1.2s of expiry per 2s of wall time and
-        // guarantee a lapse). Pattern: extend, extend, skip, extend keeps
-        // the lead positive.
-        await vi.advanceTimersByTimeAsync(600);
+        // guarantee a lapse). Measured grants of 1200 keep the cadence at
+        // clamp(1200/2, 500, 600) = 600ms.
+        await vi.advanceTimersByTimeAsync(599);
+        expect(client.extendReservation).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
         expect(client.extendReservation).toHaveBeenCalledTimes(1);
+        // Beats 2-4 extend (leadMin 0, 600, 1200 < 1.5*1200 = 1800).
         await vi.advanceTimersByTimeAsync(600);
         expect(client.extendReservation).toHaveBeenCalledTimes(2);
         await vi.advanceTimersByTimeAsync(600);
-        expect(client.extendReservation).toHaveBeenCalledTimes(2); // skip
-        await vi.advanceTimersByTimeAsync(600);
         expect(client.extendReservation).toHaveBeenCalledTimes(3);
+        await vi.advanceTimersByTimeAsync(600);
+        expect(client.extendReservation).toHaveBeenCalledTimes(4);
+        // Beat 5 at 3000ms: leadMin 1800 >= 1800 -> skip.
+        await vi.advanceTimersByTimeAsync(600);
+        expect(client.extendReservation).toHaveBeenCalledTimes(4);
         return "ok";
       },
       [],
@@ -692,7 +708,7 @@ describe("AsyncCyclesLifecycle", () => {
     vi.useRealTimers();
   });
 
-  it("heartbeat self-corrects on clamped grants: extends every beat", async () => {
+  it("heartbeat tightens cadence to the MEASURED grant when the server clamps", async () => {
     vi.useFakeTimers();
     const client = makeMockClient();
     const e0 = 1_000_000_000;
@@ -719,11 +735,18 @@ describe("AsyncCyclesLifecycle", () => {
 
     const result = await lifecycle.execute(
       async () => {
-        // The authoritative expires_at_ms keeps the lead estimate small,
-        // so every beat extends — no false skips.
-        for (let beat = 1; beat <= 4; beat++) {
-          await vi.advanceTimersByTimeAsync(30000);
-          expect(client.extendReservation).toHaveBeenCalledTimes(beat);
+        // Beat 1 at 30s measures a 15000 grant, so the cadence re-derives
+        // to clamp(15000/2, 500, 30000) = 7500ms — the MEASURED grant, not
+        // the requested ttl.
+        await vi.advanceTimersByTimeAsync(30000);
+        expect(client.extendReservation).toHaveBeenCalledTimes(1);
+        await vi.advanceTimersByTimeAsync(7500);
+        expect(client.extendReservation).toHaveBeenCalledTimes(2);
+        await vi.advanceTimersByTimeAsync(7500);
+        expect(client.extendReservation).toHaveBeenCalledTimes(3);
+        // extend_by_ms still requests the full ttl every time.
+        for (const call of client.extendReservation.mock.calls) {
+          expect(call[1].extend_by_ms).toBe(60000);
         }
         return "ok";
       },
@@ -761,16 +784,19 @@ describe("AsyncCyclesLifecycle", () => {
 
     const result = await lifecycle.execute(
       async () => {
-        // Fallback accounting (+ttl per applied grant) yields the same
-        // extend, extend, skip, extend pattern.
+        // No expires_at_ms in the extend responses: each applied grant
+        // falls back to the requested ttl, so the beat pattern matches the
+        // full-grant case — extends at beats 1-4, skip at beat 5.
         await vi.advanceTimersByTimeAsync(30000);
         expect(client.extendReservation).toHaveBeenCalledTimes(1);
         await vi.advanceTimersByTimeAsync(30000);
         expect(client.extendReservation).toHaveBeenCalledTimes(2);
         await vi.advanceTimersByTimeAsync(30000);
-        expect(client.extendReservation).toHaveBeenCalledTimes(2); // skip
-        await vi.advanceTimersByTimeAsync(30000);
         expect(client.extendReservation).toHaveBeenCalledTimes(3);
+        await vi.advanceTimersByTimeAsync(30000);
+        expect(client.extendReservation).toHaveBeenCalledTimes(4);
+        await vi.advanceTimersByTimeAsync(30000);
+        expect(client.extendReservation).toHaveBeenCalledTimes(4); // skip
         return "ok";
       },
       [],
@@ -784,11 +810,13 @@ describe("AsyncCyclesLifecycle", () => {
     vi.useRealTimers();
   });
 
-  it("heartbeat seeds from the EFFECTIVE granted ttl when tenant policy caps it", async () => {
+  it("heartbeat capped grants: 30s first beat, cadence from the measured 1h grant, extend_by stays requested", async () => {
     vi.useFakeTimers();
     const client = makeMockClient();
-    // Requested 24h, but tenant policy max_reservation_ttl_ms caps the
-    // grant at 1h: expires_at_ms - Date header = 1h.
+    // Requested 24h, but tenant policy max_reservation_ttl_ms caps every
+    // grant at 1h. The create response carries a Date header, but the
+    // Date-derived estimate (1h) is only a cadence HINT: the first-beat
+    // delay is min(requested/2 = 12h, 30s, est/2 = 30min) = 30s.
     const d0 = Date.parse("Wed, 21 Oct 2026 07:28:00 GMT"); // server frame
     const oneHour = 3_600_000;
     client.createReservation.mockResolvedValue(
@@ -817,15 +845,29 @@ describe("AsyncCyclesLifecycle", () => {
 
     const result = await lifecycle.execute(
       async () => {
-        // First beat at effectiveTtl/2 = 30min — NOT requestedTtl/2 = 12h,
-        // which would be 11h past the capped expiry.
-        await vi.advanceTimersByTimeAsync(oneHour / 2 - 1000);
+        // First beat at 30s (the cap), NOT requestedTtl/2 = 12h — 11h past
+        // the capped expiry.
+        await vi.advanceTimersByTimeAsync(29_000);
         expect(client.extendReservation).not.toHaveBeenCalled();
         await vi.advanceTimersByTimeAsync(1000);
         expect(client.extendReservation).toHaveBeenCalledTimes(1);
-        // Second beat at 1h extends again (lead = 1h < 1.5h threshold).
+        // Beat 1 measured a 1h grant -> cadence tightens to
+        // clamp(1h/2, 500, 12h) = 30min, derived from the MEASURED grant,
+        // not the request and not the Date estimate.
+        // Beats 2-4 extend while leadMin < 1.5h:
+        //   beat 2 at 30s+30min:  leadMin = 1h  - 30.5min ~ 29.5min
+        //   beat 3 at 30s+60min:  leadMin = 2h  - 60.5min ~ 59.5min
+        //   beat 4 at 30s+90min:  leadMin = 3h  - 90.5min ~ 89.5min < 90min
         await vi.advanceTimersByTimeAsync(oneHour / 2);
         expect(client.extendReservation).toHaveBeenCalledTimes(2);
+        await vi.advanceTimersByTimeAsync(oneHour / 2);
+        expect(client.extendReservation).toHaveBeenCalledTimes(3);
+        await vi.advanceTimersByTimeAsync(oneHour / 2);
+        expect(client.extendReservation).toHaveBeenCalledTimes(4);
+        // Beat 5 at 30s+120min: leadMin = 4h - 120.5min ~ 119.5min >= 90min
+        // -> skip.
+        await vi.advanceTimersByTimeAsync(oneHour / 2);
+        expect(client.extendReservation).toHaveBeenCalledTimes(4);
         return "ok";
       },
       [],
@@ -833,14 +875,58 @@ describe("AsyncCyclesLifecycle", () => {
     );
     expect(result).toBe("ok");
 
-    // extend_by_ms requests the EFFECTIVE ttl, not the capped-away 24h.
-    const extendBody = client.extendReservation.mock.calls[0][1];
-    expect(extendBody.extend_by_ms).toBe(oneHour);
+    // extend_by_ms always requests the REQUESTED ttl — the server owns
+    // clamping; the client never fabricates a smaller ask from estimates.
+    for (const call of client.extendReservation.mock.calls) {
+      expect(call[1].extend_by_ms).toBe(86_400_000);
+    }
 
     vi.useRealTimers();
   });
 
-  it("heartbeat falls back to the requested ttl on a garbage Date header", async () => {
+  it("heartbeat first beat lands at 30s for a 24h ttl even with no Date hint", async () => {
+    vi.useFakeTimers();
+    const client = makeMockClient();
+    // No Date header: the estimate is unavailable, but the 30s first-beat
+    // cap still protects against a silently capped grant.
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-hb-nohint",
+        affected_scopes: [],
+        expires_at_ms: 1_000_000_000,
+      }),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+    client.extendReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "ACTIVE", expires_at_ms: 1_003_600_000 }),
+    );
+
+    const retryEngine = makeRetryEngine();
+    const lifecycle = new AsyncCyclesLifecycle(client as any, retryEngine, { tenant: "acme" });
+
+    const result = await lifecycle.execute(
+      async () => {
+        await vi.advanceTimersByTimeAsync(29_999);
+        expect(client.extendReservation).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+        expect(client.extendReservation).toHaveBeenCalledTimes(1);
+        expect(client.extendReservation.mock.calls[0][1].extend_by_ms).toBe(
+          86_400_000,
+        );
+        return "ok";
+      },
+      [],
+      { estimate: 1000, ttlMs: 86_400_000 },
+    );
+    expect(result).toBe("ok");
+
+    vi.useRealTimers();
+  });
+
+  it("heartbeat ignores a garbage Date header: default first-beat delay, requested extend_by", async () => {
     vi.useFakeTimers();
     const client = makeMockClient();
     client.createReservation.mockResolvedValue(
@@ -867,7 +953,8 @@ describe("AsyncCyclesLifecycle", () => {
 
     const result = await lifecycle.execute(
       async () => {
-        // Unparseable Date -> effectiveTtl = requested ttl -> beat at 30s.
+        // Unparseable Date -> no cadence hint -> first beat at
+        // min(ttl/2, 30s) = 30s; extend_by_ms is the requested ttl.
         await vi.advanceTimersByTimeAsync(30000);
         expect(client.extendReservation).toHaveBeenCalledTimes(1);
         return "ok";
@@ -925,24 +1012,27 @@ describe("AsyncCyclesLifecycle", () => {
 
   // --- computeEffectiveTtlMs unit tests ---
 
-  describe("computeEffectiveTtlMs", () => {
-    it("returns the requested ttl when either server timestamp is missing", () => {
-      expect(computeEffectiveTtlMs(60000, undefined, 1000)).toBe(60000);
-      expect(computeEffectiveTtlMs(60000, 61000, undefined)).toBe(60000);
-      expect(computeEffectiveTtlMs(60000, undefined, undefined)).toBe(60000);
+  describe("computeEffectiveTtlMs (Date-derived cadence hint)", () => {
+    it("returns undefined when either server timestamp is missing", () => {
+      expect(computeEffectiveTtlMs(60000, undefined, 1000)).toBeUndefined();
+      expect(computeEffectiveTtlMs(60000, 61000, undefined)).toBeUndefined();
+      expect(computeEffectiveTtlMs(60000, undefined, undefined)).toBeUndefined();
     });
 
-    it("returns the granted ttl when the server capped the request", () => {
+    it("returns the raw derived estimate when the server capped the request", () => {
       expect(computeEffectiveTtlMs(86_400_000, 5_000_000, 1_400_000)).toBe(3_600_000);
     });
 
-    it("clamps to [1000, requestedTtl]", () => {
-      // Granted below the spec floor (or negative): clamp up to 1s.
-      expect(computeEffectiveTtlMs(60000, 1500, 1000)).toBe(1000);
-      expect(computeEffectiveTtlMs(60000, 900, 1000)).toBe(1000);
-      // Granted above the request (drifted clock or generous server):
-      // never beat slower than the requested ttl implies.
-      expect(computeEffectiveTtlMs(60000, 1_000_000, 1000)).toBe(60000);
+    it("never fabricates lease: raw value floored at 0, no upward clamp", () => {
+      // RFC 9110: Date is a whole-second best-effort origination time that
+      // intermediaries may replace — a small or negative derived value must
+      // NOT be rounded up to a fake 1s of lease.
+      expect(computeEffectiveTtlMs(60000, 1500, 1000)).toBe(500);
+      expect(computeEffectiveTtlMs(60000, 900, 1000)).toBe(0);
+      expect(computeEffectiveTtlMs(60000, 500, 1000)).toBe(0);
+      // A generous/skewed value passes through raw — the first-beat delay
+      // already caps at min(ttl/2, 30s), so a large hint is harmless.
+      expect(computeEffectiveTtlMs(60000, 1_000_000, 1000)).toBe(999_000);
     });
   });
 
