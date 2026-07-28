@@ -261,6 +261,19 @@ describe("CyclesClient", () => {
       expect(resp.rateLimitReset).toBe(1700000000);
       expect(resp.getErrorResponse()?.error).toBe("LIMIT_EXCEEDED");
     });
+
+    it("captures the HTTP Date header and exposes serverDateMs", async () => {
+      mockFetch(
+        200,
+        { decision: "ALLOW", reservation_id: "r-1", affected_scopes: [] },
+        { Date: "Wed, 21 Oct 2026 07:28:00 GMT" },
+      );
+
+      const client = new CyclesClient(config);
+      const resp = await client.createReservation({ idempotency_key: "test" });
+
+      expect(resp.serverDateMs).toBe(Date.parse("Wed, 21 Oct 2026 07:28:00 GMT"));
+    });
   });
 
   describe("asyncDispose", () => {

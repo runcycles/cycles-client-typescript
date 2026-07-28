@@ -66,6 +66,23 @@ describe("CyclesResponse", () => {
       expect(resp.retryAfterMsHeader).toBeUndefined();
     });
 
+    it.each(["-1", "1e3", "+3", "1.5", "9007199254741"])(
+      "rejects invalid Retry-After delta-seconds %s",
+      (value) => {
+        const resp = CyclesResponse.httpError(429, "Rate limited", undefined, {
+          "retry-after": value,
+        });
+        expect(resp.retryAfterMsHeader).toBeUndefined();
+      },
+    );
+
+    it("accepts optional whitespace and zero delta-seconds", () => {
+      const resp = CyclesResponse.httpError(429, "Rate limited", undefined, {
+        "retry-after": " 0 ",
+      });
+      expect(resp.retryAfterMsHeader).toBe(0);
+    });
+
     it("returns undefined for missing headers", () => {
       const resp = CyclesResponse.success(200, {});
       expect(resp.requestId).toBeUndefined();
@@ -73,6 +90,19 @@ describe("CyclesResponse", () => {
       expect(resp.rateLimitReset).toBeUndefined();
       expect(resp.cyclesTenant).toBeUndefined();
       expect(resp.retryAfterMsHeader).toBeUndefined();
+      expect(resp.serverDateMs).toBeUndefined();
+    });
+
+    it("parses the HTTP Date header to epoch ms", () => {
+      const resp = CyclesResponse.success(200, {}, {
+        date: "Wed, 21 Oct 2026 07:28:00 GMT",
+      });
+      expect(resp.serverDateMs).toBe(Date.parse("Wed, 21 Oct 2026 07:28:00 GMT"));
+    });
+
+    it("ignores a garbage Date header gracefully", () => {
+      const resp = CyclesResponse.success(200, {}, { date: "not-a-date" });
+      expect(resp.serverDateMs).toBeUndefined();
     });
   });
 

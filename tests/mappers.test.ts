@@ -82,6 +82,10 @@ describe("reservationCreateResponseFromWire", () => {
       caps: { max_tokens: 4096 },
       reason_code: "BUDGET_OK",
       retry_after_ms: undefined,
+      cycles_evidence: {
+        evidence_id: "a".repeat(64),
+        cycles_evidence_url: "https://cycles.example/v1/evidence/id",
+      },
       balances: [
         {
           scope: "tenant:acme",
@@ -99,6 +103,10 @@ describe("reservationCreateResponseFromWire", () => {
     expect(parsed.reserved).toEqual({ unit: "USD_MICROCENTS", amount: 1000 });
     expect(parsed.caps).toEqual({ maxTokens: 4096 });
     expect(parsed.reasonCode).toBe("BUDGET_OK");
+    expect(parsed.cyclesEvidence).toEqual({
+      evidenceId: "a".repeat(64),
+      cyclesEvidenceUrl: "https://cycles.example/v1/evidence/id",
+    });
     expect(parsed.balances).toHaveLength(1);
     expect(parsed.balances![0].scopePath).toBe("/acme");
   });

@@ -1036,6 +1036,7 @@ describe("lifecycle commit wiring", () => {
 
   function makeLifecycle() {
     const client = {
+      config: new CyclesConfig({ baseUrl: BASE_URL, apiKey: "key" }),
       createReservation: vi.fn(),
       commitReservation: vi.fn(),
       releaseReservation: vi.fn(),
