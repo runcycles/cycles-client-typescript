@@ -1153,6 +1153,311 @@ describe("AsyncCyclesLifecycle", () => {
     vi.useRealTimers();
   });
 
+  // --- remaining_ttl_ms (server-authoritative scheduling, spec PR #148) ---
+
+  it("remaining_ttl_ms: exact schedule from create and every extend; heuristic skip bypassed", async () => {
+    vi.useFakeTimers();
+    const client = makeMockClient();
+    const e0 = 1_000_000_000;
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-hb-field",
+        affected_scopes: [],
+        expires_at_ms: e0,
+        remaining_ttl_ms: 60000,
+      }),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+    // Extends move expiry by a huge +1,000,000 per call — enough that the
+    // heuristic leadMin skip would trip by beat 3 — while the server's
+    // remaining_ttl_ms stays 60000. Field mode must both schedule exactly
+    // from remaining_ttl_ms (59s beats; expiry differences are never
+    // accumulated into the schedule) and bypass the skip check.
+    let expiry = e0;
+    client.extendReservation.mockImplementation(async () => {
+      expiry += 1_000_000;
+      return CyclesResponse.success(200, {
+        status: "ACTIVE",
+        expires_at_ms: expiry,
+        remaining_ttl_ms: 60000,
+      });
+    });
+
+    const retryEngine = makeRetryEngine();
+    const lifecycle = new AsyncCyclesLifecycle(client as any, retryEngine, { tenant: "acme" });
+
+    const result = await lifecycle.execute(
+      async () => {
+        // First delay = max(0, 60000 - min(60000/2, max(1000, 2*rtt=0)))
+        // = 59000 — derived from the create response, NOT an immediate
+        // prime.
+        await vi.advanceTimersByTimeAsync(58_999);
+        expect(client.extendReservation).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+        expect(client.extendReservation).toHaveBeenCalledTimes(1);
+        // Every subsequent delay recomputes to 59000 from that beat's
+        // response.
+        await vi.advanceTimersByTimeAsync(59_000);
+        expect(client.extendReservation).toHaveBeenCalledTimes(2);
+        // Beat 3 at 177s: grantsSum=2,000,000, elapsed 177,000 -> the
+        // heuristic would skip (leadMin 1,823,000 >= 1.5*1,000,000), but
+        // field mode bypasses the skip check and extends.
+        await vi.advanceTimersByTimeAsync(59_000);
+        expect(client.extendReservation).toHaveBeenCalledTimes(3);
+        return "ok";
+      },
+      [],
+      { estimate: 1000, ttlMs: 60000 },
+    );
+    expect(result).toBe("ok");
+
+    // extend_by_ms is still always the requested ttl.
+    for (const call of client.extendReservation.mock.calls) {
+      expect(call[1].extend_by_ms).toBe(60000);
+    }
+
+    vi.useRealTimers();
+  });
+
+  it("remaining_ttl_ms: a capped 1s lease gets its first beat at 500ms, inside the real lease", async () => {
+    vi.useFakeTimers();
+    const client = makeMockClient();
+    // 24h requested, tenant policy caps the lease at 1s. The server says
+    // so authoritatively: remaining_ttl_ms=1000 on the create response.
+    // First delay = max(0, 1000 - min(1000/2, max(1000, 0))) = 500 — the
+    // first beat lands INSIDE the real 1s lease (the case that motivated
+    // the immediate prime on the fallback path).
+    const e0 = 1_000_000_000;
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-hb-field-capped",
+        affected_scopes: [],
+        expires_at_ms: e0,
+        remaining_ttl_ms: 1000,
+      }),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+    let expiry = e0;
+    client.extendReservation.mockImplementation(async () => {
+      expiry += 1000;
+      return CyclesResponse.success(200, {
+        status: "ACTIVE",
+        expires_at_ms: expiry,
+        remaining_ttl_ms: 1000,
+      });
+    });
+
+    const retryEngine = makeRetryEngine();
+    const lifecycle = new AsyncCyclesLifecycle(client as any, retryEngine, { tenant: "acme" });
+
+    const result = await lifecycle.execute(
+      async () => {
+        await vi.advanceTimersByTimeAsync(499);
+        expect(client.extendReservation).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+        expect(client.extendReservation).toHaveBeenCalledTimes(1);
+        // Same formula from the extend response: next beat 500ms later.
+        await vi.advanceTimersByTimeAsync(500);
+        expect(client.extendReservation).toHaveBeenCalledTimes(2);
+        return "ok";
+      },
+      [],
+      { estimate: 1000, ttlMs: 86_400_000 },
+    );
+    expect(result).toBe("ok");
+
+    vi.useRealTimers();
+  });
+
+  it("remaining_ttl_ms: max-lead clamp schedules at cap minus reserve — no collapse, no clamp warn", async () => {
+    vi.useFakeTimers();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const client = makeMockClient();
+    // Maximum-lead clamp with the authoritative field: the server holds
+    // the lease at L=30000 and SAYS so. Beats land at L minus the 1s
+    // reserve — no cadence collapse, no heuristic guessing, and no clamp
+    // warn on the field path.
+    const e0 = 5_000_000_000;
+    const t0 = Date.now();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-hb-field-lead",
+        affected_scopes: [],
+        expires_at_ms: e0,
+        remaining_ttl_ms: 30000,
+      }),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+    client.extendReservation.mockImplementation(async () =>
+      CyclesResponse.success(200, {
+        status: "ACTIVE",
+        expires_at_ms: e0 + (Date.now() - t0),
+        remaining_ttl_ms: 30000,
+      }),
+    );
+
+    const retryEngine = makeRetryEngine();
+    const lifecycle = new AsyncCyclesLifecycle(client as any, retryEngine, { tenant: "acme" });
+
+    const result = await lifecycle.execute(
+      async () => {
+        // First delay = 30000 - min(15000, 1000) = 29000.
+        await vi.advanceTimersByTimeAsync(28_999);
+        expect(client.extendReservation).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+        expect(client.extendReservation).toHaveBeenCalledTimes(1);
+        // Zero-grant responses (expiry tracks elapsed) do NOT collapse or
+        // hold anything — the schedule stays exactly 29000 per beat.
+        await vi.advanceTimersByTimeAsync(28_999);
+        expect(client.extendReservation).toHaveBeenCalledTimes(1);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(client.extendReservation).toHaveBeenCalledTimes(2);
+        await vi.advanceTimersByTimeAsync(29_000);
+        expect(client.extendReservation).toHaveBeenCalledTimes(3);
+        return "ok";
+      },
+      [],
+      { estimate: 1000, ttlMs: 60000 },
+    );
+    expect(result).toBe("ok");
+
+    // No lead-clamp warn on the field path.
+    const clampWarns = warnSpy.mock.calls.filter((c) =>
+      String(c[0]).includes("clamp lease lead"),
+    );
+    expect(clampWarns).toHaveLength(0);
+    warnSpy.mockRestore();
+
+    vi.useRealTimers();
+  });
+
+  it("remaining_ttl_ms disappearing mid-flight: heuristic resumes from maintained bookkeeping", async () => {
+    vi.useFakeTimers();
+    const client = makeMockClient();
+    const e0 = 1_000_000_000;
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-hb-field-gone",
+        affected_scopes: [],
+        expires_at_ms: e0,
+        remaining_ttl_ms: 60000,
+      }),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+    // Beat 1's response carries the field; beat 2's does not (proxy
+    // strips it / mixed-version fleet). The heuristic must resume from
+    // the bookkeeping that kept running under field mode.
+    let calls = 0;
+    client.extendReservation.mockImplementation(async () => {
+      calls += 1;
+      const body: Record<string, unknown> = {
+        status: "ACTIVE",
+        expires_at_ms: e0 + 60000 * calls,
+      };
+      if (calls === 1) body.remaining_ttl_ms = 60000;
+      return CyclesResponse.success(200, body);
+    });
+
+    const retryEngine = makeRetryEngine();
+    const lifecycle = new AsyncCyclesLifecycle(client as any, retryEngine, { tenant: "acme" });
+
+    const result = await lifecycle.execute(
+      async () => {
+        // Beat 1 at 59s (field schedule from create).
+        await vi.advanceTimersByTimeAsync(59_000);
+        expect(client.extendReservation).toHaveBeenCalledTimes(1);
+        // Beat 2 at 118s (field schedule from beat 1's response); its
+        // response has NO field -> heuristic takes over: the measured
+        // 60000 grant (>= 0.9x ttl, a real per-extend amount) re-derives
+        // the cadence to clamp(60000/2, 500, 30000) = 30000.
+        await vi.advanceTimersByTimeAsync(59_000);
+        expect(client.extendReservation).toHaveBeenCalledTimes(2);
+        // Beat 3 lands 30s later on the heuristic cadence (leadMin =
+        // 120000 - 148000 < 0 -> extend).
+        await vi.advanceTimersByTimeAsync(29_999);
+        expect(client.extendReservation).toHaveBeenCalledTimes(2);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(client.extendReservation).toHaveBeenCalledTimes(3);
+        return "ok";
+      },
+      [],
+      { estimate: 1000, ttlMs: 60000 },
+    );
+    expect(result).toBe("ok");
+
+    vi.useRealTimers();
+  });
+
+  it("remaining_ttl_ms: transient failure retries with the SAME key at clamp(lead/4, 1s, 30s)", async () => {
+    vi.useFakeTimers();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const client = makeMockClient();
+    const e0 = 1_000_000_000;
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-hb-field-503",
+        affected_scopes: [],
+        expires_at_ms: e0,
+        remaining_ttl_ms: 60000,
+      }),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+    let calls = 0;
+    client.extendReservation.mockImplementation(async () => {
+      calls += 1;
+      if (calls === 1) return CyclesResponse.httpError(503, "Service unavailable");
+      return CyclesResponse.success(200, {
+        status: "ACTIVE",
+        expires_at_ms: e0 + 60000,
+        remaining_ttl_ms: 60000,
+      });
+    });
+
+    const retryEngine = makeRetryEngine();
+    const lifecycle = new AsyncCyclesLifecycle(client as any, retryEngine, { tenant: "acme" });
+
+    const result = await lifecycle.execute(
+      async () => {
+        // Beat 1 at 59s fails transiently. The field-mode retry delay is
+        // clamp(currentLeadEstimate/4, 1s, 30s) where the lead estimate
+        // is the create leadFloor (60000) decayed by 59000 elapsed =
+        // 1000 -> clamp(250, 1000, 30000) = 1000.
+        await vi.advanceTimersByTimeAsync(59_000);
+        expect(client.extendReservation).toHaveBeenCalledTimes(1);
+        await vi.advanceTimersByTimeAsync(999);
+        expect(client.extendReservation).toHaveBeenCalledTimes(1);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(client.extendReservation).toHaveBeenCalledTimes(2);
+        return "ok";
+      },
+      [],
+      { estimate: 1000, ttlMs: 60000 },
+    );
+    expect(result).toBe("ok");
+
+    // The retry reuses the SAME idempotency key as the failed attempt.
+    const keys = client.extendReservation.mock.calls.map((c: any[]) => c[1].idempotency_key);
+    expect(keys[1]).toBe(keys[0]);
+    warnSpy.mockRestore();
+
+    vi.useRealTimers();
+  });
+
   it("heartbeat stops permanently on TENANT_CLOSED", async () => {
     vi.useFakeTimers();
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});

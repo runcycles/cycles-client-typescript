@@ -1,6 +1,7 @@
 # Cycles Protocol v0.1.25 — Client (TypeScript) Audit
 
-**Date:** 2026-07-27 (v0.4.1 — heartbeat measured-grant lead accounting (v2.3) fixes expiry drift and halves `max_extensions` consumption; spec review round 4: first beat fires immediately (delay 0 — any bounded delay can outlive a small capped lease) and cadence is regime-split (real per-extend grants tighten to `clamp(grant/2, 500 ms, ttl/2)`; lead-clamped grants — non-positive, or `< 0.9×ttl` and within the two-sided `0.75–1.25×`-elapsed band (Rust-port finding: an upper bound alone made the post-skip hold sticky) — hold at `min(ttl/2, 30 s)` with a once-per-heartbeat warn); the HTTP `Date` header is fully out of the heartbeat (`computeEffectiveTtlMs` deleted; `serverDateMs` stays as a general accessor); `extend_by_ms` always the requested ttl; permanent extend rejections (incl. `TENANT_CLOSED`, `NOT_FOUND`) stop the heartbeat; extend retries reuse the idempotency key; estimate-fallback commits marked `metadata.actual_source="estimate"`. 435 tests pass at 99.0% line coverage.),
+**Date:** 2026-07-28 (v0.4.1 — spec review round 5: server-authoritative heartbeat scheduling from the new `remaining_ttl_ms` field (spec PR #148) on create/extend responses — `leadFloor = max(0, remaining − rtt)`, next beat at `max(0, leadFloor − min(leadFloor/2, max(1 s, 2×maxRtt)))` after response receipt, exact first-beat delay from the create response (no immediate prime), heuristic `leadMin` skip bypassed in field mode, same-key transient retries at `clamp(lead/4, 1 s, 30 s)`, seamless heuristic fallback when the field is absent. The `(grant, elapsed)` band is reframed as best-effort fallback: regime detection without the field is formally undecidable (sticky window `grant ∈ [0.75×min(ttl/2, 30 s), 0.9×ttl)`). 445 tests pass at 98.9% line coverage.),
+2026-07-27 (v0.4.1 — heartbeat measured-grant lead accounting (v2.3) fixes expiry drift and halves `max_extensions` consumption; spec review round 4: first beat fires immediately (delay 0 — any bounded delay can outlive a small capped lease) and cadence is regime-split (real per-extend grants tighten to `clamp(grant/2, 500 ms, ttl/2)`; lead-clamped grants — non-positive, or `< 0.9×ttl` and within the two-sided `0.75–1.25×`-elapsed band (Rust-port finding: an upper bound alone made the post-skip hold sticky) — hold at `min(ttl/2, 30 s)` with a once-per-heartbeat warn); the HTTP `Date` header is fully out of the heartbeat (`computeEffectiveTtlMs` deleted; `serverDateMs` stays as a general accessor); `extend_by_ms` always the requested ttl; permanent extend rejections (incl. `TENANT_CLOSED`, `NOT_FOUND`) stop the heartbeat; extend retries reuse the idempotency key; estimate-fallback commits marked `metadata.actual_source="estimate"`. 435 tests pass at 99.0% line coverage.),
 2026-07-27 (v0.4.0 — durable commit retries: on-disk pending-commit journal with next-run replay and POST /v1/events recovery; first-attempt 429/401/403 never release; Retry-After persisted; streaming commit() resolves on transient failures. Review round 2 adds `flushPendingCommits()`, unclassifiable-4xx retention, 410-by-status expiry, delay clamps, and journal-parse strictness. See the dated entries below. 407 tests pass at 99.0% line coverage.),
 2026-07-24 (v0.3.4 release prep — package and changelog aligned; vendored contract fixture refreshed from runtime protocol v0.1.24 to v0.1.25.15 at `cycles-protocol@99f1391`; exact `ErrorCode` contract assertion updated for `LIMIT_EXCEEDED` and `TENANT_CLOSED`; test-only `fast-uri` updated to 3.1.4. Clean install and audit pass with zero vulnerabilities; 339 tests pass at 98.61% statement / 99.81% line coverage; lint, typecheck, build, and package dry-run are clean.),
 2026-07-10 (v0.3.4 — `TENANT_CLOSED` support from runtime spec v0.1.25.13: `ErrorCode.TENANT_CLOSED`, exported `TenantClosedError`, `CyclesProtocolError.isTenantClosed()`, and reservation-time typed exception mapping. Also `LIMIT_EXCEEDED` support from v0.1.25.12, retry classification, and `Retry-After` header exposure through `CyclesResponse.retryAfterMsHeader`.),
@@ -14,6 +15,40 @@
 **Server audit:** See `cycles-server/AUDIT.md` (all passing)
 
 ---
+
+## 2026-07-28 — Server-authoritative heartbeat scheduling (`remaining_ttl_ms`, v0.4.1)
+
+Round-5 spec review (user-approved): regime detection from
+`(grant, elapsed)` alone is formally undecidable — any per-extend grant
+in the sticky window `[0.75×min(ttl/2, 30 s), 0.9×ttl)` reproduces the
+elapsed gap at the held cadence and misclassifies permanently (ttl 24 s
+with +10 s grants: held cadence 12 s, ratio 10/12 ≈ 0.83 stays inside
+the band while the lease erodes to a lapse). Spec PR #148 therefore
+adds `remaining_ttl_ms` (integer, int64, ≥0; same clock snapshot as
+`expires_at_ms`; present on successful live-reservation responses,
+absent on dry-run/DENY and older servers) to both
+ReservationCreateResponse and ReservationExtendResponse, and both
+heartbeats treat it as NORMATIVE when present: with `rtt` the measured
+monotonic round-trip of that call (0 when unknown; per-heartbeat max
+tracked), `leadFloor = max(0, remaining − rtt)`, `retryReserve =
+min(leadFloor/2, max(1 s, 2×maxRtt))`, next beat at `max(0, leadFloor −
+retryReserve)` after response receipt, recomputed from every successful
+response carrying the field; expiry differences never accumulate in
+this mode and the heuristic `leadMin` skip is bypassed (exact schedule;
+a heuristic skip could push a beat past the real lease). A create
+response with the field derives the FIRST delay from the same formula
+instead of the immediate prime — a capped 1 s lease gets its first beat
+at 500 ms, inside the real lease, and no `max_extensions` slot is
+wasted priming under a max-lead clamp. Transient failures retry with
+the SAME idempotency key after `clamp(lead/4, 1 s, 30 s)` (lead = last
+`leadFloor` decayed by monotonic elapsed). The grants/lead bookkeeping
+keeps running underneath so the v2.3 band heuristic — now explicitly
+best-effort, for servers clamping only the per-extend delta — takes
+over seamlessly if the field disappears mid-flight; legacy servers get
+the unchanged fallback behavior. Parsed into
+`ReservationCreateResponse.remainingTtlMs` /
+`ReservationExtendResponse.remainingTtlMs`. 445 tests pass; line
+coverage 98.9%, branch 93.9% (gates 95/85); lint and typecheck clean.
 
 ## 2026-07-27 — Heartbeat drift fix + estimate-as-actual marker (v0.4.1)
 
@@ -261,7 +296,7 @@ All spec constraints are validated via explicit validation functions in `validat
 ### Lifecycle Orchestration (correct)
 
 - Reserve → Execute → Commit flow with proper cleanup (release on failure) in `lifecycle.ts`
-- Heartbeat-based TTL extension using the `extend` endpoint — measured-grant lead accounting, immediate first beat (delay 0), cadence `clamp(grant/2, 500, ttlMs/2)` for real per-extend grants, held at `min(ttlMs/2, 30 s)` under a lead clamp (see the 2026-07-27 v0.4.1 entry)
+- Heartbeat-based TTL extension using the `extend` endpoint — server-authoritative scheduling from `remaining_ttl_ms` when present (spec PR #148; see the 2026-07-28 v0.4.1 entry); fallback: measured-grant lead accounting, immediate first beat (delay 0), cadence `clamp(grant/2, 500, ttlMs/2)` for real per-extend grants, held at `min(ttlMs/2, 30 s)` under a suspected lead clamp (see the 2026-07-27 v0.4.1 entry)
 - Commit retry engine for transient failures (transport errors, 5xx) with exponential backoff in `retry.ts`
 - Dry-run handling returns decision/caps without executing guarded function
 - `DENY` decision correctly raises typed `CyclesProtocolError`

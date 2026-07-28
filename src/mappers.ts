@@ -118,6 +118,7 @@ export function reservationCreateResponseFromWire(
     reservationId: wire.reservation_id as string | undefined,
     affectedScopes: (wire.affected_scopes as string[] | undefined) ?? [],
     expiresAtMs: wire.expires_at_ms as number | undefined,
+    remainingTtlMs: wire.remaining_ttl_ms as number | undefined,
     scopePath: wire.scope_path as string | undefined,
     reserved: amountFromWire(wire.reserved as Record<string, unknown> | undefined),
     caps: capsFromWire(wire.caps as Record<string, unknown> | undefined),
@@ -154,6 +155,7 @@ export function reservationExtendResponseFromWire(
   return {
     status: wire.status as ReservationExtendResponse["status"],
     expiresAtMs: wire.expires_at_ms as number,
+    remainingTtlMs: wire.remaining_ttl_ms as number | undefined,
     balances: balancesFromWire(wire.balances as unknown[] | undefined),
   };
 }

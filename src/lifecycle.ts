@@ -337,9 +337,17 @@ export class AsyncCyclesLifecycle {
       balances: resResult.balances,
     };
 
-    // Start heartbeat. The requested ttl is what every extend asks for;
-    // the first beat fires immediately (see _startHeartbeat).
-    const heartbeatRef = this._startHeartbeat(reservationId, ttlMs, ctx);
+    // Start heartbeat. The requested ttl is what every extend asks for.
+    // When the create response carries the server-authoritative
+    // remaining_ttl_ms (spec PR #148), the first beat is scheduled from
+    // it exactly; otherwise the first beat fires immediately (see
+    // _startHeartbeat).
+    const heartbeatRef = this._startHeartbeat(
+      reservationId,
+      ttlMs,
+      resResult.remainingTtlMs,
+      ctx,
+    );
 
     try {
       const result = await runWithContext(ctx, () => fn(...args));
@@ -510,32 +518,88 @@ export class AsyncCyclesLifecycle {
 
   /**
    * `ttlMs` is the REQUESTED ttl: it is what every `extend_by_ms` asks for
-   * and it bounds the beat cadence.
+   * and it bounds the fallback beat cadence. `createRemainingTtlMs` is the
+   * server-authoritative `remaining_ttl_ms` from the create response
+   * (spec PR #148), when present.
    */
   private _startHeartbeat(
     reservationId: string,
     ttlMs: number,
+    createRemainingTtlMs: number | undefined,
     ctx: CyclesContext,
   ): { stop: () => void } | undefined {
     if (ttlMs <= 0) return undefined;
     validateExtendByMs(ttlMs);
-    // The FIRST beat fires IMMEDIATELY (delay 0). Tenant policy
-    // max_reservation_ttl_ms may have silently capped the granted TTL far
-    // below the requested one (governance default: 1 hour), the create
-    // response has no effective-TTL field, and spec review round 4
-    // confirmed that ANY bounded first-beat delay can outlive a small
-    // capped lease — so the first extend primes the lease with a real,
-    // measurable grant right away instead of gambling on an unknowable
-    // one. After each applied grant the cadence re-derives from the
-    // MEASURED grant: clamp(grant/2, 500, ttl/2), except under a lead
-    // clamp (see the regime split in the success handler), where it holds
-    // at min(ttl/2, 30 s). The 500 ms floor cannot starve liveness — it
+    // FALLBACK cadence (servers without remaining_ttl_ms): the FIRST beat
+    // fires IMMEDIATELY (delay 0). Tenant policy max_reservation_ttl_ms
+    // may have silently capped the granted TTL far below the requested
+    // one (governance default: 1 hour), the create response then has no
+    // effective-TTL signal, and spec review round 4 confirmed that ANY
+    // bounded first-beat delay can outlive a small capped lease — so the
+    // first extend primes the lease with a real, measurable grant right
+    // away instead of gambling on an unknowable one. After each applied
+    // grant the cadence re-derives from the MEASURED grant:
+    // clamp(grant/2, 500, ttl/2), except under a suspected lead clamp
+    // (see the regime split in the success handler), where it holds at
+    // min(ttl/2, 30 s). The 500 ms floor cannot starve liveness — it
     // binds only when the server grants less than 1 s per extend, i.e.
     // below the spec's own minimum ttl_ms.
     const heldIntervalMs = Math.min(ttlMs / 2, 30_000);
     let intervalMs = heldIntervalMs;
     let stopped = false;
     let currentTimer: ReturnType<typeof setTimeout> | undefined;
+
+    // --- Server-authoritative scheduling (remaining_ttl_ms, round 5) ---
+    // remaining_ttl_ms (spec PR #148, on create and extend responses) is
+    // the remaining lifetime at response evaluation, in the same clock
+    // snapshot as expires_at_ms. When present it is NORMATIVE: the
+    // (grant, elapsed) regime heuristic below is formally undecidable —
+    // e.g. ttl 24 s with +10 s grants gives a held cadence of 12 s and a
+    // post-skip grant/elapsed ratio of 10/12 ~ 0.83 that sits inside the
+    // clamp band forever while the lease erodes to a lapse — so exact
+    // scheduling always wins when the server provides it. fieldMode
+    // tracks whether the LATEST successful response carried the field;
+    // the heuristic bookkeeping keeps running underneath so it can take
+    // over seamlessly if the field disappears mid-flight (proxy strips
+    // it, mixed-version server fleet, ...).
+    let fieldMode = false;
+    let maxObservedRttMs = 0;
+    let lastLeadFloorMs = 0;
+    let lastLeadFloorMono = 0;
+
+    // leadFloor = max(0, remaining_ttl_ms - rtt) is a lower bound on the
+    // lease remaining NOW: the response was evaluated at most one
+    // round-trip ago. The next beat lands retryReserve before the floor
+    // runs out — at least 1 s (or 2x the worst observed rtt) of margin
+    // for the extend call itself, but never more than half the floor so
+    // short leases still get a usable wait. Returns the next-beat delay,
+    // measured from response receipt.
+    const scheduleFromField = (
+      remainingMs: number,
+      rttMs: number,
+      nowMono: number,
+    ): number => {
+      fieldMode = true;
+      maxObservedRttMs = Math.max(maxObservedRttMs, rttMs);
+      const leadFloor = Math.max(remainingMs - rttMs, 0);
+      lastLeadFloorMs = leadFloor;
+      lastLeadFloorMono = nowMono;
+      const retryReserve = Math.min(
+        leadFloor / 2,
+        Math.max(1000, 2 * maxObservedRttMs),
+      );
+      return Math.max(leadFloor - retryReserve, 0);
+    };
+
+    // Field-mode transient-failure retry delay: clamp(lead/4, 1 s, 30 s),
+    // where lead is the last leadFloor decayed by monotonic elapsed time.
+    const fieldRetryDelayMs = (): number => {
+      const leadEstimate = Math.max(
+        lastLeadFloorMs - (performance.now() - lastLeadFloorMono),
+        0,
+      );
+      return Math.min(Math.max(leadEstimate / 4, 1000), 30_000);
+    };
 
     // Lead lower-bound extension. `extend_by_ms` extends relative to the
     // CURRENT expires_at_ms (spec), so blindly extending by ttlMs on
@@ -575,15 +639,24 @@ export class AsyncCyclesLifecycle {
       if (stopped) return;
       currentTimer = setTimeout(() => {
         if (stopped) return;
-        const leadMin = grantsSum - (performance.now() - anchor);
-        if (lastGrant !== undefined && leadMin >= 1.5 * lastGrant) {
-          // Plenty of proven lead — skip this beat (no server call).
-          tick(intervalMs);
-          return;
+        // Heuristic skip check — BYPASSED in field mode: there the
+        // schedule is exact, and a heuristic skip could push the beat
+        // past the real lease.
+        if (!fieldMode) {
+          const leadMin = grantsSum - (performance.now() - anchor);
+          if (lastGrant !== undefined && leadMin >= 1.5 * lastGrant) {
+            // Plenty of proven lead — skip this beat (no server call).
+            tick(intervalMs);
+            return;
+          }
         }
         const key = pendingKey ?? randomUUID();
         pendingKey = key;
         const body = { idempotency_key: key, extend_by_ms: ttlMs };
+        const sentMono = performance.now();
+        // Delay until the next beat, finalized by the handlers below and
+        // consumed once in .finally.
+        let nextDelayMs = intervalMs;
         void this._client
           .extendReservation(reservationId, body)
           .then((response) => {
@@ -612,8 +685,24 @@ export class AsyncCyclesLifecycle {
                     ? prevExpiry + ttlMs
                     : undefined;
               const now = performance.now();
+              const rttMs = Math.max(now - sentMono, 0);
               const elapsedSinceSuccess = now - (lastSuccessMono ?? anchor);
               lastSuccessMono = now;
+              const remaining = response.getBodyAttribute("remaining_ttl_ms");
+              if (typeof remaining === "number") {
+                // NORMATIVE path: schedule exactly from the server's own
+                // remaining lifetime; never accumulate expiry
+                // differences here. The heuristic bookkeeping below
+                // still runs so it can take over if the field vanishes.
+                nextDelayMs = scheduleFromField(remaining, rttMs, now);
+                grantsSum += Math.max(grant, 0);
+                lastGrant = Math.max(grant, 0);
+                if (prevExpiry !== undefined) {
+                  ctx.expiresAtMs = prevExpiry;
+                }
+                return;
+              }
+              fieldMode = false;
               // Regime split (spec review round 4). Under a maximum-LEAD
               // clamp the server holds expires_at_ms ~ now + L, so the
               // difference of successive expires_at_ms values measures
@@ -661,6 +750,7 @@ export class AsyncCyclesLifecycle {
               if (prevExpiry !== undefined) {
                 ctx.expiresAtMs = prevExpiry;
               }
+              nextDelayMs = intervalMs;
               return;
             }
             // Failure: KEEP pendingKey so the next beat retries with the
@@ -680,26 +770,43 @@ export class AsyncCyclesLifecycle {
               stopped = true;
               return;
             }
+            if (fieldMode) {
+              nextDelayMs = fieldRetryDelayMs();
+            }
             console.warn(
               `[runcycles] Heartbeat extend failed (status=${response.status}); retrying next beat: ${reservationId}`,
             );
           })
           .catch(() => {
             // Transport error: best-effort — retry next beat, same key.
+            if (fieldMode) {
+              nextDelayMs = fieldRetryDelayMs();
+            }
           })
           .finally(() => {
-            tick(intervalMs);
+            tick(nextDelayMs);
           });
       }, delayMs);
     };
 
-    // Immediate first beat — see the comment above heldIntervalMs. The
-    // 0 delay applies to this first schedule ONLY: every reschedule (in
-    // .finally and on skip) passes intervalMs, which starts at
-    // heldIntervalMs and never becomes 0 — so a transient failure on the
-    // immediate first attempt waits a full held interval before the
-    // retry instead of hot-looping against a down server.
-    tick(0);
+    if (typeof createRemainingTtlMs === "number") {
+      // Server-authoritative first delay, derived from the create
+      // response's remaining_ttl_ms with the same formula as every later
+      // beat (create rtt is unknown -> 0). No immediate prime: under a
+      // maximum-lead clamp an immediate extend would only waste one of
+      // max_extensions, and the exact schedule already lands the first
+      // beat inside the real lease.
+      tick(scheduleFromField(createRemainingTtlMs, 0, anchor));
+    } else {
+      // FALLBACK: immediate first beat — see the comment above
+      // heldIntervalMs. The 0 delay applies to this first schedule ONLY:
+      // every reschedule passes a delay that never becomes 0 (heuristic
+      // reschedules use intervalMs, which starts at heldIntervalMs; a
+      // transient failure in field mode waits at least 1 s) — so a
+      // transient failure on the immediate first attempt never hot-loops
+      // against a down server.
+      tick(0);
+    }
     return {
       stop: () => {
         stopped = true;

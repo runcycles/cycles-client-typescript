@@ -179,6 +179,13 @@ export interface ReservationCreateResponse {
   reservationId?: string;
   affectedScopes: string[];
   expiresAtMs?: number;
+  /**
+   * Remaining reservation lifetime in ms at response evaluation (same
+   * clock snapshot as `expires_at_ms`). Spec PR #148; present on
+   * successful live-reservation responses, absent on dry-run/DENY and
+   * on older servers. When present it drives exact heartbeat scheduling.
+   */
+  remainingTtlMs?: number;
   scopePath?: string;
   reserved?: Amount;
   caps?: Caps;
@@ -203,6 +210,8 @@ export interface ReleaseResponse {
 export interface ReservationExtendResponse {
   status: ExtendStatus;
   expiresAtMs: number;
+  /** Remaining lifetime in ms at response evaluation (spec PR #148). */
+  remainingTtlMs?: number;
   balances?: Balance[];
 }
 
