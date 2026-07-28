@@ -110,6 +110,16 @@ function balancesFromWire(
   return wire.map((b) => balanceFromWire(b as Record<string, unknown>));
 }
 
+function cyclesEvidenceRefFromWire(
+  wire: Record<string, unknown> | undefined,
+): ReservationCreateResponse["cyclesEvidence"] {
+  if (!wire) return undefined;
+  return {
+    evidenceId: wire.evidence_id as string,
+    cyclesEvidenceUrl: wire.cycles_evidence_url as string,
+  };
+}
+
 export function reservationCreateResponseFromWire(
   wire: Record<string, unknown>,
 ): ReservationCreateResponse {
@@ -125,6 +135,9 @@ export function reservationCreateResponseFromWire(
     reasonCode: wire.reason_code as string | undefined,
     retryAfterMs: wire.retry_after_ms as number | undefined,
     balances: balancesFromWire(wire.balances as unknown[] | undefined),
+    cyclesEvidence: cyclesEvidenceRefFromWire(
+      wire.cycles_evidence as Record<string, unknown> | undefined,
+    ),
   };
 }
 

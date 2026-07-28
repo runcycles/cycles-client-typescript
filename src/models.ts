@@ -121,6 +121,11 @@ export interface Balance {
   isOverLimit?: boolean;
 }
 
+export interface CyclesEvidenceRef {
+  evidenceId: string;
+  cyclesEvidenceUrl: string;
+}
+
 // --- Request models ---
 
 export interface ReservationCreateRequest {
@@ -192,6 +197,7 @@ export interface ReservationCreateResponse {
   reasonCode?: string;
   retryAfterMs?: number;
   balances?: Balance[];
+  cyclesEvidence?: CyclesEvidenceRef;
 }
 
 export interface CommitResponse {

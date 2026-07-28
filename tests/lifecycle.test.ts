@@ -1,5 +1,11 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { AsyncCyclesLifecycle } from "../src/lifecycle.js";
+import {
+  AsyncCyclesLifecycle,
+  createLeadFloorAtScheduleStart,
+  createReservationWithRecovery,
+  isSchemaValidCreateResponse,
+  isSchemaValidExtendResponse,
+} from "../src/lifecycle.js";
 import { CyclesResponse } from "../src/response.js";
 import { CommitRetryEngine } from "../src/retry.js";
 import { CyclesConfig } from "../src/config.js";
@@ -20,16 +26,165 @@ function makeMockClient() {
     createReservation: vi.fn(),
     commitReservation: vi.fn(),
     releaseReservation: vi.fn(),
-    // Default: a benign applied extend (2xx, no expires_at_ms -> the
-    // heartbeat falls back to the requested-ttl grant). The first beat is
-    // immediate, so any test that lets a macrotask elapse would otherwise
-    // crash on an unmocked extend. Tests that exercise the heartbeat
-    // override this per-scenario.
+    // Default: a schema-valid applied extend. The first fallback beat is
+    // immediate, so tests that exercise heartbeat behavior override it.
     extendReservation: vi
       .fn()
-      .mockResolvedValue(CyclesResponse.success(200, { status: "ACTIVE" })),
+      .mockResolvedValue(
+        CyclesResponse.success(200, {
+          status: "ACTIVE",
+          expires_at_ms: 1_000_060_000,
+        }),
+      ),
   };
 }
+
+const validCreateBody = {
+  decision: "ALLOW",
+  reservation_id: "r-strict",
+  affected_scopes: ["tenant:acme"],
+  expires_at_ms: 1_000_000,
+  remaining_ttl_ms: 60_000,
+};
+
+describe("strict lease response contract", () => {
+  it("deducts local setup time after create response receipt", () => {
+    expect(createLeadFloorAtScheduleStart(60_000, 500, 1_000, 3_000)).toBe(
+      57_500,
+    );
+    expect(createLeadFloorAtScheduleStart(60_000, 500, 3_000, 1_000)).toBe(
+      undefined,
+    );
+  });
+
+  it("recovers one ambiguous create immediately with the same body and key", async () => {
+    const client = makeMockClient();
+    const request = { idempotency_key: "same-key" };
+    client.createReservation
+      .mockResolvedValueOnce(CyclesResponse.success(202, validCreateBody))
+      .mockResolvedValueOnce(CyclesResponse.success(200, validCreateBody));
+
+    const result = await createReservationWithRecovery(client as any, request);
+
+    expect(result.response.status).toBe(200);
+    expect(result.result.reservationId).toBe("r-strict");
+    expect(result.rttMs).toBeGreaterThanOrEqual(0);
+    expect(client.createReservation).toHaveBeenCalledTimes(2);
+    expect(client.createReservation.mock.calls[0][0]).toBe(request);
+    expect(client.createReservation.mock.calls[1][0]).toBe(request);
+  });
+
+  it("surfaces a schema-invalid 200 after the single recovery", async () => {
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        ...validCreateBody,
+        balances: [{ scope: "tenant:acme" }],
+      }),
+    );
+
+    await expect(
+      createReservationWithRecovery(client as any, {
+        idempotency_key: "same-key",
+      }),
+    ).rejects.toThrow("schema-valid HTTP 200");
+    expect(client.createReservation).toHaveBeenCalledTimes(2);
+  });
+
+  it("validates the complete create schema including nested evidence", () => {
+    expect(
+      isSchemaValidCreateResponse(
+        CyclesResponse.success(200, {
+          ...validCreateBody,
+          cycles_evidence: {
+            evidence_id: "a".repeat(64),
+            cycles_evidence_url: "https://cycles.example/v1/evidence/id",
+          },
+          balances: [
+            {
+              scope: "tenant:acme",
+              scope_path: "tenant:acme",
+              remaining: { unit: "USD_MICROCENTS", amount: -1 },
+              reserved: { unit: "USD_MICROCENTS", amount: 1 },
+            },
+          ],
+        }),
+      ),
+    ).toBe(true);
+    expect(
+      isSchemaValidCreateResponse(
+        CyclesResponse.success(200, {
+          ...validCreateBody,
+          cycles_evidence: {
+            evidence_id: "not-a-hash",
+            cycles_evidence_url: "relative",
+          },
+        }),
+      ),
+    ).toBe(false);
+    expect(
+      isSchemaValidCreateResponse(
+        CyclesResponse.success(200, {
+          ...validCreateBody,
+          caps: null,
+        }),
+      ),
+    ).toBe(false);
+    expect(
+      isSchemaValidCreateResponse(
+        CyclesResponse.success(200, {
+          ...validCreateBody,
+          remaining_ttl_ms: Number.MAX_SAFE_INTEGER + 1,
+        }),
+      ),
+    ).toBe(false);
+    expect(
+      isSchemaValidCreateResponse(
+        CyclesResponse.success(200, {
+          ...validCreateBody,
+          expires_at_ms: -1,
+        }),
+      ),
+    ).toBe(false);
+  });
+
+  it.each([
+    CyclesResponse.success(202, {
+      status: "ACTIVE",
+      expires_at_ms: 1,
+    }),
+    CyclesResponse.success(200, { status: "ACTIVE" }),
+    CyclesResponse.success(200, { status: "ACTIVE", expires_at_ms: -1 }),
+    CyclesResponse.success(200, {
+      status: "ACTIVE",
+      expires_at_ms: 1,
+      extra: true,
+    }),
+    CyclesResponse.success(200, {
+      status: "ACTIVE",
+      expires_at_ms: 1,
+      balances: [{ scope: "tenant:acme" }],
+    }),
+    CyclesResponse.success(200, {
+      status: "ACTIVE",
+      expires_at_ms: Number.MAX_SAFE_INTEGER + 1,
+    }),
+    CyclesResponse.success(200, {
+      status: "ACTIVE",
+      expires_at_ms: 1,
+      balances: [
+        {
+          scope: "tenant:acme",
+          scope_path: "tenant:acme",
+          remaining: { unit: "TOKENS", amount: 1 },
+          debt: null,
+        },
+      ],
+    }),
+  ])("rejects a non-schema extend response", (response) => {
+    expect(isSchemaValidExtendResponse(response)).toBe(false);
+  });
+});
 
 describe("AsyncCyclesLifecycle", () => {
   afterEach(() => {
@@ -898,7 +1053,7 @@ describe("AsyncCyclesLifecycle", () => {
     vi.useRealTimers();
   });
 
-  it("heartbeat 2xx without expires_at_ms counts the grant as +ttl and warns on odd status", async () => {
+  it("heartbeat schema-invalid 2xx remains ambiguous and reuses its key", async () => {
     vi.useFakeTimers();
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const client = makeMockClient();
@@ -913,8 +1068,7 @@ describe("AsyncCyclesLifecycle", () => {
     client.commitReservation.mockResolvedValue(
       CyclesResponse.success(200, { status: "COMMITTED" }),
     );
-    // 2xx is proof the extend applied even with an odd status field and no
-    // expires_at_ms in the body.
+    // Missing expires_at_ms and an unknown status violate the response schema.
     client.extendReservation.mockResolvedValue(
       CyclesResponse.success(200, { status: "EXTENDED" }),
     );
@@ -924,10 +1078,8 @@ describe("AsyncCyclesLifecycle", () => {
 
     const result = await lifecycle.execute(
       async () => {
-        // No expires_at_ms in the extend responses: each applied grant
-        // falls back to the requested ttl, so the beat pattern matches the
-        // full-grant case — immediate beat 1, extends at beats 2-3, skip
-        // at beat 4, extend at beat 5.
+        // Every ambiguous response is retried at the fallback cadence with
+        // the same pending idempotency key; none is recorded as applied.
         await vi.advanceTimersByTimeAsync(0);
         expect(client.extendReservation).toHaveBeenCalledTimes(1);
         await vi.advanceTimersByTimeAsync(30000);
@@ -935,17 +1087,21 @@ describe("AsyncCyclesLifecycle", () => {
         await vi.advanceTimersByTimeAsync(30000);
         expect(client.extendReservation).toHaveBeenCalledTimes(3);
         await vi.advanceTimersByTimeAsync(30000);
-        expect(client.extendReservation).toHaveBeenCalledTimes(3); // skip
-        await vi.advanceTimersByTimeAsync(30000);
         expect(client.extendReservation).toHaveBeenCalledTimes(4);
+        await vi.advanceTimersByTimeAsync(30000);
+        expect(client.extendReservation).toHaveBeenCalledTimes(5);
         return "ok";
       },
       [],
       { estimate: 1000, ttlMs: 60000 },
     );
     expect(result).toBe("ok");
+    const keys = client.extendReservation.mock.calls.map(
+      (call) => call[1].idempotency_key,
+    );
+    expect(new Set(keys).size).toBe(1);
     expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining('unexpected status "EXTENDED"'),
+      expect.stringContaining("ambiguous 2xx"),
     );
 
     vi.useRealTimers();
@@ -1492,8 +1648,7 @@ describe("AsyncCyclesLifecycle", () => {
     // ReservationExtendResponse (expires_at_ms missing): on the primary
     // path that is AMBIGUOUS — no proof the extend applied — and must be
     // recovered with the SAME idempotency key, never used for
-    // scheduling. (The fieldless fallback would have leniently counted
-    // it as applied.)
+    // scheduling. The same strict predicate applies to fieldless fallback.
     let calls = 0;
     client.extendReservation.mockImplementation(async () => {
       calls += 1;
@@ -1769,6 +1924,49 @@ describe("AsyncCyclesLifecycle", () => {
     );
     warnSpy.mockRestore();
 
+    vi.useRealTimers();
+  });
+
+  it("remaining_ttl_ms: unexpected 3xx stops instead of entering recovery", async () => {
+    vi.useFakeTimers();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-hb-field-3xx",
+        affected_scopes: [],
+        expires_at_ms: 1_000_000_000,
+        remaining_ttl_ms: 60000,
+      }),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+    client.extendReservation.mockResolvedValue(
+      CyclesResponse.httpError(302, "Redirect"),
+    );
+
+    const lifecycle = new AsyncCyclesLifecycle(
+      client as any,
+      makeRetryEngine(),
+      { tenant: "acme" },
+    );
+    await lifecycle.execute(
+      async () => {
+        await vi.advanceTimersByTimeAsync(45_000);
+        expect(client.extendReservation).toHaveBeenCalledTimes(1);
+        await vi.advanceTimersByTimeAsync(300_000);
+        expect(client.extendReservation).toHaveBeenCalledTimes(1);
+        return "ok";
+      },
+      [],
+      { estimate: 1000, ttlMs: 60000 },
+    );
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("unexpected HTTP status 302"),
+    );
+    warnSpy.mockRestore();
     vi.useRealTimers();
   });
 

@@ -15,14 +15,16 @@ function makeMockClient(
     createReservation: vi.fn(),
     commitReservation: vi.fn(),
     releaseReservation: vi.fn(),
-    // Default: a benign applied extend (2xx, no expires_at_ms -> the
-    // heartbeat falls back to the requested-ttl grant). The first beat is
-    // immediate, so any test that lets a macrotask elapse would otherwise
-    // crash on an unmocked extend. Tests that exercise the heartbeat
-    // override this per-scenario.
+    // Default: a schema-valid applied extend. Tests that exercise heartbeat
+    // behavior override it per scenario.
     extendReservation: vi
       .fn()
-      .mockResolvedValue(CyclesResponse.success(200, { status: "ACTIVE" })),
+      .mockResolvedValue(
+        CyclesResponse.success(200, {
+          status: "ACTIVE",
+          expires_at_ms: 1_000_060_000,
+        }),
+      ),
     createEvent: vi.fn(),
   };
 }
@@ -1529,6 +1531,46 @@ describe("reserveForStream", () => {
     expect(client.extendReservation).toHaveBeenCalledTimes(1);
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining("client error"),
+    );
+    warnSpy.mockRestore();
+
+    await handle.commit(500);
+    vi.useRealTimers();
+  });
+
+  it("remaining_ttl_ms: unexpected 3xx stops instead of entering recovery", async () => {
+    vi.useFakeTimers();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-hb-field-3xx",
+        affected_scopes: [],
+        expires_at_ms: 1_000_000_000,
+        remaining_ttl_ms: 60000,
+      }),
+    );
+    client.extendReservation.mockResolvedValue(
+      CyclesResponse.httpError(302, "Redirect"),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+      ttlMs: 60000,
+    });
+
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(client.extendReservation).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(client.extendReservation).toHaveBeenCalledTimes(1);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("unexpected HTTP status 302"),
     );
     warnSpy.mockRestore();
 

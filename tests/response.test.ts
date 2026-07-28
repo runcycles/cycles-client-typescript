@@ -66,6 +66,23 @@ describe("CyclesResponse", () => {
       expect(resp.retryAfterMsHeader).toBeUndefined();
     });
 
+    it.each(["-1", "1e3", "+3", "1.5", "9007199254741"])(
+      "rejects invalid Retry-After delta-seconds %s",
+      (value) => {
+        const resp = CyclesResponse.httpError(429, "Rate limited", undefined, {
+          "retry-after": value,
+        });
+        expect(resp.retryAfterMsHeader).toBeUndefined();
+      },
+    );
+
+    it("accepts optional whitespace and zero delta-seconds", () => {
+      const resp = CyclesResponse.httpError(429, "Rate limited", undefined, {
+        "retry-after": " 0 ",
+      });
+      expect(resp.retryAfterMsHeader).toBe(0);
+    });
+
     it("returns undefined for missing headers", () => {
       const resp = CyclesResponse.success(200, {});
       expect(resp.requestId).toBeUndefined();

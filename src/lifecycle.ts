@@ -18,6 +18,7 @@ import {
   type Decision,
   type Subject,
 } from "./models.js";
+import type { CyclesResponse } from "./response.js";
 import type { CommitRetryEngine } from "./retry.js";
 import {
   validateExtendByMs,
@@ -254,33 +255,324 @@ export function extractExtendErrorCode(response: {
  * `status: "ACTIVE"` and integer `expires_at_ms >= 0`, plus an integer
  * `remaining_ttl_ms >= 0` when present. Any other or malformed 2xx is
  * AMBIGUOUS: it must not be used to schedule from stale state and is
- * handled like a transient failure with same-key recovery. The fieldless
- * FALLBACK path keeps its lenient 2xx-as-applied behavior.
+ * handled like a transient failure with same-key recovery. This exact
+ * observed-success rule applies in both authoritative and fallback modes.
  */
-export function isSchemaValidExtendResponse(response: {
-  status: number;
-  getBodyAttribute: (key: string) => unknown;
-}): boolean {
-  if (response.status !== 200) return false;
-  if (response.getBodyAttribute("status") !== "ACTIVE") return false;
-  const expires = response.getBodyAttribute("expires_at_ms");
+const UNITS = new Set([
+  "USD_MICROCENTS",
+  "TOKENS",
+  "CREDITS",
+  "RISK_POINTS",
+]);
+const DECISIONS = new Set(["ALLOW", "ALLOW_WITH_CAPS", "DENY"]);
+const CREATE_RESPONSE_FIELDS = new Set([
+  "decision",
+  "reservation_id",
+  "affected_scopes",
+  "expires_at_ms",
+  "remaining_ttl_ms",
+  "scope_path",
+  "reserved",
+  "caps",
+  "reason_code",
+  "retry_after_ms",
+  "balances",
+  "cycles_evidence",
+]);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasOnlyKeys(
+  value: Record<string, unknown>,
+  allowed: ReadonlySet<string>,
+): boolean {
+  return Object.keys(value).every((key) => allowed.has(key));
+}
+
+function isInteger(value: unknown, minimum?: number): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    Number.isFinite(value) &&
+    (minimum === undefined || value >= minimum)
+  );
+}
+
+/** Conservative create-response lead at the instant heartbeat scheduling starts. */
+export function createLeadFloorAtScheduleStart(
+  remainingTtlMs: number,
+  createRttMs: number,
+  createReceivedMono: number,
+  scheduleStartedMono: number,
+): number | undefined {
+  const elapsedAfterReceipt = scheduleStartedMono - createReceivedMono;
   if (
-    typeof expires !== "number" ||
-    !Number.isInteger(expires) ||
-    expires < 0
+    !Number.isFinite(createRttMs) ||
+    createRttMs < 0 ||
+    !Number.isFinite(createReceivedMono) ||
+    !Number.isFinite(scheduleStartedMono) ||
+    !Number.isFinite(elapsedAfterReceipt) ||
+    elapsedAfterReceipt < 0
+  ) {
+    return undefined;
+  }
+  return Math.max(
+    0,
+    Math.floor(remainingTtlMs - createRttMs - elapsedAfterReceipt),
+  );
+}
+
+function isStringArray(value: unknown, maxLength?: number): value is string[] {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (item) =>
+        typeof item === "string" &&
+        (maxLength === undefined || Array.from(item).length <= maxLength),
+    )
+  );
+}
+
+function isAmount(value: unknown, signed: boolean): boolean {
+  if (!isRecord(value)) return false;
+  if (!hasOnlyKeys(value, new Set(["unit", "amount"]))) return false;
+  return (
+    typeof value.unit === "string" &&
+    UNITS.has(value.unit) &&
+    isInteger(value.amount, signed ? undefined : 0)
+  );
+}
+
+function isCaps(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  if (
+    !hasOnlyKeys(
+      value,
+      new Set([
+        "max_tokens",
+        "max_steps_remaining",
+        "tool_allowlist",
+        "tool_denylist",
+        "cooldown_ms",
+      ]),
+    )
   ) {
     return false;
   }
-  const remaining = response.getBodyAttribute("remaining_ttl_ms");
-  if (
-    remaining !== undefined &&
-    (typeof remaining !== "number" ||
-      !Number.isInteger(remaining) ||
-      remaining < 0)
-  ) {
-    return false;
+  for (const key of [
+    "max_tokens",
+    "max_steps_remaining",
+    "cooldown_ms",
+  ] as const) {
+    if (value[key] !== undefined && !isInteger(value[key], 0)) return false;
+  }
+  for (const key of ["tool_allowlist", "tool_denylist"] as const) {
+    if (value[key] !== undefined && !isStringArray(value[key], 256)) {
+      return false;
+    }
   }
   return true;
+}
+
+function isBalance(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  if (
+    !hasOnlyKeys(
+      value,
+      new Set([
+        "scope",
+        "scope_path",
+        "remaining",
+        "reserved",
+        "spent",
+        "allocated",
+        "debt",
+        "overdraft_limit",
+        "is_over_limit",
+      ]),
+    )
+  ) {
+    return false;
+  }
+  if (
+    typeof value.scope !== "string" ||
+    typeof value.scope_path !== "string" ||
+    !isAmount(value.remaining, true)
+  ) {
+    return false;
+  }
+  for (const key of [
+    "reserved",
+    "spent",
+    "allocated",
+    "debt",
+    "overdraft_limit",
+  ] as const) {
+    if (value[key] !== undefined && !isAmount(value[key], false)) return false;
+  }
+  return (
+    value.is_over_limit === undefined ||
+    typeof value.is_over_limit === "boolean"
+  );
+}
+
+function isBalances(value: unknown): boolean {
+  return Array.isArray(value) && value.every((balance) => isBalance(balance));
+}
+
+function isEvidenceRef(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  if (
+    !hasOnlyKeys(value, new Set(["evidence_id", "cycles_evidence_url"])) ||
+    typeof value.evidence_id !== "string" ||
+    !/^[0-9a-f]{64}$/.test(value.evidence_id) ||
+    typeof value.cycles_evidence_url !== "string"
+  ) {
+    return false;
+  }
+  try {
+    new URL(value.cycles_evidence_url);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Exact HTTP-200 plus full ReservationCreateResponse schema validation. */
+export function isSchemaValidCreateResponse(response: {
+  status: number;
+  body: Record<string, unknown> | undefined;
+}): boolean {
+  if (response.status !== 200 || !isRecord(response.body)) return false;
+  const body = response.body;
+  if (!hasOnlyKeys(body, CREATE_RESPONSE_FIELDS)) return false;
+  if (!DECISIONS.has(body.decision as string)) return false;
+  if (!isStringArray(body.affected_scopes)) return false;
+  if (
+    body.reservation_id !== undefined &&
+    typeof body.reservation_id !== "string"
+  ) {
+    return false;
+  }
+  if (
+    body.expires_at_ms !== undefined &&
+    !isInteger(body.expires_at_ms, 0)
+  ) {
+    return false;
+  }
+  if (
+    body.remaining_ttl_ms !== undefined &&
+    !isInteger(body.remaining_ttl_ms, 0)
+  ) {
+    return false;
+  }
+  if (body.scope_path !== undefined && typeof body.scope_path !== "string") {
+    return false;
+  }
+  if (body.reserved !== undefined && !isAmount(body.reserved, false)) {
+    return false;
+  }
+  if (body.caps !== undefined && !isCaps(body.caps)) return false;
+  if (
+    body.reason_code !== undefined &&
+    (typeof body.reason_code !== "string" ||
+      Array.from(body.reason_code).length > 128)
+  ) {
+    return false;
+  }
+  if (
+    body.retry_after_ms !== undefined &&
+    !isInteger(body.retry_after_ms, 0)
+  ) {
+    return false;
+  }
+  if (body.balances !== undefined && !isBalances(body.balances)) return false;
+  return (
+    body.cycles_evidence === undefined ||
+    isEvidenceRef(body.cycles_evidence)
+  );
+}
+
+/** Exact HTTP-200 plus full ReservationExtendResponse schema validation. */
+export function isSchemaValidExtendResponse(response: {
+  status: number;
+  body: Record<string, unknown> | undefined;
+}): boolean {
+  if (response.status !== 200 || !isRecord(response.body)) return false;
+  const body = response.body;
+  if (
+    !hasOnlyKeys(
+      body,
+      new Set(["status", "expires_at_ms", "remaining_ttl_ms", "balances"]),
+    )
+  ) {
+    return false;
+  }
+  if (body.status !== "ACTIVE" || !isInteger(body.expires_at_ms, 0)) {
+    return false;
+  }
+  if (
+    body.remaining_ttl_ms !== undefined &&
+    !isInteger(body.remaining_ttl_ms, 0)
+  ) {
+    return false;
+  }
+  return body.balances === undefined || isBalances(body.balances);
+}
+
+function isRecoverableCreateAmbiguity(response: CyclesResponse): boolean {
+  return (
+    response.isTransportError ||
+    response.isServerError ||
+    response.isSuccess
+  );
+}
+
+/**
+ * Create a reservation, allowing one immediate same-key recovery for a
+ * transport/5xx/ambiguous-2xx outcome.
+ */
+export async function createReservationWithRecovery(
+  client: CyclesClient,
+  body: Record<string, unknown>,
+): Promise<{
+  response: CyclesResponse;
+  result: ReturnType<typeof reservationCreateResponseFromWire>;
+  rttMs: number;
+  receivedMono: number;
+}> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const sentMono = performance.now();
+    let response: CyclesResponse;
+    try {
+      response = await client.createReservation(body);
+    } catch (error) {
+      if (attempt === 0) continue;
+      throw new CyclesProtocolError(
+        `Create reservation remained ambiguous after same-key retry: ${String(error)}`,
+      );
+    }
+    if (isSchemaValidCreateResponse(response)) {
+      const receivedMono = performance.now();
+      return {
+        response,
+        result: reservationCreateResponseFromWire(response.body!),
+        rttMs: receivedMono - sentMono,
+        receivedMono,
+      };
+    }
+    if (attempt === 0 && isRecoverableCreateAmbiguity(response)) continue;
+    if (!response.isSuccess) {
+      throw buildProtocolException("Failed to create reservation", response);
+    }
+    throw new CyclesProtocolError(
+      "Create reservation did not produce a schema-valid HTTP 200 response",
+      { status: response.status },
+    );
+  }
+  throw new CyclesProtocolError("Create reservation recovery exhausted");
 }
 
 export class AsyncCyclesLifecycle {
@@ -312,21 +604,12 @@ export class AsyncCyclesLifecycle {
       this._defaultSubject,
       args,
     );
-    // Monotonic attempt timing for the create call: the spec's PRIMARY
-    // heartbeat algorithm derives the first-beat delay from the create
-    // response's remaining_ttl_ms minus this call's own rtt.
-    const createSentMono = performance.now();
-    const resResponse = await this._client.createReservation(createBody);
-    const createReceivedMono = performance.now();
-
-    if (!resResponse.isSuccess) {
-      throw buildProtocolException("Failed to create reservation", resResponse);
-    }
-
-    // Parse wire-format response into typed object
-    const resResult = reservationCreateResponseFromWire(
-      resResponse.body as Record<string, unknown>,
-    );
+    const {
+      response: resResponse,
+      result: resResult,
+      rttMs: createRttMs,
+      receivedMono: createReceivedMono,
+    } = await createReservationWithRecovery(this._client, createBody);
     const resT2 = performance.now();
 
     const decision = resResult.decision as Decision;
@@ -387,7 +670,7 @@ export class AsyncCyclesLifecycle {
       reservationId,
       ttlMs,
       resResult.remainingTtlMs,
-      createReceivedMono - createSentMono,
+      createRttMs,
       createReceivedMono,
       ctx,
     );
@@ -626,6 +909,9 @@ export class AsyncCyclesLifecycle {
     // same-key retry, and scheduling margin.
     let fieldMode = false;
     let maxObservedRttMs = 0;
+    if (Number.isFinite(createRttMs) && createRttMs >= 0) {
+      maxObservedRttMs = createRttMs;
+    }
     let lastLeadFloorMs = 0;
     let lastLeadFloorMono = 0;
     // Zero-delay guard: a schema-valid success with next_delay = 0
@@ -636,6 +922,7 @@ export class AsyncCyclesLifecycle {
     // elapsed nor retry_window moves between consecutive failures).
     let lastFailMono: number | undefined;
     let lastFailWindow: number | undefined;
+    let zeroWindowRetried = false;
 
     // The client's ENFORCED finite per-attempt bound: CyclesClient caps
     // every request with AbortSignal.timeout(connectTimeout+readTimeout).
@@ -657,7 +944,9 @@ export class AsyncCyclesLifecycle {
 
     /** last lead_floor decayed by monotonic elapsed time (floored at 0). */
     const currentLeadEstimateMs = (nowMono: number): number => {
-      const decayed = lastLeadFloorMs - (nowMono - lastLeadFloorMono);
+      const elapsed = nowMono - lastLeadFloorMono;
+      if (!Number.isFinite(elapsed) || elapsed < 0) return 0;
+      const decayed = lastLeadFloorMs - elapsed;
       return Number.isFinite(decayed) ? Math.max(0, Math.floor(decayed)) : 0;
     };
 
@@ -686,6 +975,12 @@ export class AsyncCyclesLifecycle {
       // retry_window is deliberately UNclamped: negative means no
       // complete retry plus margin provably fits.
       const window = lead - attemptBudgetMs() - safetyMarginMs();
+      if (window === 0 && zeroWindowRetried) {
+        stopAndSurface(
+          "retry window is still zero after the one permitted immediate recovery retry",
+        );
+        return undefined;
+      }
       // Progress guard: between consecutive failures either monotonic
       // time advanced or the window shrank; otherwise a coarse clock
       // could sustain a zero-time recovery loop.
@@ -708,9 +1003,10 @@ export class AsyncCyclesLifecycle {
         );
         return undefined;
       }
+      if (window === 0) zeroWindowRetried = true;
       if (is429) {
         // Retry-After delta-seconds only, already converted to ms by the
-        // response accessor (overflow saturates, never wraps). Honor it
+        // response accessor (overflow is rejected, never wrapped). Honor it
         // exactly, and only when it fits the window — never invent an
         // earlier retry that violates throttling.
         if (retryAfter429Ms === undefined || !(retryAfter429Ms <= window)) {
@@ -787,32 +1083,23 @@ export class AsyncCyclesLifecycle {
           .then((response) => {
             if (response.isSuccess) {
               const schemaValid = isSchemaValidExtendResponse(response);
-              if (fieldMode && !schemaValid) {
-                // AMBIGUOUS 2xx on the primary path: not proof of
-                // application — never schedule from stale state. Handled
-                // like a transient failure: same-key recovery (pendingKey
-                // is deliberately NOT cleared).
+              if (!schemaValid) {
+                // Any non-200 or schema-invalid 2xx is ambiguous, in both
+                // modes. It is not proof of application, and the pending
+                // idempotency key must not be rotated.
                 console.warn(
                   `[runcycles] Heartbeat extend returned an ambiguous 2xx (status=${response.status}); treating as transient: ${reservationId}`,
                 );
-                nextDelayMs = fieldRecoveryDelayMs(undefined, false) ?? 0;
+                if (fieldMode) {
+                  nextDelayMs = fieldRecoveryDelayMs(undefined, false) ?? 0;
+                }
                 return;
               }
               // Observed success.
               pendingKey = undefined;
               lastFailMono = undefined;
               lastFailWindow = undefined;
-              if (!fieldMode) {
-                // FALLBACK leniency: any 2xx counts as applied — its
-                // expires_at_ms is the evidence — even with an odd
-                // status field.
-                const status = response.getBodyAttribute("status");
-                if (typeof status === "string" && status !== "ACTIVE") {
-                  console.warn(
-                    `[runcycles] Heartbeat extend returned 2xx with unexpected status "${status}"; treating as applied: ${reservationId}`,
-                  );
-                }
-              }
+              zeroWindowRetried = false;
               const newExpires = response.getBodyAttribute("expires_at_ms");
               // Measured server-frame grant; requested-ttl fallback when
               // either endpoint of the difference is unavailable.
@@ -829,6 +1116,9 @@ export class AsyncCyclesLifecycle {
                     : undefined;
               const now = performance.now();
               const rttMs = now - sentMono;
+              if (Number.isFinite(rttMs) && rttMs >= 0) {
+                maxObservedRttMs = Math.max(maxObservedRttMs, rttMs);
+              }
               const elapsedSinceSuccess = now - (lastSuccessMono ?? anchor);
               lastSuccessMono = now;
               const remaining = response.getBodyAttribute("remaining_ttl_ms");
@@ -977,6 +1267,12 @@ export class AsyncCyclesLifecycle {
               );
               return;
             }
+            if (!response.isTransportError && !response.isServerError) {
+              stopAndSurface(
+                `extend returned unexpected HTTP status ${response.status}`,
+              );
+              return;
+            }
             // Timeout-as-response, transport-as-response, or 5xx.
             const delay = fieldRecoveryDelayMs(undefined, false);
             if (delay === undefined) return; // stopped and surfaced
@@ -1011,21 +1307,22 @@ export class AsyncCyclesLifecycle {
       // one of max_extensions, and the exact schedule already lands the
       // first beat inside the real lease.
       fieldMode = true;
+      const measuredLeadFloor = createLeadFloorAtScheduleStart(
+        createRemainingTtlMs,
+        createRttMs,
+        createReceivedMono,
+        anchor,
+      );
       let leadFloor: number;
-      if (!Number.isFinite(createRttMs) || createRttMs < 0) {
+      if (measuredLeadFloor === undefined) {
         // Unknown timing must not be treated as zero elapsed time.
         leadFloor = 0;
       } else {
         maxObservedRttMs = Math.max(maxObservedRttMs, createRttMs);
-        leadFloor = Math.max(
-          0,
-          Math.floor(createRemainingTtlMs - createRttMs),
-        );
+        leadFloor = measuredLeadFloor;
       }
       lastLeadFloorMs = leadFloor;
-      lastLeadFloorMono = Number.isFinite(createReceivedMono)
-        ? createReceivedMono
-        : anchor;
+      lastLeadFloorMono = anchor;
       const firstDelay = Math.max(0, Math.floor(leadFloor - retryReserveMs()));
       if (firstDelay === 0) {
         // The create response is the first zero-delay schema-valid

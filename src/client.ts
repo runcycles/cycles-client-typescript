@@ -9,7 +9,6 @@
  * Timeout note: Node's built-in fetch does not distinguish connection timeout
  * from read timeout. The config's connectTimeout and readTimeout are summed
  * into a single AbortSignal.timeout() value that caps total request duration.
- * For stricter timeout control, consider using a custom HTTP client.
  */
 
 import {

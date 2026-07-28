@@ -36,8 +36,8 @@ present. Success predicate: only a schema-valid HTTP 200
 ReservationExtendResponse (`status: "ACTIVE"`, integer
 `expires_at_ms ≥ 0`, optional integer `remaining_ttl_ms ≥ 0`) is an
 observed success; any other or malformed 2xx is AMBIGUOUS and recovered
-like a transient failure with the SAME idempotency key (the fieldless
-fallback keeps its lenient 2xx-as-applied behavior). Scheduling,
+like a transient failure with the SAME idempotency key. This strict success
+predicate applies in both primary and fieldless fallback modes. Scheduling,
 recomputed from every schema-valid response alone (no expiry-difference
 accumulation; heuristic `leadMin` skip bypassed): per-attempt monotonic
 `rtt` (max tracked), `lead_floor = max(0, remaining − rtt)`,
@@ -70,8 +70,9 @@ servers clamping only the per-extend delta — takes over seamlessly if
 the field disappears mid-flight; legacy servers get the unchanged
 fallback behavior. Parsed into
 `ReservationCreateResponse.remainingTtlMs` /
-`ReservationExtendResponse.remainingTtlMs`. 456 tests pass; line
-coverage 97.7%, branch 92.0% (gates 95/85); lint and typecheck clean.
+`ReservationExtendResponse.remainingTtlMs`. Final verification passes 475
+tests (6 skipped); line coverage is 96.60%, branch coverage is 90.45%
+(gates 95/85), and lint, typecheck, and build are clean.
 
 ## 2026-07-27 — Heartbeat drift fix + estimate-as-actual marker (v0.4.1)
 

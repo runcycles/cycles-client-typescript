@@ -82,19 +82,25 @@ export class CyclesResponse {
   get retryAfterMsHeader(): number | undefined {
     const val = this.headers["retry-after"];
     if (val === undefined) return undefined;
-    const seconds = Number(val);
-    return Number.isInteger(seconds) ? seconds * 1000 : undefined;
+    const raw = val.trim();
+    if (!/^\d+$/.test(raw)) return undefined;
+    const seconds = Number(raw);
+    if (
+      !Number.isSafeInteger(seconds) ||
+      seconds > Number.MAX_SAFE_INTEGER / 1000
+    ) {
+      return undefined;
+    }
+    return seconds * 1000;
   }
 
   /**
    * The HTTP `Date` response header parsed to epoch milliseconds.
    *
-   * This is a server-frame timestamp: differencing it against other
-   * server-provided times (e.g. `expires_at_ms`) is clock-skew-free.
-   * The heartbeat uses it to recover the EFFECTIVE granted TTL when a
-   * tenant policy (`max_reservation_ttl_ms`) silently caps the requested
-   * one. Returns `undefined` when the header is absent or unparseable.
-   * HTTP-date resolution is 1 s, which the heartbeat margins absorb.
+   * This is exposed as general response metadata only. Lease scheduling
+   * uses `remaining_ttl_ms` when available and otherwise uses the
+   * documented monotonic fallback; it does not derive lease lead from
+   * `Date`. Returns `undefined` when the header is absent or unparseable.
    */
   get serverDateMs(): number | undefined {
     const val = this.headers["date"];

@@ -33,13 +33,14 @@ import { buildProtocolException } from "./errors.js";
 import { CyclesError, CyclesProtocolError } from "./exceptions.js";
 import {
   buildEventFallbackBody,
+  createLeadFloorAtScheduleStart,
+  createReservationWithRecovery,
   extractExtendErrorCode,
   isSchemaValidExtendResponse,
   PERMANENT_EXTEND_ERROR_CODES,
 } from "./lifecycle.js";
 import {
   metricsToWire,
-  reservationCreateResponseFromWire,
 } from "./mappers.js";
 import type { CyclesResponse } from "./response.js";
 import { CommitRetryEngine } from "./retry.js";
@@ -177,19 +178,12 @@ export async function reserveForStream(
     body.grace_period_ms = gracePeriodMs;
   }
 
-  // Create reservation. Monotonic attempt timing: the spec's PRIMARY
-  // heartbeat algorithm derives the first-beat delay from the create
-  // response's remaining_ttl_ms minus this call's own rtt.
-  const createSentMono = performance.now();
-  const response = await client.createReservation(body);
-  const createReceivedMono = performance.now();
-  if (!response.isSuccess) {
-    throw buildProtocolException("Failed to create reservation", response);
-  }
-
-  const parsed = reservationCreateResponseFromWire(
-    response.body as Record<string, unknown>,
-  );
+  const {
+    response,
+    result: parsed,
+    rttMs: createRttMs,
+    receivedMono: createReceivedMono,
+  } = await createReservationWithRecovery(client, body);
 
   if (parsed.decision === "DENY") {
     throw buildProtocolException("Reservation denied", response);
@@ -272,6 +266,9 @@ export async function reserveForStream(
     // same-key retry, and scheduling margin.
     let fieldMode = false;
     let maxObservedRttMs = 0;
+    if (Number.isFinite(createRttMs) && createRttMs >= 0) {
+      maxObservedRttMs = createRttMs;
+    }
     let lastLeadFloorMs = 0;
     let lastLeadFloorMono = 0;
     // Zero-delay guard: a schema-valid success with next_delay = 0
@@ -282,6 +279,7 @@ export async function reserveForStream(
     // elapsed nor retry_window moves between consecutive failures).
     let lastFailMono: number | undefined;
     let lastFailWindow: number | undefined;
+    let zeroWindowRetried = false;
 
     // The client's ENFORCED finite per-attempt bound: CyclesClient caps
     // every request with AbortSignal.timeout(connectTimeout+readTimeout).
@@ -303,7 +301,9 @@ export async function reserveForStream(
 
     /** last lead_floor decayed by monotonic elapsed time (floored at 0). */
     const currentLeadEstimateMs = (nowMono: number): number => {
-      const decayed = lastLeadFloorMs - (nowMono - lastLeadFloorMono);
+      const elapsed = nowMono - lastLeadFloorMono;
+      if (!Number.isFinite(elapsed) || elapsed < 0) return 0;
+      const decayed = lastLeadFloorMs - elapsed;
       return Number.isFinite(decayed) ? Math.max(0, Math.floor(decayed)) : 0;
     };
 
@@ -332,6 +332,12 @@ export async function reserveForStream(
       // retry_window is deliberately UNclamped: negative means no
       // complete retry plus margin provably fits.
       const window = lead - attemptBudgetMs() - safetyMarginMs();
+      if (window === 0 && zeroWindowRetried) {
+        stopAndSurface(
+          "retry window is still zero after the one permitted immediate recovery retry",
+        );
+        return undefined;
+      }
       // Progress guard: between consecutive failures either monotonic
       // time advanced or the window shrank; otherwise a coarse clock
       // could sustain a zero-time recovery loop.
@@ -354,9 +360,10 @@ export async function reserveForStream(
         );
         return undefined;
       }
+      if (window === 0) zeroWindowRetried = true;
       if (is429) {
         // Retry-After delta-seconds only, already converted to ms by the
-        // response accessor (overflow saturates, never wraps). Honor it
+        // response accessor (overflow is rejected, never wrapped). Honor it
         // exactly, and only when it fits the window — never invent an
         // earlier retry that violates throttling.
         if (retryAfter429Ms === undefined || !(retryAfter429Ms <= window)) {
@@ -432,32 +439,22 @@ export async function reserveForStream(
           .then((response) => {
             if (response.isSuccess) {
               const schemaValid = isSchemaValidExtendResponse(response);
-              if (fieldMode && !schemaValid) {
-                // AMBIGUOUS 2xx on the primary path: not proof of
-                // application — never schedule from stale state. Handled
-                // like a transient failure: same-key recovery (pendingKey
-                // is deliberately NOT cleared).
+              if (!schemaValid) {
+                // Any non-200 or schema-invalid 2xx is ambiguous, in both
+                // modes. Keep the pending idempotency key for recovery.
                 console.warn(
                   `[runcycles] Heartbeat extend returned an ambiguous 2xx (status=${response.status}); treating as transient: ${reservationId}`,
                 );
-                nextDelayMs = fieldRecoveryDelayMs(undefined, false) ?? 0;
+                if (fieldMode) {
+                  nextDelayMs = fieldRecoveryDelayMs(undefined, false) ?? 0;
+                }
                 return;
               }
               // Observed success.
               pendingKey = undefined;
               lastFailMono = undefined;
               lastFailWindow = undefined;
-              if (!fieldMode) {
-                // FALLBACK leniency: any 2xx counts as applied — its
-                // expires_at_ms is the evidence — even with an odd
-                // status field.
-                const status = response.getBodyAttribute("status");
-                if (typeof status === "string" && status !== "ACTIVE") {
-                  console.warn(
-                    `[runcycles] Heartbeat extend returned 2xx with unexpected status "${status}"; treating as applied: ${reservationId}`,
-                  );
-                }
-              }
+              zeroWindowRetried = false;
               const newExpires = response.getBodyAttribute("expires_at_ms");
               // Measured server-frame grant; requested-ttl fallback when
               // either endpoint of the difference is unavailable.
@@ -474,6 +471,9 @@ export async function reserveForStream(
                     : undefined;
               const now = performance.now();
               const rttMs = now - sentMono;
+              if (Number.isFinite(rttMs) && rttMs >= 0) {
+                maxObservedRttMs = Math.max(maxObservedRttMs, rttMs);
+              }
               const elapsedSinceSuccess = now - (lastSuccessMono ?? anchor);
               lastSuccessMono = now;
               const remaining = response.getBodyAttribute("remaining_ttl_ms");
@@ -616,6 +616,12 @@ export async function reserveForStream(
               );
               return;
             }
+            if (!response.isTransportError && !response.isServerError) {
+              stopAndSurface(
+                `extend returned unexpected HTTP status ${response.status}`,
+              );
+              return;
+            }
             // Timeout-as-response, transport-as-response, or 5xx.
             const delay = fieldRecoveryDelayMs(undefined, false);
             if (delay === undefined) return; // stopped and surfaced
@@ -648,22 +654,22 @@ export async function reserveForStream(
       // one of max_extensions, and the exact schedule already lands the
       // first beat inside the real lease.
       fieldMode = true;
-      const createRttMs = createReceivedMono - createSentMono;
+      const measuredLeadFloor = createLeadFloorAtScheduleStart(
+        parsed.remainingTtlMs,
+        createRttMs,
+        createReceivedMono,
+        anchor,
+      );
       let leadFloor: number;
-      if (!Number.isFinite(createRttMs) || createRttMs < 0) {
+      if (measuredLeadFloor === undefined) {
         // Unknown timing must not be treated as zero elapsed time.
         leadFloor = 0;
       } else {
         maxObservedRttMs = Math.max(maxObservedRttMs, createRttMs);
-        leadFloor = Math.max(
-          0,
-          Math.floor(parsed.remainingTtlMs - createRttMs),
-        );
+        leadFloor = measuredLeadFloor;
       }
       lastLeadFloorMs = leadFloor;
-      lastLeadFloorMono = Number.isFinite(createReceivedMono)
-        ? createReceivedMono
-        : anchor;
+      lastLeadFloorMono = anchor;
       const firstDelay = Math.max(0, Math.floor(leadFloor - retryReserveMs()));
       if (firstDelay === 0) {
         // The create response is the first zero-delay schema-valid
