@@ -34,6 +34,7 @@ import { CyclesError, CyclesProtocolError } from "./exceptions.js";
 import {
   buildEventFallbackBody,
   extractExtendErrorCode,
+  isSchemaValidExtendResponse,
   PERMANENT_EXTEND_ERROR_CODES,
 } from "./lifecycle.js";
 import {
@@ -176,8 +177,12 @@ export async function reserveForStream(
     body.grace_period_ms = gracePeriodMs;
   }
 
-  // Create reservation
+  // Create reservation. Monotonic attempt timing: the spec's PRIMARY
+  // heartbeat algorithm derives the first-beat delay from the create
+  // response's remaining_ttl_ms minus this call's own rtt.
+  const createSentMono = performance.now();
   const response = await client.createReservation(body);
+  const createReceivedMono = performance.now();
   if (!response.isSuccess) {
     throw buildProtocolException("Failed to create reservation", response);
   }
@@ -236,56 +241,135 @@ export async function reserveForStream(
     const heldIntervalMs = Math.min(ttlMs / 2, 30_000);
     let intervalMs = heldIntervalMs;
 
-    // --- Server-authoritative scheduling (remaining_ttl_ms, round 5) ---
-    // remaining_ttl_ms (spec PR #148, on create and extend responses) is
-    // the remaining lifetime at response evaluation, in the same clock
-    // snapshot as expires_at_ms. When present it is NORMATIVE: the
-    // (grant, elapsed) regime heuristic below is formally undecidable —
-    // e.g. ttl 24 s with +10 s grants gives a held cadence of 12 s and a
-    // post-skip grant/elapsed ratio of 10/12 ~ 0.83 that sits inside the
-    // clamp band forever while the lease erodes to a lapse — so exact
-    // scheduling always wins when the server provides it. fieldMode
-    // tracks whether the LATEST successful response carried the field;
-    // the heuristic bookkeeping keeps running underneath so it can take
-    // over seamlessly if the field disappears mid-flight (proxy strips
-    // it, mixed-version server fleet, ...).
+    // --- PRIMARY: server-authoritative scheduling (remaining_ttl_ms) ---
+    // Per the spec's HEARTBEAT GUIDANCE (PR #148), NORMATIVE whenever a
+    // schema-valid response carries remaining_ttl_ms — the remaining
+    // lifetime at response evaluation, same clock snapshot as
+    // expires_at_ms. The (grant, elapsed) regime heuristic below is
+    // formally undecidable (e.g. ttl 24 s with +10 s grants gives a held
+    // cadence of 12 s and a post-skip grant/elapsed ratio of 10/12 ~ 0.83
+    // that sits inside the clamp band forever while the lease erodes to a
+    // lapse), so exact scheduling always wins when the server provides
+    // it. fieldMode tracks whether the LATEST schema-valid success
+    // carried the field; the heuristic bookkeeping keeps running
+    // underneath so it can take over seamlessly if the field disappears
+    // mid-flight (proxy strips it, mixed-version server fleet, ...).
+    //
+    // Scheduling formula, recomputed from EVERY schema-valid response
+    // alone (never accumulating expiry differences):
+    //   rtt            = monotonic(response_received - attempt_sent),
+    //                    per individual HTTP attempt (max tracked);
+    //   lead_floor     = max(0, remaining_ttl_ms - rtt);
+    //   attempt_budget = max(request_timeout_budget, 1 s, 2 x maxRtt);
+    //   safety_margin  = max(1 s, 2 x maxRtt);
+    //   retry_reserve  = 2 x attempt_budget + safety_margin;
+    //   next_delay     = max(0, lead_floor - retry_reserve)
+    // scheduled from response receipt. Budgets/margins round UP, leads
+    // and delays round DOWN, so rounding never consumes the margin; all
+    // arithmetic is overflow-safe (JS doubles saturate to Infinity —
+    // an unknown/unbounded timeout makes attempt_budget Infinity and
+    // next_delay 0). retry_reserve covers one failed attempt, one
+    // same-key retry, and scheduling margin.
     let fieldMode = false;
     let maxObservedRttMs = 0;
     let lastLeadFloorMs = 0;
     let lastLeadFloorMono = 0;
+    // Zero-delay guard: a schema-valid success with next_delay = 0
+    // permits ONE immediate fresh attempt (new idempotency key); two in a
+    // row mean the lease cannot hold the retry-safety reserve -> stop.
+    let zeroDelayStreak = 0;
+    // Recovery progress guard state (spec: stop when neither monotonic
+    // elapsed nor retry_window moves between consecutive failures).
+    let lastFailMono: number | undefined;
+    let lastFailWindow: number | undefined;
 
-    // leadFloor = max(0, remaining_ttl_ms - rtt) is a lower bound on the
-    // lease remaining NOW: the response was evaluated at most one
-    // round-trip ago. The next beat lands retryReserve before the floor
-    // runs out — at least 1 s (or 2x the worst observed rtt) of margin
-    // for the extend call itself, but never more than half the floor so
-    // short leases still get a usable wait. Returns the next-beat delay,
-    // measured from response receipt.
-    const scheduleFromField = (
-      remainingMs: number,
-      rttMs: number,
-      nowMono: number,
-    ): number => {
-      fieldMode = true;
-      maxObservedRttMs = Math.max(maxObservedRttMs, rttMs);
-      const leadFloor = Math.max(remainingMs - rttMs, 0);
-      lastLeadFloorMs = leadFloor;
-      lastLeadFloorMono = nowMono;
-      const retryReserve = Math.min(
-        leadFloor / 2,
-        Math.max(1000, 2 * maxObservedRttMs),
-      );
-      return Math.max(leadFloor - retryReserve, 0);
+    // The client's ENFORCED finite per-attempt bound: CyclesClient caps
+    // every request with AbortSignal.timeout(connectTimeout+readTimeout).
+    // Unknown or unbounded -> Infinity (the spec forbids pretending an
+    // unbounded attempt fits any lease).
+    const cfgTimeoutSum =
+      client.config.connectTimeout + client.config.readTimeout;
+    const requestTimeoutBudgetMs =
+      Number.isFinite(cfgTimeoutSum) && cfgTimeoutSum > 0
+        ? cfgTimeoutSum
+        : Infinity;
+
+    const attemptBudgetMs = (): number =>
+      Math.ceil(Math.max(requestTimeoutBudgetMs, 1000, 2 * maxObservedRttMs));
+    const safetyMarginMs = (): number =>
+      Math.ceil(Math.max(1000, 2 * maxObservedRttMs));
+    const retryReserveMs = (): number =>
+      2 * attemptBudgetMs() + safetyMarginMs();
+
+    /** last lead_floor decayed by monotonic elapsed time (floored at 0). */
+    const currentLeadEstimateMs = (nowMono: number): number => {
+      const decayed = lastLeadFloorMs - (nowMono - lastLeadFloorMono);
+      return Number.isFinite(decayed) ? Math.max(0, Math.floor(decayed)) : 0;
     };
 
-    // Field-mode transient-failure retry delay: clamp(lead/4, 1 s, 30 s),
-    // where lead is the last leadFloor decayed by monotonic elapsed time.
-    const fieldRetryDelayMs = (): number => {
-      const leadEstimate = Math.max(
-        lastLeadFloorMs - (performance.now() - lastLeadFloorMono),
-        0,
+    const stopAndSurface = (reason: string): void => {
+      heartbeatStopped = true;
+      console.warn(
+        `[runcycles] Heartbeat stopped: ${reason}: ${reservationId}`,
       );
-      return Math.min(Math.max(leadEstimate / 4, 1000), 30_000);
+    };
+
+    /**
+     * Field-mode recovery decision for a transient failure (timeout,
+     * connection error, 5xx, 429, or ambiguous 2xx). Recomputes
+     * current_lead_estimate and retry_window from the SAME last
+     * schema-valid response on every failure; repeated recovery is
+     * allowed while the freshly recomputed window stays >= 0, always with
+     * the SAME idempotency key. Returns the retry delay in ms, or
+     * undefined when the heartbeat must stop (already surfaced).
+     */
+    const fieldRecoveryDelayMs = (
+      retryAfter429Ms: number | undefined,
+      is429: boolean,
+    ): number | undefined => {
+      const now = performance.now();
+      const lead = currentLeadEstimateMs(now);
+      // retry_window is deliberately UNclamped: negative means no
+      // complete retry plus margin provably fits.
+      const window = lead - attemptBudgetMs() - safetyMarginMs();
+      // Progress guard: between consecutive failures either monotonic
+      // time advanced or the window shrank; otherwise a coarse clock
+      // could sustain a zero-time recovery loop.
+      if (
+        lastFailMono !== undefined &&
+        lastFailWindow !== undefined &&
+        !(now > lastFailMono) &&
+        !(window < lastFailWindow)
+      ) {
+        stopAndSurface(
+          "no forward progress between recovery attempts (zero-time loop guard)",
+        );
+        return undefined;
+      }
+      lastFailMono = now;
+      lastFailWindow = window;
+      if (window < 0) {
+        stopAndSurface(
+          `remaining lease (${lead}ms) cannot hold one complete retry plus margin (need ${attemptBudgetMs() + safetyMarginMs()}ms)`,
+        );
+        return undefined;
+      }
+      if (is429) {
+        // Retry-After delta-seconds only, already converted to ms by the
+        // response accessor (overflow saturates, never wraps). Honor it
+        // exactly, and only when it fits the window — never invent an
+        // earlier retry that violates throttling.
+        if (retryAfter429Ms === undefined || !(retryAfter429Ms <= window)) {
+          stopAndSurface(
+            `rate limited and Retry-After ${retryAfter429Ms === undefined ? "is missing/invalid" : `(${retryAfter429Ms}ms) exceeds the safe retry window (${window}ms)`}`,
+          );
+          return undefined;
+        }
+        return retryAfter429Ms;
+      }
+      // window == 0 -> immediate retry; a second failure without
+      // intervening success trips the progress guard above.
+      return Math.max(0, Math.floor(Math.min(30_000, lead / 4, window)));
     };
 
     // Lead lower-bound extension. `extend_by_ms` extends relative to the
@@ -347,14 +431,32 @@ export async function reserveForStream(
           .extendReservation(reservationId, extendBody)
           .then((response) => {
             if (response.isSuccess) {
-              // Any 2xx counts as applied — its expires_at_ms is
-              // authoritative proof — even if the status field looks odd.
-              pendingKey = undefined;
-              const status = response.getBodyAttribute("status");
-              if (typeof status === "string" && status !== "ACTIVE") {
+              const schemaValid = isSchemaValidExtendResponse(response);
+              if (fieldMode && !schemaValid) {
+                // AMBIGUOUS 2xx on the primary path: not proof of
+                // application — never schedule from stale state. Handled
+                // like a transient failure: same-key recovery (pendingKey
+                // is deliberately NOT cleared).
                 console.warn(
-                  `[runcycles] Heartbeat extend returned 2xx with unexpected status "${status}"; treating as applied: ${reservationId}`,
+                  `[runcycles] Heartbeat extend returned an ambiguous 2xx (status=${response.status}); treating as transient: ${reservationId}`,
                 );
+                nextDelayMs = fieldRecoveryDelayMs(undefined, false) ?? 0;
+                return;
+              }
+              // Observed success.
+              pendingKey = undefined;
+              lastFailMono = undefined;
+              lastFailWindow = undefined;
+              if (!fieldMode) {
+                // FALLBACK leniency: any 2xx counts as applied — its
+                // expires_at_ms is the evidence — even with an odd
+                // status field.
+                const status = response.getBodyAttribute("status");
+                if (typeof status === "string" && status !== "ACTIVE") {
+                  console.warn(
+                    `[runcycles] Heartbeat extend returned 2xx with unexpected status "${status}"; treating as applied: ${reservationId}`,
+                  );
+                }
               }
               const newExpires = response.getBodyAttribute("expires_at_ms");
               // Measured server-frame grant; requested-ttl fallback when
@@ -371,21 +473,59 @@ export async function reserveForStream(
                     ? prevExpiry + ttlMs
                     : undefined;
               const now = performance.now();
-              const rttMs = Math.max(now - sentMono, 0);
+              const rttMs = now - sentMono;
               const elapsedSinceSuccess = now - (lastSuccessMono ?? anchor);
               lastSuccessMono = now;
               const remaining = response.getBodyAttribute("remaining_ttl_ms");
-              if (typeof remaining === "number") {
-                // NORMATIVE path: schedule exactly from the server's own
+              if (schemaValid && typeof remaining === "number") {
+                // PRIMARY path: schedule exactly from the server's own
                 // remaining lifetime; never accumulate expiry
                 // differences here. The heuristic bookkeeping below
                 // still runs so it can take over if the field vanishes.
-                nextDelayMs = scheduleFromField(remaining, rttMs, now);
+                fieldMode = true;
+                let leadFloor: number;
+                if (!Number.isFinite(rttMs) || rttMs < 0) {
+                  // Timing unavailable/unreliable: unknown elapsed time
+                  // must NOT be treated as zero — lead_floor and
+                  // next_delay collapse to 0. The zero-delay guard below
+                  // then permits at most one immediate fresh attempt
+                  // before stopping; this is never a silent downgrade to
+                  // the fieldless fallback.
+                  leadFloor = 0;
+                } else {
+                  maxObservedRttMs = Math.max(maxObservedRttMs, rttMs);
+                  leadFloor = Math.max(0, Math.floor(remaining - rttMs));
+                }
+                lastLeadFloorMs = leadFloor;
+                lastLeadFloorMono = now;
+                nextDelayMs = Math.max(
+                  0,
+                  Math.floor(leadFloor - retryReserveMs()),
+                );
+                if (nextDelayMs === 0) {
+                  if (zeroDelayStreak >= 1) {
+                    // Two consecutive zero-delay schedules: the lease is
+                    // shorter than the retry-safety budget — stop rather
+                    // than burn max_extensions in a tight loop.
+                    stopAndSurface(
+                      `lease is shorter than the retry-safety budget (lead_floor=${leadFloor}ms, retry_reserve=${retryReserveMs()}ms)`,
+                    );
+                    return;
+                  }
+                  // One immediate FRESH attempt (new idempotency key —
+                  // pendingKey was cleared above) is permitted: an
+                  // additive-delta server's immediate extension can
+                  // still establish positive lead.
+                  zeroDelayStreak = 1;
+                } else {
+                  zeroDelayStreak = 0;
+                }
                 grantsSum += Math.max(grant, 0);
                 lastGrant = Math.max(grant, 0);
                 return;
               }
               fieldMode = false;
+              zeroDelayStreak = 0;
               // Regime split (spec review round 4). Under a maximum-LEAD
               // clamp the server holds expires_at_ms ~ now + L, so the
               // difference of successive expires_at_ms values measures
@@ -433,8 +573,8 @@ export async function reserveForStream(
               nextDelayMs = intervalMs;
               return;
             }
-            // Failure: KEEP pendingKey so the next beat retries with the
-            // same idempotency key. Permanent rejections (reservation gone,
+            // Failure: KEEP pendingKey so any retry reuses the same
+            // idempotency key. Permanent rejections (reservation gone,
             // settled, or extension budget exhausted) stop the heartbeat —
             // no retry can ever fix them. The bare status check catches
             // bodyless 410 Gone responses.
@@ -450,39 +590,96 @@ export async function reserveForStream(
               heartbeatStopped = true;
               return;
             }
-            if (fieldMode) {
-              nextDelayMs = fieldRetryDelayMs();
+            if (!fieldMode) {
+              // FALLBACK: retry on the next beat at the current cadence.
+              console.warn(
+                `[runcycles] Heartbeat extend failed (status=${response.status}); retrying next beat: ${reservationId}`,
+              );
+              return;
             }
+            // PRIMARY-path failure handling.
+            if (response.status === 429) {
+              const delay = fieldRecoveryDelayMs(
+                response.retryAfterMsHeader,
+                true,
+              );
+              if (delay === undefined) return; // stopped and surfaced
+              nextDelayMs = delay;
+              return;
+            }
+            if (response.isClientError) {
+              // Any other 4xx: a request/authorization failure a retry of
+              // the UNCHANGED request cannot fix — stop and surface;
+              // never rotate the idempotency key to force it through.
+              stopAndSurface(
+                `extend rejected with client error (status=${response.status}, error=${String(errorCode)})`,
+              );
+              return;
+            }
+            // Timeout-as-response, transport-as-response, or 5xx.
+            const delay = fieldRecoveryDelayMs(undefined, false);
+            if (delay === undefined) return; // stopped and surfaced
+            nextDelayMs = delay;
             console.warn(
-              `[runcycles] Heartbeat extend failed (status=${response.status}); retrying next beat: ${reservationId}`,
+              `[runcycles] Heartbeat extend failed (status=${response.status}); retrying with the same key in ${nextDelayMs}ms: ${reservationId}`,
             );
           })
           .catch(() => {
-            // Transport error: best-effort — retry next beat, same key.
+            // Transport exception: best-effort — same-key retry.
             if (fieldMode) {
-              nextDelayMs = fieldRetryDelayMs();
+              const delay = fieldRecoveryDelayMs(undefined, false);
+              if (delay === undefined) return; // stopped and surfaced
+              nextDelayMs = delay;
             }
           })
           .finally(() => { tick(nextDelayMs); });
       }, delayMs);
     };
 
-    if (typeof parsed.remainingTtlMs === "number") {
-      // Server-authoritative first delay, derived from the create
-      // response's remaining_ttl_ms with the same formula as every later
-      // beat (create rtt is unknown -> 0). No immediate prime: under a
-      // maximum-lead clamp an immediate extend would only waste one of
-      // max_extensions, and the exact schedule already lands the first
-      // beat inside the real lease.
-      tick(scheduleFromField(parsed.remainingTtlMs, 0, anchor));
+    if (
+      typeof parsed.remainingTtlMs === "number" &&
+      Number.isInteger(parsed.remainingTtlMs) &&
+      parsed.remainingTtlMs >= 0
+    ) {
+      // PRIMARY: the first beat derives from the create response's
+      // remaining_ttl_ms with the same formula as every later beat,
+      // using the create call's own measured rtt. No immediate prime:
+      // under a maximum-lead clamp an immediate extend would only waste
+      // one of max_extensions, and the exact schedule already lands the
+      // first beat inside the real lease.
+      fieldMode = true;
+      const createRttMs = createReceivedMono - createSentMono;
+      let leadFloor: number;
+      if (!Number.isFinite(createRttMs) || createRttMs < 0) {
+        // Unknown timing must not be treated as zero elapsed time.
+        leadFloor = 0;
+      } else {
+        maxObservedRttMs = Math.max(maxObservedRttMs, createRttMs);
+        leadFloor = Math.max(
+          0,
+          Math.floor(parsed.remainingTtlMs - createRttMs),
+        );
+      }
+      lastLeadFloorMs = leadFloor;
+      lastLeadFloorMono = Number.isFinite(createReceivedMono)
+        ? createReceivedMono
+        : anchor;
+      const firstDelay = Math.max(0, Math.floor(leadFloor - retryReserveMs()));
+      if (firstDelay === 0) {
+        // The create response is the first zero-delay schema-valid
+        // success: exactly one immediate fresh extension is permitted
+        // before the two-consecutive-zero-delay guard stops the
+        // heartbeat.
+        zeroDelayStreak = 1;
+      }
+      tick(firstDelay);
     } else {
       // FALLBACK: immediate first beat — see the comment above
       // heldIntervalMs. The 0 delay applies to this first schedule ONLY:
       // every reschedule passes a delay that never becomes 0 (heuristic
-      // reschedules use intervalMs, which starts at heldIntervalMs; a
-      // transient failure in field mode waits at least 1 s) — so a
-      // transient failure on the immediate first attempt never hot-loops
-      // against a down server.
+      // reschedules use intervalMs, which starts at heldIntervalMs), so
+      // a transient failure on the immediate first attempt never
+      // hot-loops against a down server.
       tick(0);
     }
   };

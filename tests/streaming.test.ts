@@ -990,7 +990,8 @@ describe("reserveForStream", () => {
     // Extends move expiry by a huge +1,000,000 per call — enough that the
     // heuristic leadMin skip would trip by beat 3 — while the server's
     // remaining_ttl_ms stays 60000. Field mode must both schedule exactly
-    // from remaining_ttl_ms (59s beats) and bypass the skip check.
+    // from remaining_ttl_ms (expiry differences are never accumulated
+    // into the schedule) and bypass the skip check.
     let expiry = e0;
     client.extendReservation.mockImplementation(async () => {
       expiry += 1_000_000;
@@ -1011,17 +1012,22 @@ describe("reserveForStream", () => {
       ttlMs: 60000,
     });
 
-    // First delay = max(0, 60000 - min(30000, max(1000, 0))) = 59000 —
-    // derived from the create response, NOT an immediate prime.
-    await vi.advanceTimersByTimeAsync(58_999);
+    // Enforced per-attempt timeout T = connect 2000 + read 5000 = 7000
+    // (test default config). With rtt 0:
+    //   attempt_budget = max(7000, 1000, 0) = 7000
+    //   safety_margin  = max(1000, 0)       = 1000
+    //   retry_reserve  = 2*7000 + 1000      = 15000
+    //   first delay    = max(0, 60000 - 15000) = 45000
+    // — derived from the create response, NOT an immediate prime.
+    await vi.advanceTimersByTimeAsync(44_999);
     expect(client.extendReservation).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
     expect(client.extendReservation).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(59_000);
+    await vi.advanceTimersByTimeAsync(45_000);
     expect(client.extendReservation).toHaveBeenCalledTimes(2);
-    // Beat 3: the heuristic would skip (leadMin 1,823,000 >= 1,500,000)
-    // but field mode bypasses the skip check and extends.
-    await vi.advanceTimersByTimeAsync(59_000);
+    // Beat 3 at 135s: the heuristic would skip (leadMin 1,865,000 >=
+    // 1.5*1,000,000) but field mode bypasses the skip check and extends.
+    await vi.advanceTimersByTimeAsync(45_000);
     expect(client.extendReservation).toHaveBeenCalledTimes(3);
     for (const call of client.extendReservation.mock.calls) {
       expect(call[1].extend_by_ms).toBe(60000);
@@ -1031,17 +1037,22 @@ describe("reserveForStream", () => {
     vi.useRealTimers();
   });
 
-  it("remaining_ttl_ms: a capped 1s lease gets its first beat at 500ms, inside the real lease", async () => {
+  it("remaining_ttl_ms zero-delay guard: a lease below the retry reserve gets ONE immediate fresh attempt, then stops", async () => {
     vi.useFakeTimers();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const client = makeMockClient();
-    // 24h requested, tenant policy caps the lease at 1s; the server says
-    // so authoritatively. First delay = max(0, 1000 - min(500, 1000)) =
-    // 500 — inside the real 1s lease.
+    // 24h requested, tenant policy caps the lease at 1s and the server
+    // says so authoritatively (remaining_ttl_ms=1000). The retry reserve
+    // is 2*7000 + 1000 = 15000 > 1000, so next_delay = 0: exactly ONE
+    // immediate fresh extension is permitted; when it also yields
+    // next_delay = 0, the heartbeat stops and surfaces that the lease is
+    // shorter than the retry-safety budget — no tight loop, no silent
+    // fallback.
     const e0 = 1_000_000_000;
     client.createReservation.mockResolvedValue(
       CyclesResponse.success(200, {
         decision: "ALLOW",
-        reservation_id: "r-hb-field-capped",
+        reservation_id: "r-hb-field-guard",
         affected_scopes: [],
         expires_at_ms: e0,
         remaining_ttl_ms: 1000,
@@ -1067,13 +1078,16 @@ describe("reserveForStream", () => {
       ttlMs: 86_400_000,
     });
 
-    await vi.advanceTimersByTimeAsync(499);
-    expect(client.extendReservation).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(1);
+    // The one permitted immediate attempt.
+    await vi.advanceTimersByTimeAsync(0);
     expect(client.extendReservation).toHaveBeenCalledTimes(1);
-    // Same formula from the extend response: next beat 500ms later.
-    await vi.advanceTimersByTimeAsync(500);
-    expect(client.extendReservation).toHaveBeenCalledTimes(2);
+    // Stopped: no further attempts ever.
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(client.extendReservation).toHaveBeenCalledTimes(1);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("retry-safety budget"),
+    );
+    warnSpy.mockRestore();
 
     await handle.commit(500);
     vi.useRealTimers();
@@ -1084,7 +1098,8 @@ describe("reserveForStream", () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const client = makeMockClient();
     // The server holds the lease at L=30000 and SAYS so: beats land at
-    // L minus the 1s reserve — no cadence collapse, no clamp warn.
+    // L minus the retry reserve (2*7000 + 1000 = 15000) — no cadence
+    // collapse, no clamp warn.
     const e0 = 5_000_000_000;
     const t0 = Date.now();
     client.createReservation.mockResolvedValue(
@@ -1114,18 +1129,18 @@ describe("reserveForStream", () => {
       ttlMs: 60000,
     });
 
-    // First delay = 30000 - min(15000, 1000) = 29000.
-    await vi.advanceTimersByTimeAsync(28_999);
+    // First delay = max(0, 30000 - (2*7000 + 1000)) = 15000.
+    await vi.advanceTimersByTimeAsync(14_999);
     expect(client.extendReservation).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
     expect(client.extendReservation).toHaveBeenCalledTimes(1);
     // Zero-grant responses (expiry tracks elapsed) do NOT collapse or
-    // hold anything — the schedule stays exactly 29000 per beat.
-    await vi.advanceTimersByTimeAsync(28_999);
+    // hold anything — the schedule stays exactly 15000 per beat.
+    await vi.advanceTimersByTimeAsync(14_999);
     expect(client.extendReservation).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(1);
     expect(client.extendReservation).toHaveBeenCalledTimes(2);
-    await vi.advanceTimersByTimeAsync(29_000);
+    await vi.advanceTimersByTimeAsync(15_000);
     expect(client.extendReservation).toHaveBeenCalledTimes(3);
 
     const clampWarns = warnSpy.mock.calls.filter((c) =>
@@ -1174,12 +1189,12 @@ describe("reserveForStream", () => {
       ttlMs: 60000,
     });
 
-    // Beat 1 at 59s (field schedule from create).
-    await vi.advanceTimersByTimeAsync(59_000);
+    // Beat 1 at 45s (field schedule from create: 60000 - 15000).
+    await vi.advanceTimersByTimeAsync(45_000);
     expect(client.extendReservation).toHaveBeenCalledTimes(1);
-    // Beat 2 at 118s (field schedule); its response has NO field ->
+    // Beat 2 at 90s (field schedule); its response has NO field ->
     // heuristic takes over: measured 60000 grant -> 30s cadence.
-    await vi.advanceTimersByTimeAsync(59_000);
+    await vi.advanceTimersByTimeAsync(45_000);
     expect(client.extendReservation).toHaveBeenCalledTimes(2);
     // Beat 3 lands 30s later on the heuristic cadence.
     await vi.advanceTimersByTimeAsync(29_999);
@@ -1191,7 +1206,7 @@ describe("reserveForStream", () => {
     vi.useRealTimers();
   });
 
-  it("remaining_ttl_ms: transient failure retries with the SAME key at clamp(lead/4, 1s, 30s)", async () => {
+  it("remaining_ttl_ms: transient failure retries with the SAME key at min(30s, lead/4, retry_window)", async () => {
     vi.useFakeTimers();
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const client = makeMockClient();
@@ -1226,11 +1241,14 @@ describe("reserveForStream", () => {
       ttlMs: 60000,
     });
 
-    // Beat 1 at 59s fails transiently. Field-mode retry delay =
-    // clamp((60000 - 59000)/4, 1s, 30s) = 1000.
-    await vi.advanceTimersByTimeAsync(59_000);
+    // Beat 1 at 45s fails transiently. Recovery recomputes from the
+    // create response's lead:
+    //   lead   = 60000 - 45000 elapsed     = 15000
+    //   window = 15000 - 7000 - 1000       = 7000 (>= 0 -> retry)
+    //   delay  = min(30000, 15000/4, 7000) = 3750, SAME key.
+    await vi.advanceTimersByTimeAsync(45_000);
     expect(client.extendReservation).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(999);
+    await vi.advanceTimersByTimeAsync(3_749);
     expect(client.extendReservation).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(1);
     expect(client.extendReservation).toHaveBeenCalledTimes(2);
@@ -1238,6 +1256,280 @@ describe("reserveForStream", () => {
     // The retry reuses the SAME idempotency key as the failed attempt.
     const keys = client.extendReservation.mock.calls.map((c: any[]) => c[1].idempotency_key);
     expect(keys[1]).toBe(keys[0]);
+    warnSpy.mockRestore();
+
+    await handle.commit(500);
+    vi.useRealTimers();
+  });
+
+  it("remaining_ttl_ms: ambiguous 2xx is NOT applied — same-key recovery like a transient failure", async () => {
+    vi.useFakeTimers();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const client = makeMockClient();
+    const e0 = 1_000_000_000;
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-hb-field-amb",
+        affected_scopes: [],
+        expires_at_ms: e0,
+        remaining_ttl_ms: 60000,
+      }),
+    );
+    // Beat 1 gets a 200 whose body is NOT a schema-valid
+    // ReservationExtendResponse (expires_at_ms missing): AMBIGUOUS on
+    // the primary path — same-key recovery, never used for scheduling.
+    let calls = 0;
+    client.extendReservation.mockImplementation(async () => {
+      calls += 1;
+      if (calls === 1) {
+        return CyclesResponse.success(200, { status: "ACTIVE" });
+      }
+      return CyclesResponse.success(200, {
+        status: "ACTIVE",
+        expires_at_ms: e0 + 60000,
+        remaining_ttl_ms: 60000,
+      });
+    });
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+      ttlMs: 60000,
+    });
+
+    // Beat 1 at 45s -> ambiguous. Recovery: lead 15000, window 7000,
+    // delay = min(30000, 3750, 7000) = 3750, SAME key.
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(client.extendReservation).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(3_749);
+    expect(client.extendReservation).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(client.extendReservation).toHaveBeenCalledTimes(2);
+
+    const keys = client.extendReservation.mock.calls.map((c: any[]) => c[1].idempotency_key);
+    expect(keys[1]).toBe(keys[0]);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("ambiguous 2xx"),
+    );
+    warnSpy.mockRestore();
+
+    await handle.commit(500);
+    vi.useRealTimers();
+  });
+
+  it("remaining_ttl_ms recovery loop: repeated same-key retries while retry_window >= 0, then stop", async () => {
+    vi.useFakeTimers();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const client = makeMockClient();
+    const e0 = 1_000_000_000;
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-hb-field-loop",
+        affected_scopes: [],
+        expires_at_ms: e0,
+        remaining_ttl_ms: 60000,
+      }),
+    );
+    // Every extend fails 503; recovery recomputes lead/window from the
+    // SAME last schema-valid response (the create) each time:
+    // attempts at 45000 (delay 3750), 48750 (2812), 51562 (438),
+    // 52000 (window 0 -> one immediate retry), then STOP when no
+    // complete retry plus margin fits.
+    client.extendReservation.mockResolvedValue(
+      CyclesResponse.httpError(503, "Service unavailable"),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+      ttlMs: 60000,
+    });
+
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(client.extendReservation).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(3_750);
+    expect(client.extendReservation).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(2_812);
+    expect(client.extendReservation).toHaveBeenCalledTimes(3);
+    await vi.advanceTimersByTimeAsync(439);
+    expect(client.extendReservation).toHaveBeenCalledTimes(5);
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(client.extendReservation).toHaveBeenCalledTimes(5);
+
+    // Every recovery attempt reused the SAME idempotency key.
+    const keys = client.extendReservation.mock.calls.map((c: any[]) => c[1].idempotency_key);
+    for (const k of keys) {
+      expect(k).toBe(keys[0]);
+    }
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("cannot hold one complete retry"),
+    );
+    warnSpy.mockRestore();
+
+    await handle.commit(500);
+    vi.useRealTimers();
+  });
+
+  it("remaining_ttl_ms: 429 Retry-After is honored exactly when it fits the retry window", async () => {
+    vi.useFakeTimers();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const client = makeMockClient();
+    const e0 = 1_000_000_000;
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-hb-field-429",
+        affected_scopes: [],
+        expires_at_ms: e0,
+        remaining_ttl_ms: 60000,
+      }),
+    );
+    let calls = 0;
+    client.extendReservation.mockImplementation(async () => {
+      calls += 1;
+      if (calls === 1) {
+        return CyclesResponse.httpError(
+          429,
+          "busy",
+          { error: "LIMIT_EXCEEDED", message: "slow down", request_id: "r" },
+          { "retry-after": "2" },
+        );
+      }
+      return CyclesResponse.success(200, {
+        status: "ACTIVE",
+        expires_at_ms: e0 + 60000,
+        remaining_ttl_ms: 60000,
+      });
+    });
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+      ttlMs: 60000,
+    });
+
+    // Beat 1 at 45s is rate limited. Window = 7000; Retry-After 2s ->
+    // 2000ms <= 7000 -> retry EXACTLY 2000ms later, same key.
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(client.extendReservation).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(client.extendReservation).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(client.extendReservation).toHaveBeenCalledTimes(2);
+
+    const keys = client.extendReservation.mock.calls.map((c: any[]) => c[1].idempotency_key);
+    expect(keys[1]).toBe(keys[0]);
+    warnSpy.mockRestore();
+
+    await handle.commit(500);
+    vi.useRealTimers();
+  });
+
+  it("remaining_ttl_ms: 429 Retry-After exceeding the retry window stops the heartbeat", async () => {
+    vi.useFakeTimers();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const client = makeMockClient();
+    const e0 = 1_000_000_000;
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-hb-field-429x",
+        affected_scopes: [],
+        expires_at_ms: e0,
+        remaining_ttl_ms: 60000,
+      }),
+    );
+    // Retry-After 8s = 8000ms > window 7000ms -> honoring it would land
+    // past the safe retry window; retrying earlier would violate
+    // throttling — stop and surface.
+    client.extendReservation.mockResolvedValue(
+      CyclesResponse.httpError(
+        429,
+        "busy",
+        { error: "LIMIT_EXCEEDED", message: "slow down", request_id: "r" },
+        { "retry-after": "8" },
+      ),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+      ttlMs: 60000,
+    });
+
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(client.extendReservation).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(client.extendReservation).toHaveBeenCalledTimes(1);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("Retry-After"),
+    );
+    warnSpy.mockRestore();
+
+    await handle.commit(500);
+    vi.useRealTimers();
+  });
+
+  it("remaining_ttl_ms: any other 4xx stops the heartbeat without rotating the idempotency key", async () => {
+    vi.useFakeTimers();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const client = makeMockClient();
+    const e0 = 1_000_000_000;
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-hb-field-4xx",
+        affected_scopes: [],
+        expires_at_ms: e0,
+        remaining_ttl_ms: 60000,
+      }),
+    );
+    // A non-permanent, non-429 client error: retrying the UNCHANGED
+    // request cannot fix it, and rotating the key to force it through is
+    // forbidden — stop and surface.
+    client.extendReservation.mockResolvedValue(
+      CyclesResponse.httpError(400, "Bad request", {
+        error: "INVALID_REQUEST",
+        message: "bad",
+        request_id: "r",
+      }),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+      ttlMs: 60000,
+    });
+
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(client.extendReservation).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(client.extendReservation).toHaveBeenCalledTimes(1);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("client error"),
+    );
     warnSpy.mockRestore();
 
     await handle.commit(500);
