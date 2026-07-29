@@ -22,7 +22,7 @@
  * can settle each other's records (safe: replay is idempotent).
  */
 
-import { pbkdf2Sync } from "node:crypto";
+import { createHash, pbkdf2Sync } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -96,6 +96,11 @@ export function authFingerprint(
 }
 
 function safeFilename(reservationId: string): string {
+  const digest = createHash("sha256").update(reservationId, "utf8").digest("hex");
+  return `v2-${digest}${SUFFIX}`;
+}
+
+function legacyFilename(reservationId: string): string {
   const sanitized = reservationId.replace(/[^A-Za-z0-9_-]/g, "_");
   return `${sanitized}${SUFFIX}`;
 }
@@ -232,6 +237,17 @@ export class CommitJournal {
       fs.rmSync(path.join(this.directory, safeFilename(reservationId)), {
         force: true,
       });
+      const legacy = path.join(this.directory, legacyFilename(reservationId));
+      if (fs.existsSync(legacy)) {
+        try {
+          const entry = recordFromJson(fs.readFileSync(legacy, "utf-8"));
+          if (entry.reservationId === reservationId) {
+            fs.rmSync(legacy, { force: true });
+          }
+        } catch {
+          // Never delete a colliding or malformed legacy record.
+        }
+      }
     } catch (err) {
       console.warn(
         `[runcycles] Failed to discard journal entry: ${reservationId}: ${String(err)}`,
@@ -284,6 +300,33 @@ export class CommitJournal {
           } catch {
             // best-effort quarantine
           }
+          continue;
+        }
+        const standardPath = path.join(
+          this.directory,
+          safeFilename(entry.reservationId),
+        );
+        let duplicateOfStandard = false;
+        if (filePath !== standardPath) {
+          try {
+            if (!fs.existsSync(standardPath)) {
+              fs.renameSync(filePath, standardPath);
+            } else {
+              const existing = recordFromJson(
+                fs.readFileSync(standardPath, "utf-8"),
+              );
+              if (existing.reservationId === entry.reservationId) {
+                fs.rmSync(filePath, { force: true });
+                duplicateOfStandard = true;
+              }
+            }
+          } catch (err) {
+            console.warn(
+              `[runcycles] Could not safely migrate legacy journal filename for ${entry.reservationId}: ${String(err)}`,
+            );
+          }
+        }
+        if (duplicateOfStandard) {
           continue;
         }
         if (entry.baseUrl === baseUrl) {

@@ -14,6 +14,10 @@ import {
 import { AsyncCyclesLifecycle, buildEventFallbackBody } from "../src/lifecycle.js";
 import { CyclesResponse } from "../src/response.js";
 import { CommitRetryEngine } from "../src/retry.js";
+import {
+  isSchemaValidCommitSuccess,
+  isSchemaValidEventSuccess,
+} from "../src/settlement.js";
 // Imported from the package barrel on purpose: guards the public export.
 import { flushPendingCommits } from "../src/index.js";
 
@@ -89,7 +93,10 @@ function expiredResponse(): CyclesResponse {
 }
 
 function commitSuccess(): CyclesResponse {
-  return CyclesResponse.success(200, { status: "COMMITTED" });
+  return CyclesResponse.success(200, {
+    status: "COMMITTED",
+    charged: { unit: "USD_MICROCENTS", amount: 100 },
+  });
 }
 
 function eventSuccess(): CyclesResponse {
@@ -132,6 +139,46 @@ describe("CommitJournal", () => {
     const loaded = journal.loadPending(BASE_URL);
     expect(loaded).toHaveLength(1);
     expect(loaded[0].mode).toBe("event");
+  });
+
+  it("uses cross-SDK digest names and safely migrates colliding legacy names", () => {
+    const dir = path.join(defaultJournalDir(), "j");
+    const journal = new CommitJournal(dir);
+    journal.record(record("rsv/a"));
+    journal.record(record("rsv_a"));
+    expect(fs.readdirSync(dir).sort()).toEqual([
+      "v2-80bbb4b84643293ad96bc2381b863301591d0acc7afb0858cd7bcdee5f698099.json",
+      "v2-e3edb9ca022de3c9c90c5667d47fa66448cee1f254e488a761313faee34141d7.json",
+    ]);
+
+    const legacy = path.join(dir, "rsv_a.json");
+    fs.writeFileSync(
+      legacy,
+      JSON.stringify({
+        version: 1,
+        reservation_id: "rsv/a",
+        base_url: BASE_URL,
+        mode: "commit",
+        commit_body: commitBody(),
+        event_fallback_body: eventBody(),
+        recorded_at_ms: 1,
+        not_before_ms: null,
+      }),
+      "utf-8",
+    );
+    journal.discard("rsv_a");
+    expect(fs.existsSync(legacy)).toBe(true);
+    const loaded = journal.loadPending(BASE_URL);
+    expect(fs.existsSync(legacy)).toBe(false);
+    expect(loaded.map((entry) => entry.reservationId)).toEqual(["rsv/a"]);
+  });
+
+  it("uses the standard UTF-8 digest for non-BMP identifiers", () => {
+    const dir = path.join(defaultJournalDir(), "j");
+    new CommitJournal(dir).record(record("r🚀"));
+    expect(fs.readdirSync(dir)).toEqual([
+      "v2-34c5b33347a139e63c81ea72943cc15dd4c2087dc1eaa756a78f3c49974e0b87.json",
+    ]);
   });
 
   it("filters by base URL", () => {
@@ -262,6 +309,52 @@ describe("CommitJournal", () => {
       expect(fs.statSync(path.dirname(dir)).mode & 0o777).toBe(0o700);
     },
   );
+});
+
+describe("strict settlement success validation", () => {
+  it("accepts commit evidence and rejects invalid optional values and units", () => {
+    const body = {
+      status: "COMMITTED",
+      charged: { unit: "USD_MICROCENTS", amount: 1 },
+      cycles_evidence: {
+        evidence_id: "a".repeat(64),
+        cycles_evidence_url: "https://cycles.example/v1/evidence/id",
+      },
+    };
+    expect(
+      isSchemaValidCommitSuccess(CyclesResponse.success(200, body)),
+    ).toBe(true);
+    expect(
+      isSchemaValidCommitSuccess(
+        CyclesResponse.success(200, { ...body, balances: null }),
+      ),
+    ).toBe(false);
+    expect(
+      isSchemaValidCommitSuccess(
+        CyclesResponse.success(200, {
+          ...body,
+          charged: { unit: "FUTURE_UNIT", amount: 1 },
+        }),
+      ),
+    ).toBe(false);
+  });
+
+  it("follows the event response wire schema exactly", () => {
+    expect(
+      isSchemaValidEventSuccess(
+        CyclesResponse.success(201, { status: "APPLIED", event_id: "" }),
+      ),
+    ).toBe(true);
+    expect(
+      isSchemaValidEventSuccess(
+        CyclesResponse.success(201, {
+          status: "APPLIED",
+          event_id: "event-1",
+          charged: null,
+        }),
+      ),
+    ).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1047,6 +1140,8 @@ describe("lifecycle commit wiring", () => {
       setClient: vi.fn(),
       schedule: vi.fn(),
       scheduleEvent: vi.fn(),
+      persistPending: vi.fn(),
+      discardPending: vi.fn(),
     };
     const lifecycle = new AsyncCyclesLifecycle(
       client as never,
@@ -1057,6 +1152,61 @@ describe("lifecycle commit wiring", () => {
   }
 
   const cfg = { estimate: 1000, tenant: "acme", ttlMs: 60_000 };
+
+  it("journals before the first commit request and discards valid success", async () => {
+    const { lifecycle, client, engine } = makeLifecycle();
+    client.createReservation.mockResolvedValue(allowResponse());
+    client.commitReservation.mockResolvedValue(commitSuccess());
+    const order: string[] = [];
+    engine.persistPending.mockImplementation(() => order.push("persist"));
+    client.commitReservation.mockImplementation(async () => {
+      order.push("commit");
+      return commitSuccess();
+    });
+
+    await lifecycle.execute(async () => "result", [], cfg);
+
+    expect(order).toEqual(["persist", "commit"]);
+    expect(engine.discardPending).toHaveBeenCalledWith("rsv_test");
+  });
+
+  it("treats a protocol-invalid 2xx as ambiguous and preserves the key", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { lifecycle, client, engine } = makeLifecycle();
+    client.createReservation.mockResolvedValue(allowResponse());
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+
+    await lifecycle.execute(async () => "result", [], cfg);
+
+    expect(engine.schedule).toHaveBeenCalledTimes(1);
+    const persisted = engine.persistPending.mock.calls[0][1] as Record<string, unknown>;
+    const scheduled = engine.schedule.mock.calls[0][1] as Record<string, unknown>;
+    expect(scheduled.idempotency_key).toBe(persisted.idempotency_key);
+    expect(engine.discardPending).not.toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
+
+  it("retains a contradictory 4xx carrying a retryable error code", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { lifecycle, client, engine } = makeLifecycle();
+    client.createReservation.mockResolvedValue(allowResponse());
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.httpError(400, "proxy mismatch", {
+        error: "INTERNAL_ERROR",
+        message: "transient",
+        request_id: "req-1",
+      }),
+    );
+
+    await lifecycle.execute(async () => "result", [], cfg);
+
+    expect(engine.schedule).toHaveBeenCalledTimes(1);
+    expect(engine.discardPending).not.toHaveBeenCalled();
+    expect(client.releaseReservation).not.toHaveBeenCalled();
+    errorSpy.mockRestore();
+  });
 
   it("schedules retry with Retry-After on a rate-limited first commit", async () => {
     const { lifecycle, client, engine } = makeLifecycle();

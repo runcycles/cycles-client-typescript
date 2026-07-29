@@ -14,12 +14,14 @@ import {
   ErrorCode,
   errorCodeFromString,
   isMetricsEmpty,
+  isRetryableErrorCode,
   type CyclesMetrics,
   type Decision,
   type Subject,
 } from "./models.js";
 import type { CyclesResponse } from "./response.js";
 import type { CommitRetryEngine } from "./retry.js";
+import { isSchemaValidCommitSuccess } from "./settlement.js";
 import {
   validateExtendByMs,
   validateGracePeriodMs,
@@ -739,12 +741,25 @@ export class AsyncCyclesLifecycle {
     commitBody: Record<string, unknown>,
     eventFallbackBody: Record<string, unknown>,
   ): Promise<void> {
+    this._retryEngine.persistPending(
+      reservationId,
+      commitBody,
+      eventFallbackBody,
+    );
     try {
       const response = await this._client.commitReservation(
         reservationId,
         commitBody,
       );
+      if (isSchemaValidCommitSuccess(response)) {
+        this._retryEngine.discardPending(reservationId);
+        return;
+      }
       if (response.isSuccess) {
+        console.warn(
+          `[runcycles] Commit returned an ambiguous protocol-invalid 2xx (status=${response.status}); scheduling same-key retry: ${reservationId}`,
+        );
+        this._retryEngine.schedule(reservationId, commitBody, eventFallbackBody);
         return;
       }
 
@@ -798,18 +813,23 @@ export class AsyncCyclesLifecycle {
         return;
       }
       if (errorCode === "RESERVATION_FINALIZED") {
+        this._retryEngine.discardPending(reservationId);
         return;
       }
       if (errorCode === "IDEMPOTENCY_MISMATCH") {
+        this._retryEngine.discardPending(reservationId);
         return;
       }
       if (response.isClientError) {
+        const parsedErrorCode = errorCodeFromString(errorCode);
         if (
-          errorCode !== undefined &&
-          errorCodeFromString(errorCode) !== ErrorCode.UNKNOWN
+          parsedErrorCode !== undefined &&
+          parsedErrorCode !== ErrorCode.UNKNOWN &&
+          !isRetryableErrorCode(parsedErrorCode)
         ) {
           // Recognized protocol code — a genuine rejection the retry
           // engine cannot fix. Releasing returns the reserved budget.
+          this._retryEngine.discardPending(reservationId);
           await this._handleRelease(
             reservationId,
             `commit_rejected_${errorCode}`,
@@ -825,6 +845,7 @@ export class AsyncCyclesLifecycle {
         this._retryEngine.schedule(reservationId, commitBody, eventFallbackBody);
         return;
       }
+      this._retryEngine.schedule(reservationId, commitBody, eventFallbackBody);
     } catch {
       this._retryEngine.schedule(reservationId, commitBody, eventFallbackBody);
     }

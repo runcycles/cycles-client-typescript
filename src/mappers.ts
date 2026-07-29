@@ -149,6 +149,9 @@ export function commitResponseFromWire(
     charged: amountFromWire(wire.charged as Record<string, unknown>)!,
     released: amountFromWire(wire.released as Record<string, unknown> | undefined),
     balances: balancesFromWire(wire.balances as unknown[] | undefined),
+    cyclesEvidence: cyclesEvidenceRefFromWire(
+      wire.cycles_evidence as Record<string, unknown> | undefined,
+    ),
   };
 }
 
