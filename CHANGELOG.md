@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-07-28
+
+### Fixed
+
+- Heartbeat transport exceptions from both `withCycles` and `reserveForStream` are now reported with the reservation ID, error detail, and same-key retry disposition. Heartbeats remain non-fatal and retain their existing recovery timing, but a lost extend response is no longer invisible to operators.
+
 ## [0.4.1] - 2026-07-27
 
 ### Fixed

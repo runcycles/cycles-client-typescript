@@ -1281,12 +1281,29 @@ export class AsyncCyclesLifecycle {
               `[runcycles] Heartbeat extend failed (status=${response.status}); retrying with the same key in ${nextDelayMs}ms: ${reservationId}`,
             );
           })
-          .catch(() => {
-            // Transport exception: best-effort — same-key retry.
+          .catch((error: unknown) => {
+            // Transport exception: preserve the same-key retry semantics, but
+            // never make the loss of lease authority invisible to operators.
+            const detail =
+              error instanceof Error
+                ? `${error.name}: ${error.message}`
+                : String(error);
             if (fieldMode) {
               const delay = fieldRecoveryDelayMs(undefined, false);
-              if (delay === undefined) return; // stopped and surfaced
+              if (delay === undefined) {
+                console.warn(
+                  `[runcycles] Heartbeat extend transport error; recovery stopped: ${reservationId}: ${detail}`,
+                );
+                return; // stopped and surfaced
+              }
               nextDelayMs = delay;
+              console.warn(
+                `[runcycles] Heartbeat extend transport error; retrying with the same key in ${nextDelayMs}ms: ${reservationId}: ${detail}`,
+              );
+            } else {
+              console.warn(
+                `[runcycles] Heartbeat extend transport error; retrying next beat with the same key in ${nextDelayMs}ms: ${reservationId}: ${detail}`,
+              );
             }
           })
           .finally(() => {

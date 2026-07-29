@@ -503,8 +503,9 @@ describe("reserveForStream", () => {
     vi.useRealTimers();
   });
 
-  it("heartbeat swallows extend failures gracefully", async () => {
+  it("heartbeat logs thrown transport failures and keeps the stream alive", async () => {
     vi.useFakeTimers();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const client = makeMockClient();
     client.createReservation.mockResolvedValue(
       CyclesResponse.success(200, {
@@ -528,6 +529,14 @@ describe("reserveForStream", () => {
     // Should not throw even though extend fails
     await vi.advanceTimersByTimeAsync(31000);
     expect(client.extendReservation).toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "Heartbeat extend transport error; retrying next beat with the same key",
+      ),
+    );
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("Error: extend failed"),
+    );
 
     await handle.commit(500);
     vi.useRealTimers();
@@ -1533,6 +1542,47 @@ describe("reserveForStream", () => {
       expect.stringContaining("client error"),
     );
     warnSpy.mockRestore();
+
+    await handle.commit(500);
+    vi.useRealTimers();
+  });
+
+  it("heartbeat reports when a field-mode transport failure exhausts the safe recovery window", async () => {
+    vi.useFakeTimers();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-hb-field-transport-stop",
+        affected_scopes: [],
+        expires_at_ms: 1_000_000_000,
+        remaining_ttl_ms: 1000,
+      }),
+    );
+    client.extendReservation.mockRejectedValue(new Error("socket closed"));
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 1000,
+      tenant: "acme",
+      ttlMs: 60_000,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(client.extendReservation).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(client.extendReservation).toHaveBeenCalledTimes(1);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "Heartbeat extend transport error; recovery stopped: r-hb-field-transport-stop",
+      ),
+    );
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("Error: socket closed"),
+    );
 
     await handle.commit(500);
     vi.useRealTimers();
