@@ -44,8 +44,14 @@ import {
 } from "./mappers.js";
 import type { CyclesResponse } from "./response.js";
 import { CommitRetryEngine } from "./retry.js";
+import { isSchemaValidCommitSuccess } from "./settlement.js";
 import type { Caps, CyclesMetrics, Decision, Subject } from "./models.js";
-import { ErrorCode, errorCodeFromString, isMetricsEmpty } from "./models.js";
+import {
+  ErrorCode,
+  errorCodeFromString,
+  isMetricsEmpty,
+  isRetryableErrorCode,
+} from "./models.js";
 import {
   validateExtendByMs,
   validateGracePeriodMs,
@@ -630,12 +636,29 @@ export async function reserveForStream(
               `[runcycles] Heartbeat extend failed (status=${response.status}); retrying with the same key in ${nextDelayMs}ms: ${reservationId}`,
             );
           })
-          .catch(() => {
-            // Transport exception: best-effort — same-key retry.
+          .catch((error: unknown) => {
+            // Transport exception: preserve the same-key retry semantics, but
+            // never make the loss of lease authority invisible to operators.
+            const detail =
+              error instanceof Error
+                ? `${error.name}: ${error.message}`
+                : String(error);
             if (fieldMode) {
               const delay = fieldRecoveryDelayMs(undefined, false);
-              if (delay === undefined) return; // stopped and surfaced
+              if (delay === undefined) {
+                console.warn(
+                  `[runcycles] Heartbeat extend transport error; recovery stopped: ${reservationId}: ${detail}`,
+                );
+                return; // stopped and surfaced
+              }
               nextDelayMs = delay;
+              console.warn(
+                `[runcycles] Heartbeat extend transport error; retrying with the same key in ${nextDelayMs}ms: ${reservationId}: ${detail}`,
+              );
+            } else {
+              console.warn(
+                `[runcycles] Heartbeat extend transport error; retrying next beat with the same key in ${nextDelayMs}ms: ${reservationId}: ${detail}`,
+              );
             }
           })
           .finally(() => { tick(nextDelayMs); });
@@ -727,6 +750,7 @@ export async function reserveForStream(
         action,
         commitBody,
       );
+      retryEngine.persistPending(reservationId, commitBody, eventFallback);
 
       let response: CyclesResponse;
       try {
@@ -737,7 +761,15 @@ export async function reserveForStream(
         retryEngine.schedule(reservationId, commitBody, eventFallback);
         return;
       }
+      if (isSchemaValidCommitSuccess(response)) {
+        retryEngine.discardPending(reservationId);
+        return;
+      }
       if (response.isSuccess) {
+        console.warn(
+          `[runcycles] Stream commit returned an ambiguous protocol-invalid 2xx (status=${response.status}); scheduling same-key retry: ${reservationId}`,
+        );
+        retryEngine.schedule(reservationId, commitBody, eventFallback);
         return;
       }
       if (response.isTransportError || response.isServerError) {
@@ -783,16 +815,19 @@ export async function reserveForStream(
         errorCode === "RESERVATION_FINALIZED" ||
         errorCode === "IDEMPOTENCY_MISMATCH"
       ) {
+        retryEngine.discardPending(reservationId);
         console.warn(
           `[runcycles] Stream commit already settled (${errorCode}): ${reservationId}`,
         );
         return;
       }
 
+      const parsedErrorCode = errorCodeFromString(errorCode);
       if (
         response.isClientError &&
-        errorCode !== undefined &&
-        errorCodeFromString(errorCode) !== ErrorCode.UNKNOWN
+        parsedErrorCode !== undefined &&
+        parsedErrorCode !== ErrorCode.UNKNOWN &&
+        !isRetryableErrorCode(parsedErrorCode)
       ) {
         // Genuine rejection (e.g. UNIT_MISMATCH — a recognized protocol
         // code): reset finalized so the caller can correct and retry
@@ -801,6 +836,7 @@ export async function reserveForStream(
         // extend's .finally→tick could race with a new startHeartbeat
         // call). The reservation's remaining TTL should give the caller
         // enough time to retry or release.
+        retryEngine.discardPending(reservationId);
         finalized = false;
         throw new CyclesError(
           `Commit failed with status ${response.status}: ${response.errorMessage ?? "unknown error"}`,

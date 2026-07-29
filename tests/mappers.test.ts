@@ -182,11 +182,16 @@ describe("commitResponseFromWire", () => {
           remaining: { unit: "USD_MICROCENTS", amount: 4300 },
         },
       ],
+      cycles_evidence: {
+        evidence_id: "a".repeat(64),
+        cycles_evidence_url: "https://cycles.example/v1/evidence/id",
+      },
     });
     expect(parsed.status).toBe("COMMITTED");
     expect(parsed.charged).toEqual({ unit: "USD_MICROCENTS", amount: 500 });
     expect(parsed.released).toEqual({ unit: "USD_MICROCENTS", amount: 200 });
     expect(parsed.balances).toHaveLength(1);
+    expect(parsed.cyclesEvidence?.evidenceId).toBe("a".repeat(64));
   });
 
   it("handles response without released or balances", () => {

@@ -22,7 +22,7 @@
  * can settle each other's records (safe: replay is idempotent).
  */
 
-import { pbkdf2Sync } from "node:crypto";
+import { createHash, pbkdf2Sync } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -96,6 +96,11 @@ export function authFingerprint(
 }
 
 function safeFilename(reservationId: string): string {
+  const digest = createHash("sha256").update(reservationId, "utf8").digest("hex");
+  return `v2-${digest}${SUFFIX}`;
+}
+
+function legacyFilename(reservationId: string): string {
   const sanitized = reservationId.replace(/[^A-Za-z0-9_-]/g, "_");
   return `${sanitized}${SUFFIX}`;
 }
@@ -137,7 +142,14 @@ function recordToJson(record: PendingCommitRecord): string {
 }
 
 function recordFromJson(raw: string): PendingCommitRecord {
-  const data = JSON.parse(raw) as Record<string, unknown>;
+  const parsed = JSON.parse(raw) as unknown;
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("journal record must be a JSON object");
+  }
+  const data = parsed as Record<string, unknown>;
+  if (data.version !== RECORD_VERSION) {
+    throw new Error(`unsupported journal version: ${String(data.version)}`);
+  }
   const reservationId = data.reservation_id;
   // An absent mode defaults to "commit"; an explicit null is rejected
   // below like any other invalid mode (parity with the Python/Java SDKs).
@@ -150,9 +162,17 @@ function recordFromJson(raw: string): PendingCommitRecord {
   }
   const commitBody = data.commit_body;
   const eventFallbackBody = data.event_fallback_body;
-  // Arrays satisfy typeof === "object" but are not valid request bodies.
-  if (Array.isArray(commitBody) || Array.isArray(eventFallbackBody)) {
-    throw new Error("journal record has array-valued body");
+  for (const [name, body] of [
+    ["commit_body", commitBody],
+    ["event_fallback_body", eventFallbackBody],
+  ] as const) {
+    if (
+      body !== undefined &&
+      body !== null &&
+      (typeof body !== "object" || Array.isArray(body))
+    ) {
+      throw new Error(`journal record has invalid ${name}`);
+    }
   }
   if (mode === "commit" && (commitBody === null || typeof commitBody !== "object")) {
     throw new Error("commit-mode journal record missing commit_body");
@@ -163,7 +183,24 @@ function recordFromJson(raw: string): PendingCommitRecord {
   ) {
     throw new Error("event-mode journal record missing event_fallback_body");
   }
+  if (data.base_url !== undefined && typeof data.base_url !== "string") {
+    throw new Error("journal record has invalid base_url");
+  }
+  const recordedAtRaw = data.recorded_at_ms;
+  if (
+    recordedAtRaw !== undefined &&
+    (!Number.isSafeInteger(recordedAtRaw) || (recordedAtRaw as number) < 0)
+  ) {
+    throw new Error("journal record has invalid recorded_at_ms");
+  }
   const notBeforeRaw = data.not_before_ms;
+  if (
+    notBeforeRaw !== undefined &&
+    notBeforeRaw !== null &&
+    (!Number.isSafeInteger(notBeforeRaw) || (notBeforeRaw as number) < 0)
+  ) {
+    throw new Error("journal record has invalid not_before_ms");
+  }
   return {
     reservationId,
     baseUrl: typeof data.base_url === "string" ? data.base_url : "",
@@ -172,8 +209,8 @@ function recordFromJson(raw: string): PendingCommitRecord {
     eventFallbackBody: (eventFallbackBody ?? undefined) as
       | Record<string, unknown>
       | undefined,
-    recordedAtMs: typeof data.recorded_at_ms === "number" ? data.recorded_at_ms : 0,
-    notBeforeMs: typeof notBeforeRaw === "number" ? notBeforeRaw : undefined,
+    recordedAtMs: (recordedAtRaw as number | undefined) ?? 0,
+    notBeforeMs: (notBeforeRaw as number | null | undefined) ?? undefined,
   };
 }
 
@@ -232,6 +269,17 @@ export class CommitJournal {
       fs.rmSync(path.join(this.directory, safeFilename(reservationId)), {
         force: true,
       });
+      const legacy = path.join(this.directory, legacyFilename(reservationId));
+      if (fs.existsSync(legacy)) {
+        try {
+          const entry = recordFromJson(fs.readFileSync(legacy, "utf-8"));
+          if (entry.reservationId === reservationId) {
+            fs.rmSync(legacy, { force: true });
+          }
+        } catch {
+          // Never delete a colliding or malformed legacy record.
+        }
+      }
     } catch (err) {
       console.warn(
         `[runcycles] Failed to discard journal entry: ${reservationId}: ${String(err)}`,
@@ -284,6 +332,33 @@ export class CommitJournal {
           } catch {
             // best-effort quarantine
           }
+          continue;
+        }
+        const standardPath = path.join(
+          this.directory,
+          safeFilename(entry.reservationId),
+        );
+        let duplicateOfStandard = false;
+        if (filePath !== standardPath) {
+          try {
+            if (!fs.existsSync(standardPath)) {
+              fs.renameSync(filePath, standardPath);
+            } else {
+              const existing = recordFromJson(
+                fs.readFileSync(standardPath, "utf-8"),
+              );
+              if (existing.reservationId === entry.reservationId) {
+                fs.rmSync(filePath, { force: true });
+                duplicateOfStandard = true;
+              }
+            }
+          } catch (err) {
+            console.warn(
+              `[runcycles] Could not safely migrate legacy journal filename for ${entry.reservationId}: ${String(err)}`,
+            );
+          }
+        }
+        if (duplicateOfStandard) {
           continue;
         }
         if (entry.baseUrl === baseUrl) {

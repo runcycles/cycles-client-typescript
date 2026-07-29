@@ -205,6 +205,7 @@ export interface CommitResponse {
   charged: Amount;
   released?: Amount;
   balances?: Balance[];
+  cyclesEvidence?: CyclesEvidenceRef;
 }
 
 export interface ReleaseResponse {

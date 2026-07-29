@@ -25,7 +25,15 @@ import {
   defaultJournalDir,
   type PendingCommitRecord,
 } from "./journal.js";
-import { ErrorCode, errorCodeFromString } from "./models.js";
+import {
+  ErrorCode,
+  errorCodeFromString,
+  isRetryableErrorCode,
+} from "./models.js";
+import {
+  isSchemaValidCommitSuccess,
+  isSchemaValidEventSuccess,
+} from "./settlement.js";
 
 /**
  * Upper bound on any honored server-requested or restored delay (1 hour).
@@ -42,9 +50,14 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** True when the response carries a recognized protocol error code. */
+/** True only for a recognized, non-retryable protocol rejection. */
 function hasRecognizedErrorCode(code: string | undefined): boolean {
-  return code !== undefined && errorCodeFromString(code) !== ErrorCode.UNKNOWN;
+  const parsed = errorCodeFromString(code);
+  return (
+    parsed !== undefined &&
+    parsed !== ErrorCode.UNKNOWN &&
+    !isRetryableErrorCode(parsed)
+  );
 }
 
 interface PendingCommit {
@@ -177,6 +190,26 @@ export class CommitRetryEngine {
       pending.retryAfterMs = clampDelay(retryAfterMs);
     }
     this._submit(pending);
+  }
+
+  /** Journal known actual spend before the first settlement request. */
+  persistPending(
+    reservationId: string,
+    commitBody: Record<string, unknown>,
+    eventFallbackBody?: Record<string, unknown>,
+  ): void {
+    this._journalRecord({
+      reservationId,
+      commitBody,
+      eventFallbackBody,
+      mode: "commit",
+      attempt: 0,
+    });
+  }
+
+  /** Remove a pre-journaled settlement after a terminal outcome. */
+  discardPending(reservationId: string): void {
+    this._journalDiscard(reservationId);
   }
 
   /** Deliver spend via POST /v1/events for a reservation that already expired. */
@@ -374,7 +407,7 @@ export class CommitRetryEngine {
     pending: PendingCommit,
     response: CyclesResponse,
   ): boolean {
-    if (response.isSuccess) {
+    if (isSchemaValidCommitSuccess(response)) {
       this._journalDiscard(pending.reservationId);
       return true;
     }
@@ -434,7 +467,7 @@ export class CommitRetryEngine {
     pending: PendingCommit,
     response: CyclesResponse,
   ): boolean {
-    if (response.isSuccess) {
+    if (isSchemaValidEventSuccess(response)) {
       this._journalDiscard(pending.reservationId);
       return true;
     }

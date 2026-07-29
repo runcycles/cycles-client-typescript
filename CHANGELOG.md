@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-07-28
+
+### Fixed
+
+- Heartbeat transport exceptions from both `withCycles` and `reserveForStream` are now reported with the reservation ID, error detail, and same-key retry disposition. Heartbeats remain non-fatal and retain their existing recovery timing, but a lost extend response is no longer invisible to operators.
+- Known actual usage is journaled before the first commit request. Commit and event settlement now require exact schema-valid HTTP 200/201 success; malformed 2xx responses retain the original idempotency key and durable record.
+- Journal filenames now use `v2-<sha256(exact UTF-8 reservation id)>.json`, with collision-safe legacy migration. Contradictory retryable 4xx envelopes retain the record.
+- Pull-request and release CI now run every shared durable-recovery and guarantee-boundary scenario; publishing is gated on conformance.
+- `CommitResponse` and its wire mapper now expose the optional `cycles_evidence` reference.
+- Unsupported or structurally invalid journal records are quarantined without
+  blocking valid replay, and the conformance adapter reports the exact native
+  test it executed instead of copying runner-owned oracle outcomes.
+
 ## [0.4.1] - 2026-07-27
 
 ### Fixed

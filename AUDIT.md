@@ -1,5 +1,11 @@
 # Cycles Protocol v0.1.25 — Client (TypeScript) Audit
 
+**Date:** 2026-07-28 (v0.4.2 — heartbeat transport exceptions in both
+`withCycles` and `reserveForStream` are no longer silently swallowed. The
+default warn/non-fatal policy is unchanged, but every thrown extend failure
+now reports the reservation ID, error detail, and same-key retry/stop
+disposition. Regression tests pin observability without terminating the
+guarded action or stream.),
 **Date:** 2026-07-28 (v0.4.1 — heartbeat aligned to the settled spec PR #148 (head `dd60c27`) HEARTBEAT GUIDANCE: server-authoritative scheduling from `remaining_ttl_ms` with a schema-valid-HTTP-200-only success predicate (ambiguous 2xx → same-key recovery), `next_delay = max(0, lead_floor − (2×attempt_budget + safety_margin))` where `attempt_budget = max(enforced per-attempt timeout, 1 s, 2×maxRtt)` and `safety_margin = max(1 s, 2×maxRtt)`, zero-delay guard (one immediate fresh attempt, then stop + surface), unclamped-`retry_window` recovery with exact-`Retry-After` 429 handling and 4xx stop-without-key-rotation, first beat from the create response's field using the create call's measured rtt, seamless heuristic fallback only when the field is absent. The `(grant, elapsed)` band stays a best-effort fallback: regime detection without the field is formally undecidable (sticky window `grant ∈ [0.75×min(ttl/2, 30 s), 0.9×ttl)`). 456 tests pass at 97.7% line coverage.),
 2026-07-27 (v0.4.1 — heartbeat measured-grant lead accounting (v2.3) fixes expiry drift and halves `max_extensions` consumption; spec review round 4: first beat fires immediately (delay 0 — any bounded delay can outlive a small capped lease) and cadence is regime-split (real per-extend grants tighten to `clamp(grant/2, 500 ms, ttl/2)`; lead-clamped grants — non-positive, or `< 0.9×ttl` and within the two-sided `0.75–1.25×`-elapsed band (Rust-port finding: an upper bound alone made the post-skip hold sticky) — hold at `min(ttl/2, 30 s)` with a once-per-heartbeat warn); the HTTP `Date` header is fully out of the heartbeat (`computeEffectiveTtlMs` deleted; `serverDateMs` stays as a general accessor); `extend_by_ms` always the requested ttl; permanent extend rejections (incl. `TENANT_CLOSED`, `NOT_FOUND`) stop the heartbeat; extend retries reuse the idempotency key; estimate-fallback commits marked `metadata.actual_source="estimate"`. 435 tests pass at 99.0% line coverage.),
 2026-07-27 (v0.4.0 — durable commit retries: on-disk pending-commit journal with next-run replay and POST /v1/events recovery; first-attempt 429/401/403 never release; Retry-After persisted; streaming commit() resolves on transient failures. Review round 2 adds `flushPendingCommits()`, unclassifiable-4xx retention, 410-by-status expiry, delay clamps, and journal-parse strictness. See the dated entries below. 407 tests pass at 99.0% line coverage.),
@@ -15,6 +21,15 @@
 **Server audit:** See `cycles-server/AUDIT.md` (all passing)
 
 ---
+
+## 2026-07-28 — heartbeat transport observability (v0.4.2)
+
+The heartbeat policy remains warn-and-continue: extend transport failure does
+not cancel user work and final settlement still runs. The two transport
+exception handlers now emit the reservation ID, normalized error, and whether
+the same-key recovery will retry (including its delay) or has stopped because
+the normative retry window is exhausted. This removes the only fleet path that
+lost the lease-safety signal without any forensic trail.
 
 ## 2026-07-28 — Server-authoritative heartbeat scheduling (`remaining_ttl_ms`, v0.4.1)
 

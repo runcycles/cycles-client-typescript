@@ -26,7 +26,7 @@ describe("CommitRetryEngine", () => {
     const mockClient = {
       commitReservation: vi
         .fn()
-        .mockResolvedValueOnce(CyclesResponse.httpError(500, "Server error"))
+        .mockRejectedValueOnce(new Error("response lost"))
         .mockResolvedValueOnce(CyclesResponse.success(200, { status: "COMMITTED" })),
     };
     engine.setClient(mockClient as any);
@@ -40,6 +40,9 @@ describe("CommitRetryEngine", () => {
     // Second retry after 200ms
     await vi.advanceTimersByTimeAsync(200);
     expect(mockClient.commitReservation).toHaveBeenCalledTimes(2);
+    expect(
+      mockClient.commitReservation.mock.calls.map((call) => call[1].idempotency_key),
+    ).toEqual(["c-1", "c-1"]);
   });
 
   it("stops on non-retryable client error", async () => {
