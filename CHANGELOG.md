@@ -15,6 +15,9 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.
 - Journal filenames now use `v2-<sha256(exact UTF-8 reservation id)>.json`, with collision-safe legacy migration. Contradictory retryable 4xx envelopes retain the record.
 - Pull-request and release CI now run every shared durable-recovery and guarantee-boundary scenario; publishing is gated on conformance.
 - `CommitResponse` and its wire mapper now expose the optional `cycles_evidence` reference.
+- Unsupported or structurally invalid journal records are quarantined without
+  blocking valid replay, and the conformance adapter reports the exact native
+  test it executed instead of copying runner-owned oracle outcomes.
 
 ## [0.4.1] - 2026-07-27
 

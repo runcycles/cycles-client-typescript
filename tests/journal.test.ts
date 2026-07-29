@@ -13,7 +13,10 @@ import {
 } from "../src/journal.js";
 import { AsyncCyclesLifecycle, buildEventFallbackBody } from "../src/lifecycle.js";
 import { CyclesResponse } from "../src/response.js";
-import { CommitRetryEngine } from "../src/retry.js";
+import {
+  _resetReplayStateForTests,
+  CommitRetryEngine,
+} from "../src/retry.js";
 import {
   isSchemaValidCommitSuccess,
   isSchemaValidEventSuccess,
@@ -194,26 +197,51 @@ describe("CommitJournal", () => {
     expect(journal.loadPending(BASE_URL)).toEqual([]);
   });
 
-  it("quarantines corrupt files as *.corrupt", () => {
+  it("quarantines corrupt and unsupported records without blocking valid replay", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const dir = path.join(defaultJournalDir(), "j");
     const journal = new CommitJournal(dir);
     journal.record(record("rsv_good"));
     fs.writeFileSync(path.join(dir, "rsv_bad.json"), "{not json", "utf-8");
+    fs.writeFileSync(
+      path.join(dir, "rsv_future.json"),
+      JSON.stringify({
+        version: 2,
+        reservation_id: "rsv_future",
+        base_url: BASE_URL,
+        mode: "commit",
+        commit_body: commitBody(),
+        recorded_at_ms: 1,
+      }),
+      "utf-8",
+    );
+    fs.writeFileSync(path.join(dir, "rsv_array.json"), "[]", "utf-8");
 
     const loaded = journal.loadPending(BASE_URL);
     expect(loaded.map((e) => e.reservationId)).toEqual(["rsv_good"]);
-    expect(fs.existsSync(path.join(dir, "rsv_bad.corrupt"))).toBe(true);
-    expect(fs.existsSync(path.join(dir, "rsv_bad.json"))).toBe(false);
+    for (const stem of ["rsv_bad", "rsv_future", "rsv_array"]) {
+      expect(fs.existsSync(path.join(dir, `${stem}.corrupt`))).toBe(true);
+      expect(fs.existsSync(path.join(dir, `${stem}.json`))).toBe(false);
+    }
+    expect(warnSpy).toHaveBeenCalledTimes(3);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("rsv_future.json"));
+    warnSpy.mockRestore();
   });
 
   it("quarantines semantically invalid records", () => {
     const dir = path.join(defaultJournalDir(), "j");
     fs.mkdirSync(dir, { recursive: true });
     const cases: Record<string, string> = {
-      "no_rid.json": '{"reservation_id": "", "mode": "commit", "commit_body": {}}',
-      "bad_mode.json": '{"reservation_id": "r1", "mode": "sideways", "commit_body": {}}',
-      "commit_no_body.json": '{"reservation_id": "r2", "mode": "commit"}',
-      "event_no_body.json": '{"reservation_id": "r3", "mode": "event", "commit_body": {}}',
+      "no_rid.json":
+        '{"version": 1, "reservation_id": "", "mode": "commit", "commit_body": {}}',
+      "bad_mode.json":
+        '{"version": 1, "reservation_id": "r1", "mode": "sideways", "commit_body": {}}',
+      "commit_no_body.json":
+        '{"version": 1, "reservation_id": "r2", "mode": "commit"}',
+      "event_no_body.json":
+        '{"version": 1, "reservation_id": "r3", "mode": "event", "commit_body": {}}',
+      "bad_timestamp.json":
+        '{"version": 1, "reservation_id": "r4", "mode": "commit", "commit_body": {}, "recorded_at_ms": "now"}',
     };
     for (const [name, content] of Object.entries(cases)) {
       fs.writeFileSync(path.join(dir, name), content, "utf-8");
@@ -257,7 +285,7 @@ describe("CommitJournal", () => {
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(
       path.join(dir, "null_mode.json"),
-      '{"reservation_id": "r1", "mode": null, "commit_body": {}}',
+      '{"version": 1, "reservation_id": "r1", "mode": null, "commit_body": {}}',
       "utf-8",
     );
     const journal = new CommitJournal(dir);
@@ -270,9 +298,10 @@ describe("CommitJournal", () => {
     const dir = path.join(defaultJournalDir(), "j");
     fs.mkdirSync(dir, { recursive: true });
     const cases: Record<string, string> = {
-      "array_commit.json": '{"reservation_id": "r1", "mode": "commit", "commit_body": []}',
+      "array_commit.json":
+        '{"version": 1, "reservation_id": "r1", "mode": "commit", "commit_body": []}',
       "array_event.json":
-        '{"reservation_id": "r2", "mode": "event", "commit_body": {}, "event_fallback_body": []}',
+        '{"version": 1, "reservation_id": "r2", "mode": "event", "commit_body": {}, "event_fallback_body": []}',
     };
     for (const [name, content] of Object.entries(cases)) {
       fs.writeFileSync(path.join(dir, name), content, "utf-8");
@@ -470,7 +499,13 @@ describe("CommitRetryEngine durability", () => {
     const engine = new CommitRetryEngine(makeConfig());
     const client = makeMockClient();
     client.commitReservation.mockResolvedValue(expiredResponse());
-    client.createEvent.mockResolvedValue(eventSuccess());
+    client.createEvent.mockImplementation(async () => {
+      const persisted = new CommitJournal(identityDir()).loadPending(BASE_URL);
+      expect(persisted).toHaveLength(1);
+      expect(persisted[0].mode).toBe("event");
+      expect(persisted[0].eventFallbackBody).toEqual(eventBody());
+      return eventSuccess();
+    });
     engine.setClient(client as never);
 
     engine.schedule("rsv_1", commitBody(), eventBody());
@@ -940,7 +975,11 @@ describe("journal replay", () => {
   });
 
   it("survives API-key rotation when a tenant is configured", async () => {
-    new CommitJournal(identityDir("old-key", BASE_URL, "acme")).record(record("rsv_old"));
+    const oldIdentityDir = identityDir("old-key", BASE_URL, "acme");
+    new CommitJournal(oldIdentityDir).record(record("rsv_old"));
+    const persisted = path.join(oldIdentityDir, fs.readdirSync(oldIdentityDir)[0]);
+    expect(persisted).not.toContain("old-key");
+    expect(fs.readFileSync(persisted, "utf-8")).not.toContain("old-key");
 
     const engine = new CommitRetryEngine(makeConfig({ apiKey: "rotated-key", tenant: "acme" }));
     const client = makeMockClient();
@@ -975,6 +1014,42 @@ describe("journal replay", () => {
     expect(client.commitReservation).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(1_000);
     expect(client.commitReservation).toHaveBeenCalledTimes(2);
+    expect(journalFiles()).toHaveLength(0);
+  });
+
+  it("concurrent replay workers reuse one key and remove the record", async () => {
+    new CommitJournal(identityDir()).record(record("rsv_old"));
+    const seenKeys: string[] = [];
+    let releaseBoth!: () => void;
+    const bothArrived = new Promise<void>((resolve) => {
+      releaseBoth = resolve;
+    });
+    const client = makeMockClient();
+    client.commitReservation.mockImplementation(
+      async (_reservationId: string, body: Record<string, unknown>) => {
+        seenKeys.push(String(body.idempotency_key));
+        if (seenKeys.length === 2) releaseBoth();
+        await bothArrived;
+        return commitSuccess();
+      },
+    );
+
+    const first = new CommitRetryEngine(makeConfig());
+    first.setClient(client as never);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(client.commitReservation).toHaveBeenCalledTimes(1);
+
+    // Model a separate process: the second worker carries no in-memory
+    // replay claim, only the still-present durable record.
+    _resetReplayStateForTests();
+    const second = new CommitRetryEngine(makeConfig());
+    second.setClient(client as never);
+    await vi.advanceTimersByTimeAsync(100);
+    await Promise.all([first.flush(1_000), second.flush(1_000)]);
+
+    expect(seenKeys).toEqual(["ck-1", "ck-1"]);
+    expect(new Set(seenKeys).size).toBe(1);
+    expect(journalFiles()).toHaveLength(0);
   });
 
   it("does not replay when retry is disabled", () => {
@@ -1249,6 +1324,10 @@ describe("lifecycle commit wiring", () => {
     expect(rid).toBe("rsv_test");
     expect((body.metadata as Record<string, unknown>).recovered_reservation_id).toBe("rsv_test");
     expect(body.subject).toEqual({ tenant: "acme" });
+    expect(body.action).toEqual({ kind: "unknown", name: "unknown" });
+    expect(body.actual).toEqual({ unit: "USD_MICROCENTS", amount: 1000 });
+    const persisted = engine.persistPending.mock.calls[0][1] as Record<string, unknown>;
+    expect(body.idempotency_key).toBe(persisted.idempotency_key);
     expect(client.releaseReservation).not.toHaveBeenCalled();
     warnSpy.mockRestore();
   });

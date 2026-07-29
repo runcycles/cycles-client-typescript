@@ -142,7 +142,14 @@ function recordToJson(record: PendingCommitRecord): string {
 }
 
 function recordFromJson(raw: string): PendingCommitRecord {
-  const data = JSON.parse(raw) as Record<string, unknown>;
+  const parsed = JSON.parse(raw) as unknown;
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("journal record must be a JSON object");
+  }
+  const data = parsed as Record<string, unknown>;
+  if (data.version !== RECORD_VERSION) {
+    throw new Error(`unsupported journal version: ${String(data.version)}`);
+  }
   const reservationId = data.reservation_id;
   // An absent mode defaults to "commit"; an explicit null is rejected
   // below like any other invalid mode (parity with the Python/Java SDKs).
@@ -155,9 +162,17 @@ function recordFromJson(raw: string): PendingCommitRecord {
   }
   const commitBody = data.commit_body;
   const eventFallbackBody = data.event_fallback_body;
-  // Arrays satisfy typeof === "object" but are not valid request bodies.
-  if (Array.isArray(commitBody) || Array.isArray(eventFallbackBody)) {
-    throw new Error("journal record has array-valued body");
+  for (const [name, body] of [
+    ["commit_body", commitBody],
+    ["event_fallback_body", eventFallbackBody],
+  ] as const) {
+    if (
+      body !== undefined &&
+      body !== null &&
+      (typeof body !== "object" || Array.isArray(body))
+    ) {
+      throw new Error(`journal record has invalid ${name}`);
+    }
   }
   if (mode === "commit" && (commitBody === null || typeof commitBody !== "object")) {
     throw new Error("commit-mode journal record missing commit_body");
@@ -168,7 +183,24 @@ function recordFromJson(raw: string): PendingCommitRecord {
   ) {
     throw new Error("event-mode journal record missing event_fallback_body");
   }
+  if (data.base_url !== undefined && typeof data.base_url !== "string") {
+    throw new Error("journal record has invalid base_url");
+  }
+  const recordedAtRaw = data.recorded_at_ms;
+  if (
+    recordedAtRaw !== undefined &&
+    (!Number.isSafeInteger(recordedAtRaw) || (recordedAtRaw as number) < 0)
+  ) {
+    throw new Error("journal record has invalid recorded_at_ms");
+  }
   const notBeforeRaw = data.not_before_ms;
+  if (
+    notBeforeRaw !== undefined &&
+    notBeforeRaw !== null &&
+    (!Number.isSafeInteger(notBeforeRaw) || (notBeforeRaw as number) < 0)
+  ) {
+    throw new Error("journal record has invalid not_before_ms");
+  }
   return {
     reservationId,
     baseUrl: typeof data.base_url === "string" ? data.base_url : "",
@@ -177,8 +209,8 @@ function recordFromJson(raw: string): PendingCommitRecord {
     eventFallbackBody: (eventFallbackBody ?? undefined) as
       | Record<string, unknown>
       | undefined,
-    recordedAtMs: typeof data.recorded_at_ms === "number" ? data.recorded_at_ms : 0,
-    notBeforeMs: typeof notBeforeRaw === "number" ? notBeforeRaw : undefined,
+    recordedAtMs: (recordedAtRaw as number | undefined) ?? 0,
+    notBeforeMs: (notBeforeRaw as number | null | undefined) ?? undefined,
   };
 }
 

@@ -626,14 +626,21 @@ describe("AsyncCyclesLifecycle", () => {
     client.commitReservation.mockResolvedValue(
       CyclesResponse.success(200, { status: "COMMITTED" }),
     );
-    client.extendReservation.mockRejectedValue(new Error("extend failed"));
+    client.extendReservation
+      .mockRejectedValueOnce(new Error("extend failed"))
+      .mockResolvedValueOnce(
+        CyclesResponse.success(200, {
+          status: "ACTIVE",
+          expires_at_ms: 1_000_000_000,
+        }),
+      );
 
     const retryEngine = makeRetryEngine();
     const lifecycle = new AsyncCyclesLifecycle(client as any, retryEngine, { tenant: "acme" });
 
     const result = await lifecycle.execute(
       async () => {
-        await vi.advanceTimersByTimeAsync(31000);
+        await vi.advanceTimersByTimeAsync(61000);
         return "ok";
       },
       [],
@@ -641,12 +648,18 @@ describe("AsyncCyclesLifecycle", () => {
     );
 
     expect(result).toBe("ok");
-    expect(client.extendReservation).toHaveBeenCalled();
+    expect(client.extendReservation.mock.calls.length).toBeGreaterThanOrEqual(2);
+    const firstTwoKeys = client.extendReservation.mock.calls
+      .slice(0, 2)
+      .map((call) => (call[1] as Record<string, unknown>).idempotency_key);
+    expect(firstTwoKeys[0]).toBe(firstTwoKeys[1]);
+    expect(client.commitReservation).toHaveBeenCalledTimes(1);
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining(
         "Heartbeat extend transport error; retrying next beat with the same key",
       ),
     );
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("r-hb-fail"));
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining("Error: extend failed"),
     );
@@ -2200,6 +2213,7 @@ describe("AsyncCyclesLifecycle", () => {
     );
 
     const retryEngine = makeRetryEngine();
+    const scheduleEventSpy = vi.spyOn(retryEngine, "scheduleEvent");
     const lifecycle = new AsyncCyclesLifecycle(client as any, retryEngine, { tenant: "acme" });
 
     await expect(
@@ -2208,6 +2222,9 @@ describe("AsyncCyclesLifecycle", () => {
         useEstimateIfActualNotProvided: false,
       }),
     ).rejects.toThrow("actual expression is required");
+    expect(client.commitReservation).not.toHaveBeenCalled();
+    expect(scheduleEventSpy).not.toHaveBeenCalled();
+    expect(client.releaseReservation).toHaveBeenCalledOnce();
   });
 
   // --- estimate-committed-as-actual marker tests ---
