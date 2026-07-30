@@ -1,6 +1,7 @@
 [![npm](https://img.shields.io/npm/v/runcycles)](https://www.npmjs.com/package/runcycles)
 [![npm Downloads](https://img.shields.io/npm/dm/runcycles)](https://www.npmjs.com/package/runcycles)
 [![CI](https://github.com/runcycles/cycles-client-typescript/actions/workflows/ci.yml/badge.svg)](https://github.com/runcycles/cycles-client-typescript/actions)
+[![Recovery conformance](https://img.shields.io/github/actions/workflow/status/runcycles/cycles-client-typescript/ci.yml?branch=main&label=recovery%20conformance)](https://runcycles.io/protocol/sdk-recovery-conformance)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 [![Coverage](https://img.shields.io/badge/coverage-98%25-brightgreen)](https://github.com/runcycles/cycles-client-typescript/actions)
 

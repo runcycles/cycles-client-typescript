@@ -1,5 +1,10 @@
 # Cycles Protocol v0.1.25 — Client (TypeScript) Audit
 
+**Date:** 2026-07-30 (no runtime change — the durable recovery CI job now
+emits and uploads the profile 0.3 machine-readable evidence report even on
+failure, and the README links its recovery-conformance badge to the public SDK
+matrix. The report binds all 12 scenarios and exact native tests to the SDK
+commit, protocol commit, catalog digest, and Actions run.),
 **Date:** 2026-07-28 (v0.4.2 — heartbeat transport exceptions in both
 `withCycles` and `reserveForStream` are no longer silently swallowed. The
 default warn/non-fatal policy is unchanged, but every thrown extend failure
