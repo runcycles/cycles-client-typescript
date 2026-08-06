@@ -521,7 +521,8 @@ describe("AsyncCyclesLifecycle", () => {
     expect(result).toBe("ok");
   });
 
-  it("releases reservation on other client commit errors", async () => {
+  it("does not release known spend on recognized client commit errors", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     const client = makeMockClient();
     client.createReservation.mockResolvedValue(
       CyclesResponse.success(200, {
@@ -537,18 +538,13 @@ describe("AsyncCyclesLifecycle", () => {
         request_id: "req-1",
       }),
     );
-    client.releaseReservation.mockResolvedValue(
-      CyclesResponse.success(200, { status: "RELEASED" }),
-    );
-
     const retryEngine = makeRetryEngine();
     const lifecycle = new AsyncCyclesLifecycle(client as any, retryEngine, { tenant: "acme" });
 
     const result = await lifecycle.execute(async () => "ok", [], { estimate: 1000 });
     expect(result).toBe("ok");
-    expect(client.releaseReservation).toHaveBeenCalledOnce();
-    const releaseArgs = client.releaseReservation.mock.calls[0];
-    expect(releaseArgs[0]).toBe("r-1");
+    expect(client.releaseReservation).not.toHaveBeenCalled();
+    errorSpy.mockRestore();
   });
 
   it("schedules retry when commit throws an exception", async () => {
@@ -2199,32 +2195,119 @@ describe("AsyncCyclesLifecycle", () => {
     expect(commitBody.actual.amount).toBe(777);
   });
 
-  it("throws when actual is undefined and useEstimateIfActualNotProvided is false", async () => {
+  it("rejects missing required actual before reserving or running the action", async () => {
     const client = makeMockClient();
-    client.createReservation.mockResolvedValue(
-      CyclesResponse.success(200, {
-        decision: "ALLOW",
-        reservation_id: "r-1",
-        affected_scopes: [],
-      }),
-    );
-    client.releaseReservation.mockResolvedValue(
-      CyclesResponse.success(200, { status: "RELEASED" }),
-    );
-
     const retryEngine = makeRetryEngine();
     const scheduleEventSpy = vi.spyOn(retryEngine, "scheduleEvent");
     const lifecycle = new AsyncCyclesLifecycle(client as any, retryEngine, { tenant: "acme" });
+    const action = vi.fn(async () => "result");
 
     await expect(
-      lifecycle.execute(async () => "result", [], {
+      lifecycle.execute(action, [], {
         estimate: 1000,
         useEstimateIfActualNotProvided: false,
       }),
     ).rejects.toThrow("actual expression is required");
+    expect(action).not.toHaveBeenCalled();
+    expect(client.createReservation).not.toHaveBeenCalled();
     expect(client.commitReservation).not.toHaveBeenCalled();
     expect(scheduleEventSpy).not.toHaveBeenCalled();
-    expect(client.releaseReservation).toHaveBeenCalledOnce();
+    expect(client.releaseReservation).not.toHaveBeenCalled();
+  });
+
+  it("commits the estimate when an actual callback fails after the action", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-actual-fallback",
+        affected_scopes: [],
+      }),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+
+    const lifecycle = new AsyncCyclesLifecycle(client as any, makeRetryEngine(), {
+      tenant: "acme",
+    });
+
+    await expect(
+      lifecycle.execute(async () => "spent", [], {
+        estimate: 1000,
+        actual: () => {
+          throw new Error("usage parser failed");
+        },
+      }),
+    ).resolves.toBe("spent");
+
+    const commitBody = client.commitReservation.mock.calls[0][1];
+    expect(commitBody.actual).toEqual({ unit: "USD_MICROCENTS", amount: 1000 });
+    expect(commitBody.metadata).toEqual({ actual_source: "estimate" });
+    expect(client.releaseReservation).not.toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("Actual evaluation failed"),
+      expect.any(Error),
+    );
+  });
+
+  it("commits the estimate when an actual callback returns a non-finite amount", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-invalid-actual",
+        affected_scopes: [],
+      }),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+
+    const lifecycle = new AsyncCyclesLifecycle(client as any, makeRetryEngine(), {
+      tenant: "acme",
+    });
+    await lifecycle.execute(async () => "spent", [], {
+      estimate: 1000,
+      actual: () => Number.NaN,
+    });
+
+    const commitBody = client.commitReservation.mock.calls[0][1];
+    expect(commitBody.actual.amount).toBe(1000);
+    expect(commitBody.metadata.actual_source).toBe("estimate");
+    expect(client.releaseReservation).not.toHaveBeenCalled();
+  });
+
+  it("does not release when durable settlement setup fails after the action", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-journal-fail",
+        affected_scopes: [],
+      }),
+    );
+
+    const retryEngine = makeRetryEngine();
+    vi.spyOn(retryEngine, "persistPending").mockImplementation(() => {
+      throw new Error("journal unavailable");
+    });
+    const lifecycle = new AsyncCyclesLifecycle(client as any, retryEngine, {
+      tenant: "acme",
+    });
+
+    await expect(
+      lifecycle.execute(async () => "spent", [], { estimate: 1000 }),
+    ).rejects.toThrow("journal unavailable");
+    expect(client.commitReservation).not.toHaveBeenCalled();
+    expect(client.releaseReservation).not.toHaveBeenCalled();
+    expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining("not releasing known spend"),
+      expect.any(Error),
+    );
   });
 
   // --- estimate-committed-as-actual marker tests ---

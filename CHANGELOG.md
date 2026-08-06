@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.4.3] - 2026-08-06
+
+### Fixed
+
+- `withCycles` no longer releases a reservation after a recognized terminal
+  commit rejection. The guarded function has already spent the resource, so
+  returning its reserved budget would undercount known spend.
+- `StreamReservation.commit()` still surfaces a recognized terminal rejection,
+  but keeps the handle finalized. A broad caller catch can no longer turn the
+  failed settlement into a release of known spend.
+- `withCycles` now releases only when the guarded function itself fails.
+  Post-action settlement/setup failures never return budget for work that
+  already ran; a failing or invalid `actual` callback falls back to the
+  validated estimate and records `metadata.actual_source="estimate"`.
+- A configuration that disables estimate fallback without providing `actual`
+  is rejected before a reservation is created or the guarded function runs.
+- `StreamReservation.commit()` now replaces a non-finite, negative, fractional,
+  or unsafe-integer actual with the validated estimate and an
+  `actual_source="estimate"` marker instead of journaling an invalid amount.
+
+### Tests and docs
+
+- Regression tests pin no-release behavior for lifecycle, post-action, and
+  streaming paths.
+- README settlement tables and error guidance now distinguish handler failure
+  (release) from post-action commit rejection (never release).
+- The development lockfile updates `brace-expansion` to 5.0.9, clearing the
+  current high-severity expansion DoS advisories; published runtime
+  dependencies are unchanged.
+
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/).

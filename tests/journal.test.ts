@@ -1390,7 +1390,7 @@ describe("lifecycle commit wiring", () => {
     errorSpy.mockRestore();
   });
 
-  it("still releases on a genuine rejection", async () => {
+  it("never releases known spend on a genuine commit rejection", async () => {
     const { lifecycle, client, engine } = makeLifecycle();
     client.createReservation.mockResolvedValue(allowResponse());
     client.commitReservation.mockResolvedValue(
@@ -1406,6 +1406,6 @@ describe("lifecycle commit wiring", () => {
 
     expect(engine.schedule).not.toHaveBeenCalled();
     expect(engine.scheduleEvent).not.toHaveBeenCalled();
-    expect(client.releaseReservation).toHaveBeenCalledTimes(1);
+    expect(client.releaseReservation).not.toHaveBeenCalled();
   });
 });

@@ -99,8 +99,9 @@ export interface StreamReservation {
    * (codeless or unrecognized error codes) are handled internally —
    * journaled and retried in the background (with a `POST /v1/events`
    * fallback once the reservation has expired) — and resolve normally.
-   * Only genuine rejections carrying a recognized protocol error code
-   * (e.g. UNIT_MISMATCH) reset `finalized` and throw.
+   * Genuine rejections carrying a recognized protocol error code (e.g.
+   * UNIT_MISMATCH) discard the unrecoverable journal entry and throw, but
+   * remain finalized so a broad catch cannot release known spend.
    */
   commit(
     actual: number,
@@ -732,17 +733,32 @@ export async function reserveForStream(
       if (finalized) {
         throw new CyclesError("StreamReservation already finalized");
       }
+      let settledActual = actual;
+      let settledMetadata = metadata;
+      try {
+        validateNonNegative(actual, "actual");
+      } catch (err) {
+        // The stream has already consumed resources. An invalid caller-side
+        // measurement must not strand or release the reservation; settle the
+        // validated estimate and mark the evidence instead.
+        settledActual = estimate;
+        settledMetadata = { ...(metadata ?? {}), actual_source: "estimate" };
+        console.warn(
+          `[runcycles] Stream actual is invalid; committing the estimate instead: ${reservationId}`,
+          err,
+        );
+      }
       finalized = true;
       stopHeartbeat();
       const commitBody: Record<string, unknown> = {
         idempotency_key: randomUUID(),
-        actual: { unit, amount: actual },
+        actual: { unit, amount: settledActual },
       };
       if (metrics && !isMetricsEmpty(metrics)) {
         commitBody.metrics = metricsToWire(metrics);
       }
-      if (metadata) {
-        commitBody.metadata = metadata;
+      if (settledMetadata) {
+        commitBody.metadata = settledMetadata;
       }
       const eventFallback = buildEventFallbackBody(
         reservationId,
@@ -830,14 +846,10 @@ export async function reserveForStream(
         !isRetryableErrorCode(parsedErrorCode)
       ) {
         // Genuine rejection (e.g. UNIT_MISMATCH — a recognized protocol
-        // code): reset finalized so the caller can correct and retry
-        // commit or fall back to release. The heartbeat is NOT restarted
-        // to avoid spawning duplicate heartbeat chains (an old in-flight
-        // extend's .finally→tick could race with a new startHeartbeat
-        // call). The reservation's remaining TTL should give the caller
-        // enough time to retry or release.
+        // code): the retry engine cannot fix the malformed commit. The spend
+        // already happened, so keep the handle finalized; a broad caller
+        // catch must not be able to release the reserved budget.
         retryEngine.discardPending(reservationId);
-        finalized = false;
         throw new CyclesError(
           `Commit failed with status ${response.status}: ${response.errorMessage ?? "unknown error"}`,
         );

@@ -43,6 +43,20 @@ describe("validation", () => {
     it("throws with negative", () => {
       expect(() => validateNonNegative(-1, "estimate")).toThrow("non-negative");
     });
+
+    it.each([Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
+      "throws with non-finite value %s",
+      (value) => {
+        expect(() => validateNonNegative(value, "estimate")).toThrow("finite");
+      },
+    );
+
+    it.each([1.5, Number.MAX_SAFE_INTEGER + 1])(
+      "throws with non-safe-integer value %s",
+      (value) => {
+        expect(() => validateNonNegative(value, "estimate")).toThrow("safe integer");
+      },
+    );
   });
 
   describe("validateTtlMs", () => {
