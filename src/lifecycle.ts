@@ -600,6 +600,22 @@ export class AsyncCyclesLifecycle {
   ): Promise<T> {
     const estimate = evaluateAmount(cfg.estimate, args);
 
+    // Configuration errors must fail before a reservation exists. Otherwise a
+    // successful guarded action could be followed by a missing-actual error and
+    // the generic failure path would incorrectly return budget for known spend.
+    if (
+      !cfg.dryRun &&
+      cfg.actual === undefined &&
+      cfg.useEstimateIfActualNotProvided === false
+    ) {
+      throw new Error(
+        "actual expression is required when useEstimateIfActualNotProvided is false",
+      );
+    }
+    if (!cfg.dryRun && typeof cfg.actual === "number") {
+      validateNonNegative(cfg.actual, "actual");
+    }
+
     const createBody = buildReservationBody(
       cfg,
       estimate,
@@ -677,18 +693,36 @@ export class AsyncCyclesLifecycle {
       ctx,
     );
 
+    let guardedFunctionCompleted = false;
     try {
       const result = await runWithContext(ctx, () => fn(...args));
+      guardedFunctionCompleted = true;
       const methodElapsed = Math.round(performance.now() - resT2);
 
       // Resolve actual
       const useEstimateFallback = cfg.useEstimateIfActualNotProvided !== false;
-      const { amount: actualAmount, usedEstimateFallback } = evaluateActual(
-        cfg.actual,
-        result,
-        estimate,
-        useEstimateFallback,
-      );
+      let actualAmount: number;
+      let usedEstimateFallback: boolean;
+      try {
+        const resolved = evaluateActual(
+          cfg.actual,
+          result,
+          estimate,
+          useEstimateFallback,
+        );
+        validateNonNegative(resolved.amount, "actual");
+        ({ amount: actualAmount, usedEstimateFallback } = resolved);
+      } catch (err) {
+        // The action already ran. Preserve the spend by committing the validated
+        // estimate instead of releasing or losing the reservation because a
+        // user-supplied post-action accounting callback failed.
+        actualAmount = estimate;
+        usedEstimateFallback = true;
+        console.warn(
+          `[runcycles] Actual evaluation failed after the guarded action completed; committing the estimate instead: ${reservationId}`,
+          err,
+        );
+      }
 
       // Build commit
       let metrics = ctx.metrics;
@@ -727,7 +761,14 @@ export class AsyncCyclesLifecycle {
 
       return result;
     } catch (err) {
-      await this._handleRelease(reservationId, "guarded_method_failed");
+      if (!guardedFunctionCompleted) {
+        await this._handleRelease(reservationId, "guarded_method_failed");
+      } else {
+        console.error(
+          `[runcycles] Post-action settlement failed; not releasing known spend: ${reservationId}`,
+          err,
+        );
+      }
       throw err;
     } finally {
       if (heartbeatRef) {
@@ -827,12 +868,12 @@ export class AsyncCyclesLifecycle {
           parsedErrorCode !== ErrorCode.UNKNOWN &&
           !isRetryableErrorCode(parsedErrorCode)
         ) {
-          // Recognized protocol code — a genuine rejection the retry
-          // engine cannot fix. Releasing returns the reserved budget.
+          // Recognized protocol code — a genuine rejection the retry engine
+          // cannot fix. The guarded function has already spent the resource,
+          // so releasing here would return budget for known spend.
           this._retryEngine.discardPending(reservationId);
-          await this._handleRelease(
-            reservationId,
-            `commit_rejected_${errorCode}`,
+          console.error(
+            `[runcycles] Commit was rejected after spend was recorded locally (error=${String(errorCode)}); not releasing known spend: ${reservationId}`,
           );
           return;
         }

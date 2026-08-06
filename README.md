@@ -83,10 +83,12 @@ const result = await callLlm("Hello", 100);
 | Reservation denied | **Neither** | `BudgetExceededError`, `OverdraftLimitExceededError`, or `DebtOutstandingError` thrown; function never executes |
 | `dryRun: true`, any decision | **Neither** | Returns `DryRunResult` or throws; no real reservation created |
 | Function returns successfully | **Commit** | Actual amount charged; unused remainder auto-released |
-| Function throws any error | **Release** | Full reserved amount returned to budget; error re-thrown |
+| Guarded function throws | **Release** | Full reserved amount returned to budget; error re-thrown |
+| Post-action settlement setup throws | **Neither** | Error surfaces, but known spend is never released |
+| `actual` callback throws or returns an invalid amount | **Commit estimate** | Commit carries `metadata.actual_source="estimate"` |
 | Commit fails (5xx / network) | **Retry** | Exponential backoff with configurable attempts |
-| Commit fails (non-retryable 4xx) | **Release** | Reservation released after non-retryable client error |
-| Commit gets RESERVATION_EXPIRED | **Neither** | Server already reclaimed budget on TTL expiry |
+| Commit fails (recognized non-retryable 4xx) | **Neither** | Retry stops and the journal entry is discarded, but known spend is never released |
+| Commit gets RESERVATION_EXPIRED | **Event recovery** | Spend is recorded through `POST /v1/events` because the server already reclaimed the expired reservation |
 | Commit gets RESERVATION_FINALIZED | **Neither** | Already committed or released (idempotent replay) |
 | Commit gets IDEMPOTENCY_MISMATCH | **Neither** | Previous commit already processed; no release attempted |
 
@@ -146,7 +148,8 @@ try {
 ```
 
 The handle is **once-only and race-safe**: in streaming code, multiple terminal paths can fire concurrently (onFinish, error handler, abort signal). Only the first terminal call wins:
-- `commit()` throws `CyclesError` if already finalized (dropping a commit silently hides bugs). If `commit()` fails due to a network or server error, `finalized` resets to `false` so you can retry — but the heartbeat is **not** restarted (restart it manually if needed)
+- `commit()` throws `CyclesError` if already finalized (dropping a commit silently hides bugs). Transient commit failures are durably queued and resolve normally. A recognized terminal rejection throws but leaves `finalized` true, so a broad catch cannot release known spend.
+- An invalid `commit(actual)` amount falls back to the reserved estimate and adds `metadata.actual_source="estimate"`; the handle never journals an invalid amount after the stream ran.
 - `release()` is a silent no-op if already finalized (best-effort by design)
 - `dispose()` stops the heartbeat only, for startup failures before streaming begins
 - `handle.finalized` — check whether the handle has been finalized
@@ -319,7 +322,9 @@ interface WithCyclesConfig {
   estimate: number | ((...args) => number);  // Estimated cost (static or computed from args)
 
   // Actual cost — optional (defaults to estimate if not provided)
-  actual?: number | ((result) => number);    // Actual cost (static or computed from result)
+  actual?: number | ((result) => number);    // Actual cost (static or computed from result).
+                                             // Callback failure/invalid output after the action
+                                             // safely falls back to the estimate.
   useEstimateIfActualNotProvided?: boolean;  // Default: true — use estimate as actual.
                                              // When this fallback is taken the commit carries
                                              // metadata.actual_source = "estimate" so estimated
@@ -472,14 +477,14 @@ try {
 | `DebtOutstandingError` | Outstanding debt blocks new reservations |
 | `ReservationExpiredError` | Operating on an expired reservation |
 | `ReservationFinalizedError` | Operating on an already-committed/released reservation |
-| `TenantClosedError` | The owning tenant is CLOSED (HTTP 409 `TENANT_CLOSED`, runtime spec v0.1.25.13); thrown at reservation time by `withCycles` / `reserveForStream` — commit-time client errors are handled/released internally, and `StreamReservation.commit()` throws generic `CyclesError` |
+| `TenantClosedError` | The owning tenant is CLOSED (HTTP 409 `TENANT_CLOSED`, runtime spec v0.1.25.13); thrown at reservation time by `withCycles` / `reserveForStream` — commit-time client errors never release known spend, and `StreamReservation.commit()` throws generic `CyclesError` for recognized terminal rejection |
 | `CyclesTransportError` | Exported for use in your own code; never thrown by the SDK — transport failures surface as `status === -1` (see below) |
 
 ### Transport failures (status -1)
 
 Transport failures (DNS failure, timeout, connection refused) do not surface as a distinct exception class. The SDK never throws `CyclesTransportError` itself — the class is exported for use in your own code (e.g. wrapping transport-level failures in higher-level integrations). Instead:
 
-- **`withCycles` / `reserveForStream`** throw `CyclesProtocolError` with `status === -1` and `errorCode` `undefined` for **reservation-time** transport failures. Commit-time failures differ: `withCycles` retries the commit in the background (fire-and-forget), while `StreamReservation.commit()` throws and resets `finalized` so you can retry or `release()`.
+- **`withCycles` / `reserveForStream`** throw `CyclesProtocolError` with `status === -1` and `errorCode` `undefined` for **reservation-time** transport failures. Commit-time transient failures are journaled for recovery. `StreamReservation.commit()` throws only for recognized terminal rejection and remains finalized so the caller cannot release known spend.
 - **Programmatic `CyclesClient` calls** never throw on transport failure — they return a `CyclesResponse` with `isTransportError` set and `status` of `-1` (see below).
 
 ### With `CyclesClient` (programmatic)
@@ -725,7 +730,7 @@ A commit records spend that has already happened, so the SDK never lets one exis
 - **Rate limiting:** 429 / `LIMIT_EXCEEDED` is transient everywhere — a rate-limited first commit is scheduled for retry (never released, which would return budget for spend that already happened), and the next attempt waits at least the server's `Retry-After`. The floor is persisted as an absolute timestamp, so a restart mid-wait still honors it.
 - **Authentication failures:** 401/403 on any commit attempt journals the spend (never releases it) and stops the current run's attempts, so spend recorded during a key misconfiguration or rotation window replays once credentials are fixed.
 - **Expired reservations:** a commit answered `RESERVATION_EXPIRED` (or a bodyless HTTP 410) — where the server has already returned the reserved budget to the pool — is recovered via `POST /v1/events` (the protocol's post-hoc direct-debit endpoint), reusing the commit's idempotency key and tagging `metadata.recovered_reservation_id` for reconciliation.
-- **Genuine rejections** — 4xx responses carrying a **recognized** protocol error code (e.g. `UNIT_MISMATCH`) — stop retries and discard the journal entry — retrying cannot fix a malformed commit. Codeless, mangled, or unknown (forward-compat) error codes are *not* treated as rejections: the spend record is journaled and retained for replay instead of being released or discarded.
+- **Genuine rejections** — 4xx responses carrying a **recognized** protocol error code (e.g. `UNIT_MISMATCH`) — stop retries and discard the journal entry because retrying cannot fix a malformed commit. They never release the reservation after the guarded action has spent the resource. Codeless, mangled, or unknown (forward-compat) error codes are *not* treated as rejections: the spend record is journaled and retained for replay instead of being released or discarded.
 - **Delay clamp:** any server-requested wait (`Retry-After`, persisted floors) is honored for at most 1 hour.
 - Applies to `withCycles` **and** the streaming adapter's `handle.commit()`; the programmatic client (`client.commitReservation`) stays manual.
 - Retry timers are ref'd, so a naturally-draining Node process waits for in-flight retries; `process.exit()`, crashes, and signals are covered by journal replay on the next run. Set `journalEnabled: false` (or `CYCLES_JOURNAL_ENABLED=false`) to opt out.

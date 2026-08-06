@@ -117,6 +117,40 @@ describe("reserveForStream", () => {
     expect(client.extendReservation).not.toHaveBeenCalled();
   });
 
+  it("commits the estimate with an audit marker when actual is invalid", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const client = makeMockClient();
+    client.createReservation.mockResolvedValue(
+      CyclesResponse.success(200, {
+        decision: "ALLOW",
+        reservation_id: "r-stream-invalid-actual",
+        affected_scopes: [],
+      }),
+    );
+    client.commitReservation.mockResolvedValue(
+      CyclesResponse.success(200, { status: "COMMITTED" }),
+    );
+
+    const handle = await reserveForStream({
+      client: client as any,
+      estimate: 3000,
+      tenant: "acme",
+    });
+    await handle.commit(Number.NaN, undefined, { trace_id: "trace-1" });
+
+    const commitBody = client.commitReservation.mock.calls[0][1];
+    expect(commitBody.actual).toEqual({ unit: "USD_MICROCENTS", amount: 3000 });
+    expect(commitBody.metadata).toEqual({
+      trace_id: "trace-1",
+      actual_source: "estimate",
+    });
+    expect(handle.finalized).toBe(true);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("Stream actual is invalid"),
+      expect.any(Error),
+    );
+  });
+
   it("releases on abort and auto-disposes heartbeat", async () => {
     const client = makeMockClient();
     client.createReservation.mockResolvedValue(
@@ -1866,7 +1900,7 @@ describe("reserveForStream", () => {
     expect(record.event_fallback_body.subject).toEqual({ tenant: "acme" });
   });
 
-  it("genuine commit rejection throws and allows release as fallback", async () => {
+  it("genuine commit rejection throws but cannot release known spend", async () => {
     const client = makeMockClient({ retryEnabled: false });
     client.createReservation.mockResolvedValue(
       CyclesResponse.success(200, {
@@ -1892,15 +1926,16 @@ describe("reserveForStream", () => {
       tenant: "acme",
     });
 
-    // A malformed commit is the caller's to correct — not journaled.
+    // A malformed commit is terminal and not journaled, but the guarded work
+    // already spent the resource so a broad catch must not release it.
     await expect(handle.commit(500)).rejects.toThrow("Commit failed with status 409");
-    expect(handle.finalized).toBe(false);
+    expect(handle.finalized).toBe(true);
     expect(journalFiles()).toHaveLength(0);
 
-    // Caller falls back to release
+    // A caller may still invoke release from a broad catch; it is a no-op.
     await handle.release("commit_failed");
     expect(handle.finalized).toBe(true);
-    expect(client.releaseReservation).toHaveBeenCalledOnce();
+    expect(client.releaseReservation).not.toHaveBeenCalled();
   });
 
   it("commit treats a bodyless 410 as expired and uses the event fallback", async () => {

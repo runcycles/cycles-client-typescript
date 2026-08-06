@@ -1,5 +1,15 @@
 # Cycles Protocol v0.1.25 — Client (TypeScript) Audit
 
+**Date:** 2026-08-06 (v0.4.3 — recognized terminal commit rejection no
+longer releases known spend in `withCycles`; post-action failures cannot enter
+the guarded-function release path; actual-evaluation failure commits the
+estimate with an audit marker; and missing required actual configuration fails
+before reservation. Streaming commit rejection keeps the handle finalized so
+broad catch cleanup cannot release it. Lifecycle, post-action, and streaming
+regressions pin these paths. Final verification: 494 tests pass, 6 skip;
+coverage is 95.82% lines and 89.63% branches; lint, typecheck, build, package
+contents, and npm audit are clean.),
+
 **Date:** 2026-07-30 (no runtime change — the durable recovery CI job now
 emits and uploads the profile 0.3 machine-readable evidence report even on
 failure, and the README links its recovery-conformance badge to the public SDK

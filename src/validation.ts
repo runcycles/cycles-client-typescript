@@ -20,8 +20,8 @@ export function validateSubject(subject: Subject | undefined): void {
 }
 
 export function validateNonNegative(value: number, name: string): void {
-  if (value < 0) {
-    throw new Error(`${name} must be non-negative, got ${value}`);
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${name} must be a finite, non-negative safe integer, got ${value}`);
   }
 }
 
