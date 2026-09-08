@@ -1,5 +1,19 @@
 # Cycles Protocol v0.1.25 — Client (TypeScript) Audit
 
+## 2026-09-08 — TypeScript ESLint dependency review
+
+Dependabot PR #202 updates the development-only ESLint plugin and its parser
+peer from 8.68.0 to 8.69.0 in the lockfile. It also covers the parser update
+proposed separately in #201. Manifest ranges, SDK source, and protocol fixtures
+are unchanged. The upstream release adds an optional lint-rule setting and
+rule fixes; no application migration is needed.
+
+On dependency head `bf7b314`, CI passed on Node 20 and 22, including lint,
+typecheck, build, coverage, and durable recovery conformance. The Node 20 run
+reported 495 passing tests, 5 skipped live-server tests, and 95.82% line
+coverage (89.63% branches), preserving the repository coverage gates.
+Evidence: [CI run 34007635988](https://github.com/runcycles/cycles-client-typescript/actions/runs/34007635988).
+
 **Date:** 2026-08-06 (v0.4.3 — recognized terminal commit rejection no
 longer releases known spend in `withCycles`; post-action failures cannot enter
 the guarded-function release path; actual-evaluation failure commits the
