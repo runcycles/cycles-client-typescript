@@ -1,5 +1,16 @@
 # Cycles Protocol v0.1.25 — Client (TypeScript) Audit
 
+## 2026-09-24 — Dependency maintenance
+
+Consolidates Dependabot PRs #204, #205, #206, and #209: TypeScript ESLint
+plugin/parser 8.70.0, ESLint 10.10.0, Node types 26.5.1, and the SHA-pinned
+CodeQL uploader 4.38.0. Vitest remains on version 4 to preserve the Node 20
+test matrix; the independent version 5 PRs #207 and #208 were declined.
+
+SDK source and YAML protocol fixtures are unchanged. Existing Node 20/22
+lint, typecheck, build, coverage (95% line minimum), and durable recovery
+checks remain enabled and must pass on the consolidated PR before merge.
+
 ## 2026-09-08 — TypeScript ESLint dependency review
 
 Dependabot PR #202 updates the development-only ESLint plugin and its parser
