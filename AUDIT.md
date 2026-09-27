@@ -20,6 +20,16 @@ SDK source and YAML protocol fixtures are unchanged. Existing Node 20/22
 lint, typecheck, build, coverage (95% line minimum), and durable recovery
 checks remain enabled and must pass on the consolidated PR before merge.
 
+## 2026-09-27 — Vite 8.3.0 dependency review
+
+PR #216 updates the development lockfile to Vite 8.3.0 and compatible
+PostCSS, picomatch, and nanoid releases. Manifest ranges, SDK source, and
+YAML protocol fixtures are unchanged. The reviewed Node 20/22 CI passed
+lint, typecheck, build, coverage, and durable recovery conformance. The
+Node 22 run passed 495 tests (5 live tests skipped) with 95.82% line
+coverage, preserving the existing 95% gate.
+Evidence: [CI run 36289858376](https://github.com/runcycles/cycles-client-typescript/actions/runs/36289858376).
+
 ## 2026-09-08 — TypeScript ESLint dependency review
 
 Dependabot PR #202 updates the development-only ESLint plugin and its parser
