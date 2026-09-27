@@ -1,5 +1,14 @@
 # Cycles Protocol v0.1.25 — Client (TypeScript) Audit
 
+## 2026-09-27 — ESLint 10.11.0 dependency review
+
+PR #210 updates only the development lockfile from ESLint 10.10.0 to
+10.11.0. Runtime code and the YAML protocol contract are unchanged. The
+reviewed CI run passed lint, typecheck, build, Node 20/22 tests, and durable
+recovery conformance. The Node 22 coverage run passed 495 tests (5 live tests
+skipped) with 95.82% line coverage, above the existing 95% gate.
+Evidence: [CI run 36289951258](https://github.com/runcycles/cycles-client-typescript/actions/runs/36289951258).
+
 ## 2026-09-24 — Dependency maintenance
 
 Consolidates Dependabot PRs #204, #205, #206, and #209: TypeScript ESLint
