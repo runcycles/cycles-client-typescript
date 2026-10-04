@@ -1,5 +1,9 @@
 # Cycles Protocol v0.1.25 — Client (TypeScript) Audit
 
+## 2026-10-04 — Dependency maintenance
+
+Consolidates Dependabot PRs #221, #220, and #218: Node type definitions 26.6.3 and TypeScript ESLint plugin/parser 8.71.0. The shared parser/plugin dependencies are kept at the same version without redundant nested copies. SDK source and YAML protocol fixtures are unchanged. Existing Node 20/22 lint, typecheck, build, coverage (95% line minimum), and durable recovery conformance checks must pass on the combined commit before merge. Vitest remains on version 4 to preserve Node 20 support; the isolated coverage-v8 5 PR #219 was declined. Local lint and tests pass with 95.82% line coverage, and local typecheck/build pass.
+
 ## 2026-09-27 — ESLint 10.11.0 dependency review
 
 PR #210 updates only the development lockfile from ESLint 10.10.0 to
