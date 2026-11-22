@@ -1,5 +1,11 @@
 # Cycles Protocol v0.1.25 — Client (TypeScript) Audit
 
+## 2026-11-22 — Dependabot dependency review
+
+PRs #258, #260, and #262 updated the development lockfile to ESLint 10.15.0 and the TypeScript ESLint parser and plugin to 8.73.0. The Node 20 and 22 test jobs passed on the reviewed PRs.
+
+PRs #259 and #261 were declined. Vitest 5.1.1 excludes Node 20 from its engine range, and its coverage provider requires the matching runner. The SDK continues to test on Node 20 with Vitest 4.
+
 ## 2026-11-08 - Dependabot dependency review
 
 PR #252 updates development ESLint to 10.14.0 and minimatch to 10.2.6 in the lockfile. Declines Vitest 5 / coverage-v8 5 PRs #253 and #254 because supported Node 20 is outside the Vitest 5 engine range.
